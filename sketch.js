@@ -35,7 +35,9 @@ const COL = {
   protons:   [255, 210, 110], // warm yellow
 };
 
-const PARTICLE_SIZE_SCALE = 4;
+const PARTICLE_SIZE_SCALE = 6;
+// Global scaling factor for particle counts (set to 0.1 for 10% of previous counts)
+const PARTICLE_SCALE = 0.10;
 
 // Performance knobs (trade tiny smoothness for big FPS gains)
 let COHESION_GRID_EVERY = 2;   // rebuild neighbor grid every N frames
@@ -44,6 +46,8 @@ let HEAVY_FIELD_STRIDE = 2;    // apply heavy per-particle fields 1/N per frame
 let FIELD_UPDATE_EVERY = 2;    // update face field buffers every N frames
 let RESERVOIR_UPDATE_EVERY = 1; // update hand reservoir every N frames
 let COLLISION_ITERS = 3;       // position-based collision solver iterations (space only)
+// How strongly collisions correct positions (lower = softer, less vibration)
+let COLLISION_PUSH = 0.25;
 let cohesionGridCache = null;
 let cohesionGridFrame = -1;
 let fpsSmoothed = 60;
@@ -211,7 +215,8 @@ function spawnXrayPulse(T, spikeStrength) {
   if (!T) T = computeHandData(new Date());
   const s = constrain(spikeStrength, 0, 1);
   const id = xrayBlobIdCounter++;
-  const count = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
+  const rawCount = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
+  const count = max(1, floor(rawCount * PARTICLE_SCALE));
   const radius = constrain(XRAY_BLOB_BASE_RADIUS + s * 140 + xray * 70, XRAY_BLOB_BASE_RADIUS, XRAY_BLOB_MAX_RADIUS);
   xrayBlobs.push({ id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, count: 0 });
 
@@ -328,7 +333,7 @@ let chamberFillFrac = 0;
 const DISABLE_RINGS = true;
 
 // Collision/packing: make collision radius match visual size (helps prevent overlap/whitening).
-const COLLISION_RADIUS_SCALE = 1.05;
+const COLLISION_RADIUS_SCALE = 2;
 
 // Density pressure (prevents “everything collapses to center” when rings are disabled).
 // This acts like an incompressible single-layer packing: particles drift from dense cells to sparse cells.
@@ -395,7 +400,7 @@ amp.setInput();
   textFont("system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial");
 
   if (START_CHAMBER_FULL) {
-    seedChamberParticles(computeHandData(new Date()), min(CAPACITY, START_CHAMBER_FILL_COUNT));
+    seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
   }
 }
 
@@ -568,46 +573,109 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
   }
   avg = avg / max(1, particleList.length);
   const cellSize = max(24, avg * 3.2);
+  // Build neighbor grid once and reuse across position-based iterations.
+  // Rebuilding each iteration is more accurate but costly; reusing
+  // yields a large speedup with acceptable visual results.
+  const grid = buildNeighborGrid(particleList, cellSize);
 
-  // Position-based iterations. We reuse a single grid per frame for speed.
+  // Pre-allocate neighbor offsets as packed keys delta to avoid recomputing strings.
   for (let it = 0; it < iterations; it++) {
-    const grid = buildNeighborGrid(particleList, cellSize);
-
     for (let i = 0; i < particleList.length; i++) {
       const p = particleList[i];
       const cx = floor(p.pos.x / cellSize);
       const cy = floor(p.pos.y / cellSize);
       const r1 = rad[i];
 
+      // check 3x3 neighborhood
       for (let oy = -1; oy <= 1; oy++) {
+        const cyo = (cy + oy) & 0xffff;
         for (let ox = -1; ox <= 1; ox++) {
-          const key = (((cx + ox) & 0xffff) << 16) | ((cy + oy) & 0xffff);
+          const key = (((cx + ox) & 0xffff) << 16) | cyo;
           const cell = grid.get(key);
           if (!cell) continue;
 
-          for (let j = 0; j < cell.length; j++) {
-            const k = cell[j];
+          for (let ci = 0; ci < cell.length; ci++) {
+            const k = cell[ci];
             if (k <= i) continue; // handle each pair once
             const q = particleList[k];
+
             const dx = p.pos.x - q.pos.x;
             const dy = p.pos.y - q.pos.y;
             const d2 = dx * dx + dy * dy;
-            if (d2 <= 0.000001) continue;
+            if (d2 <= 1e-6) continue;
             const r2 = rad[k];
             const minD = r1 + r2;
-            if (d2 >= minD * minD) continue;
+            if (d2 >= (minD * minD)) continue;
 
             const d = sqrt(d2);
-            const nx = dx / d;
-            const ny = dy / d;
+            const inv = 1.0 / d;
+            const nx = dx * inv;
+            const ny = dy * inv;
             const overlap = (minD - d);
-            const push = overlap * 0.5;
+            const push = overlap * COLLISION_PUSH;
 
             p.pos.x += nx * push;
             p.pos.y += ny * push;
             q.pos.x -= nx * push;
             q.pos.y -= ny * push;
+
+            // Softly remove relative normal velocity to reduce vibration/bounce
+            const rv = (p.vel.x - q.vel.x) * nx + (p.vel.y - q.vel.y) * ny;
+            const dampFactor = 0.15; // small damping fraction
+            const impulse = rv * dampFactor;
+            p.vel.x -= nx * impulse;
+            p.vel.y -= ny * impulse;
+            q.vel.x += nx * impulse;
+            q.vel.y += ny * impulse;
           }
+        }
+      }
+    }
+  }
+  // Final cleanup pass: rebuild neighbor grid once and resolve any remaining overlaps
+  // that occurred because the reused grid became stale as particles moved.
+  const grid2 = buildNeighborGrid(particleList, cellSize);
+  for (let i = 0; i < particleList.length; i++) {
+    const p = particleList[i];
+    const cx = floor(p.pos.x / cellSize);
+    const cy = floor(p.pos.y / cellSize);
+    const r1 = rad[i];
+
+    for (let oy = -1; oy <= 1; oy++) {
+      const cyo = (cy + oy) & 0xffff;
+      for (let ox = -1; ox <= 1; ox++) {
+        const key = (((cx + ox) & 0xffff) << 16) | cyo;
+        const cell = grid2.get(key);
+        if (!cell) continue;
+        for (let ci = 0; ci < cell.length; ci++) {
+          const k = cell[ci];
+          if (k <= i) continue;
+          const q = particleList[k];
+          const dx = p.pos.x - q.pos.x;
+          const dy = p.pos.y - q.pos.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 <= 1e-6) continue;
+          const r2 = rad[k];
+          const minD = r1 + r2;
+          if (d2 >= (minD * minD)) continue;
+          const d = sqrt(d2);
+          const inv = 1.0 / d;
+          const nx = dx * inv;
+          const ny = dy * inv;
+          const overlap = (minD - d);
+          const push = overlap * COLLISION_PUSH;
+          p.pos.x += nx * push;
+          p.pos.y += ny * push;
+          q.pos.x -= nx * push;
+          q.pos.y -= ny * push;
+
+          const rv = (p.vel.x - q.vel.x) * nx + (p.vel.y - q.vel.y) * ny;
+          const dampFactor = 0.15;
+          const impulse = rv * dampFactor;
+          p.vel.x -= nx * impulse;
+          p.vel.y -= ny * impulse;
+          q.vel.x += nx * impulse;
+          q.vel.y += ny * impulse;
         }
       }
     }
@@ -1400,7 +1468,7 @@ function resetVisualSystems() {
   xrayBlobs = [];
 
   if (START_CHAMBER_FULL) {
-    seedChamberParticles(computeHandData(new Date()), min(CAPACITY, START_CHAMBER_FILL_COUNT));
+    seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
   }
 }
 
@@ -1560,12 +1628,14 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
 
 // ---------- Emission ----------
 function emitEnergy(T) {
-  // Make it feel “full”:
-  const base = 8;
+  // Make it feel “full”. Lower base to reduce overall particle count (bigger particles)
+  const base = 4;
   let rate = base + overallAmp * 40 + electrons * 30 + h_ions * 18;
   const fps = frameRate();
   const throttle = (fps < 30) ? 0.4 : (fps < 45 ? 0.7 : 1.0);
   rate *= throttle;
+  // Apply global particle count scale (reduce emission by scale)
+  rate *= PARTICLE_SCALE;
 
   emitFromHand(T, "hour",   rate * 0.75);
   emitFromHand(T, "minute", rate * 0.95);
