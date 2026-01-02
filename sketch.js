@@ -18,9 +18,12 @@ let analysisOK = false;
 
 // ---------- Proxies ----------
 let xray = 0, mag = 0, h_ions = 0, electrons = 0, protons = 0, overallAmp = 0;
-const CHANGE_SMOOTH = 0.25;
-const CHANGE_GAIN = 10.0;
+const CHANGE_SMOOTH = 0.45;
+const CHANGE_GAIN = 28.0;
 const CHANGE_KNEE = 3.0;
+const REACTIVITY_SCALE = 1.2;
+const REACTIVITY_KNEE = 0.6;
+const REACTIVITY_COMPRESS = 1.2;
 const XRAY_MICRO_BURST_SCALE = 0.18;
 const ALPHA_SCALE = 1.15;
 const VISCOSITY_BASE = 0.060;
@@ -32,8 +35,8 @@ let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let change = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let flux = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let changeEmph = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
-const SMOOTH_FAST = 0.20;
-const SMOOTH_SLOW = 0.06;
+const SMOOTH_FAST = 0.35;
+const SMOOTH_SLOW = 0.18;
 
 // ---------- Colors ----------
 const COL = {
@@ -336,8 +339,8 @@ const HAND_SPIKE_TIP_F = 0.08;
 const HAND_SPIKE_BASE_S = 0.45;
 const HAND_SPIKE_TIP_S = 0.10;
 
-const CAPACITY = 50000;   // how full the clock can get
-const SOFT_CAP  = CAPACITY;  // only prune when the chamber is full
+let CAPACITY = 50000;   // updated in setup based on visual fill target
+let SOFT_CAP = CAPACITY;  // only prune when the chamber is full
 
 // Start with the chamber already "full" (visual bootstrap).
 // Kept below CAPACITY by default so it doesn't freeze slower machines.
@@ -434,6 +437,15 @@ amp.setInput();
   fileInput.attribute("accept", "audio/*");
 
   textFont("system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial");
+
+  {
+    const T = computeHandData(new Date());
+    const area = PI * T.radius * T.radius;
+    const cellArea = max(1, DRAW_GRID_SIZE * DRAW_GRID_SIZE);
+    const fillTarget = floor((area / cellArea) * 0.20); // 85% of grid occupancy
+    CAPACITY = max(2000, fillTarget);
+    SOFT_CAP = CAPACITY;
+  }
 
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
@@ -1612,11 +1624,11 @@ function updateAudioFeatures() {
   const aE = constrain(level * 4.0, 0, 1);
 
   // shape
-  const xRaw = pow(xE, 1.4);
-  const mRaw = pow(mE, 1.1);
-  const hRaw = pow(hE, 1.2);
-  const eRaw = pow(eE, 1.15);
-  const pRaw = pow(pE, 1.05);
+  const xRaw = pow(xE, 1.15);
+  const mRaw = pow(mE, 1.0);
+  const hRaw = pow(hE, 1.05);
+  const eRaw = pow(eE, 1.05);
+  const pRaw = pow(pE, 1.0);
 
   // smooth per “time type”
   xray      = lerp(xray,      xRaw, SMOOTH_FAST);
@@ -1625,6 +1637,19 @@ function updateAudioFeatures() {
   protons   = lerp(protons,   pRaw, SMOOTH_SLOW);
   h_ions    = lerp(h_ions,    hRaw, SMOOTH_SLOW);
   overallAmp= lerp(overallAmp, aE,  SMOOTH_FAST);
+
+  // Global reactivity boost with soft-knee to avoid saturating at 1.0.
+  const react = (v) => {
+    const compressed = pow(constrain(v, 0, 1), REACTIVITY_COMPRESS);
+    const boosted = compressed * REACTIVITY_SCALE;
+    return boosted / (boosted + REACTIVITY_KNEE);
+  };
+  xray      = react(xray);
+  mag       = react(mag);
+  electrons = react(electrons);
+  protons   = react(protons);
+  h_ions    = react(h_ions);
+  overallAmp= react(overallAmp);
 
   updateChangeSignals();
 
