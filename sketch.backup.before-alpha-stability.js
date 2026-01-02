@@ -25,9 +25,7 @@ const REACTIVITY_SCALE = 1.2;
 const REACTIVITY_KNEE = 0.6;
 const REACTIVITY_COMPRESS = 1.2;
 const XRAY_MICRO_BURST_SCALE = 0.18;
-const ALPHA_SCALE = 2.45;
-// Reduce how much opacity changes with strength (keeps colors more identifiable).
-const ALPHA_STRENGTH_MIX = 0.25;
+const ALPHA_SCALE = 1.15;
 const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
 const DRAW_GRID_SIZE = 3;
@@ -2447,8 +2445,7 @@ Particle.prototype.draw = function() {
   if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + this.seed * 6.0);
   if (this.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + this.seed * 10.0);
 
-  const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
-  const alpha = (prof.alphaBase + alphaStrength * strength) * a * flick * ALPHA_SCALE;
+  const alpha = (prof.alphaBase + prof.alphaStrength * strength) * a * flick * ALPHA_SCALE;
   fill(this.col[0], this.col[1], this.col[2], alpha);
 
   const s = this.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - a));

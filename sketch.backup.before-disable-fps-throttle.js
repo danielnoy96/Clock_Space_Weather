@@ -25,13 +25,10 @@ const REACTIVITY_SCALE = 1.2;
 const REACTIVITY_KNEE = 0.6;
 const REACTIVITY_COMPRESS = 1.2;
 const XRAY_MICRO_BURST_SCALE = 0.18;
-const ALPHA_SCALE = 2.45;
-// Reduce how much opacity changes with strength (keeps colors more identifiable).
-const ALPHA_STRENGTH_MIX = 0.25;
+const ALPHA_SCALE = 1.15;
 const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
 const DRAW_GRID_SIZE = 3;
-const DISABLE_FPS_THROTTLE = true;
 
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -1768,11 +1765,9 @@ function emitEnergy(T) {
     changeEmph.electrons * 12 +
     changeEmph.protons * 8;
   rate += changeRate;
-  if (!DISABLE_FPS_THROTTLE) {
-    const fps = frameRate();
-    const throttle = (fps < 30) ? 0.4 : (fps < 45 ? 0.7 : 1.0);
-    rate *= throttle;
-  }
+  const fps = frameRate();
+  const throttle = (fps < 30) ? 0.4 : (fps < 45 ? 0.7 : 1.0);
+  rate *= throttle;
   // Apply global particle count scale (reduce emission by scale)
   rate *= PARTICLE_SCALE;
 
@@ -1780,48 +1775,6 @@ function emitEnergy(T) {
   emitFromHand(T, "minute", rate * 0.95);
   emitFromHand(T, "second", rate * 1.20);
   // Do not hard-cap here; capacity control is handled in enforceCapacity().
-}
-
-function allocateCounts(total, weightsByKind) {
-  const n = max(0, floor(total));
-  const order = ["protons", "h_ions", "mag", "electrons", "xray"];
-  if (n <= 0) return { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
-
-  let sum = 0;
-  for (const kind of order) sum += max(0, weightsByKind[kind] || 0);
-  if (sum <= 1e-9) return { protons: n, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
-
-  const base = Object.create(null);
-  const frac = Object.create(null);
-  let baseSum = 0;
-
-  for (const kind of order) {
-    const r = (max(0, weightsByKind[kind] || 0) / sum) * n;
-    const b = floor(r);
-    base[kind] = b;
-    frac[kind] = r - b;
-    baseSum += b;
-  }
-
-  let rem = n - baseSum;
-  if (rem > 0) {
-    order
-      .slice()
-      .sort((a, b) => frac[b] - frac[a])
-      .forEach((kind) => {
-        if (rem <= 0) return;
-        base[kind] += 1;
-        rem -= 1;
-      });
-  }
-
-  return {
-    protons: base.protons || 0,
-    h_ions: base.h_ions || 0,
-    mag: base.mag || 0,
-    electrons: base.electrons || 0,
-    xray: base.xray || 0,
-  };
 }
 
 function emitFromHand(T, which, rate) {
@@ -1854,23 +1807,19 @@ function emitFromHand(T, which, rate) {
   const spread = (1.0 + electrons * 2.2 + mag * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
 
   const count = floor(rate);
-  const counts = allocateCounts(count, { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx });
-  const kindSequence = [];
-  for (const k of ["protons", "h_ions", "mag", "electrons", "xray"]) {
-    for (let j = 0; j < (counts[k] || 0); j++) kindSequence.push(k);
-  }
-  // Randomize order so types are interleaved but total proportions stay exact.
-  for (let i = kindSequence.length - 1; i > 0; i--) {
-    const j = floor(random() * (i + 1));
-    const tmp = kindSequence[i];
-    kindSequence[i] = kindSequence[j];
-    kindSequence[j] = tmp;
-  }
 
   for (let i = 0; i < count; i++) {
     // Pick a particle “type” probabilistically by contributions
-    const kind = kindSequence[i] || "protons";
-    const col = COL[kind] || COL.protons;
+    const r = random() * sum;
+    let kind = "protons";
+    let col = COL.protons;
+    let acc = wp;
+
+    if (r < acc) { kind = "protons"; col = COL.protons; }
+    else if ((acc += wh) && r < acc) { kind = "h_ions"; col = COL.h_ions; }
+    else if ((acc += wm) && r < acc) { kind = "mag"; col = COL.mag; }
+    else if ((acc += we) && r < acc) { kind = "electrons"; col = COL.electrons; }
+    else { kind = "xray"; col = COL.xray; }
 
     // Emit directly into the chamber (no hand reservoir).
 
@@ -2447,8 +2396,7 @@ Particle.prototype.draw = function() {
   if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + this.seed * 6.0);
   if (this.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + this.seed * 10.0);
 
-  const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
-  const alpha = (prof.alphaBase + alphaStrength * strength) * a * flick * ALPHA_SCALE;
+  const alpha = (prof.alphaBase + prof.alphaStrength * strength) * a * flick * ALPHA_SCALE;
   fill(this.col[0], this.col[1], this.col[2], alpha);
 
   const s = this.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - a));
