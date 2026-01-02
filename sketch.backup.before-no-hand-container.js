@@ -1821,7 +1821,11 @@ function emitFromHand(T, which, rate) {
     else if ((acc += we) && r < acc) { kind = "electrons"; col = COL.electrons; }
     else { kind = "xray"; col = COL.xray; }
 
-    // Emit directly into the chamber (no hand reservoir).
+    // Hand is now a drawn container (not filled with particles). We deposit first;
+    // only when full do particles leak into the chamber, near the anchor circle.
+    const deposit = 1.0 + constrain(kindStrength(kind), 0, 1) * 1.5;
+    const spill = depositHandEnergy(which, deposit);
+    if (spill <= 0) continue;
 
     // Leak point: around the anchor disk, slightly biased outward (never from the center).
     const hr = HAND_HEAD_R[which];
