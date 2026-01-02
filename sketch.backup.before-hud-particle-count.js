@@ -2198,12 +2198,8 @@ function drawHUD() {
     x, y + 38
   );
   text(
-    `Particles: ${particles.length} | fill ${nf((particles.length / CAPACITY) * 100, 1, 1)}%`,
-    x, y + 54
-  );
-  text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
-    x, y + 70
+    x, y + 54
   );
 }
 

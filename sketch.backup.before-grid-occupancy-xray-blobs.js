@@ -25,7 +25,7 @@ const XRAY_MICRO_BURST_SCALE = 0.18;
 const ALPHA_SCALE = 1.15;
 const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
-const DRAW_GRID_SIZE = 3;
+const XRAY_ALPHA_BOOST = 1.6;
 
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -85,10 +85,10 @@ const PARTICLE_PROFILE = {
     eddyMult: 0.35,
     reservoirJitterMult: 0.8,
     flickerHz: 0.12,
-    cohesionRadius: 240,
-    cohesionStrength: 0.50,
-    cohesionMaxNeighbors: 18,
-    cohesionMaxForce: 0.45,
+    cohesionRadius: 280,
+    cohesionStrength: 0.70,
+    cohesionMaxNeighbors: 22,
+    cohesionMaxForce: 0.65,
     separationRadiusMult: 0.70,
     separationStrength: 0.35,
     layerRadiusFrac: 0.0,
@@ -304,11 +304,11 @@ function applyXrayBlobForce(p) {
   const nx = dx / d;
   const ny = dy / d;
 
-  // Springy "viscosity": keep particles within a radius, but allow drift.
-  const desired = blob.radius;
+  // Springy "viscosity": keep particles within a tighter radius for visible clumps.
+  const desired = blob.radius * 0.6;
   const over = max(0, d - desired);
-  const pull = (0.010 + 0.030 * s) * (1.0 + over / max(1, desired));
-  const maxPull = 0.28;
+  const pull = (0.018 + 0.050 * s) * (1.0 + over / max(1, desired));
+  const maxPull = 0.45;
   const fx = constrain(nx * pull, -maxPull, maxPull);
   const fy = constrain(ny * pull, -maxPull, maxPull);
   p.vel.x += fx;
@@ -2034,30 +2034,23 @@ function updateParticles(T) {
 function drawParticles() {
   noStroke();
 
-  // Grid-occupancy draw to prevent overdraw/whitening in dense regions.
-  const cols = floor(width / DRAW_GRID_SIZE);
-  const rows = floor(height / DRAW_GRID_SIZE);
-  const used = new Int32Array(cols * rows);
-  used.fill(-1);
-
-  const drawByKind = (kind) => {
-    for (let i = 0; i < particles.length; i++) {
-      const p = particles[i];
-      if (!p || p.kind !== kind) continue;
-      const gx = floor(p.pos.x / DRAW_GRID_SIZE);
-      const gy = floor(p.pos.y / DRAW_GRID_SIZE);
-      if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
-      const idx = gx + gy * cols;
-      if (used[idx] !== -1) continue;
-      used[idx] = i;
-      p.draw();
-    }
-  };
-
+  // Use conservative blending for most layers to preserve color identity.
   push();
   blendMode(BLEND);
-  for (const kind of ["protons", "h_ions", "mag", "electrons", "xray"]) {
-    drawByKind(kind);
+  for (const kind of ["protons", "h_ions", "mag", "electrons"]) {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (p && p.kind === kind) p.draw();
+    }
+  }
+  pop();
+
+  // X-rays stay additive so pulses read as "hot", but alpha is reduced to avoid whitening.
+  push();
+  blendMode(ADD);
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (p && p.kind === "xray") p.draw();
   }
   pop();
 }
@@ -2198,12 +2191,8 @@ function drawHUD() {
     x, y + 38
   );
   text(
-    `Particles: ${particles.length} | fill ${nf((particles.length / CAPACITY) * 100, 1, 1)}%`,
-    x, y + 54
-  );
-  text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
-    x, y + 70
+    x, y + 54
   );
 }
 
@@ -2375,7 +2364,9 @@ Particle.prototype.draw = function() {
   if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + this.seed * 6.0);
   if (this.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + this.seed * 10.0);
 
-  const alpha = (prof.alphaBase + prof.alphaStrength * strength) * a * flick * ALPHA_SCALE;
+  let alpha = (prof.alphaBase + prof.alphaStrength * strength) * a * flick * ALPHA_SCALE;
+  if (this.kind === "xray") alpha *= XRAY_ALPHA_BOOST;
+  alpha = constrain(alpha, 0, 255);
   fill(this.col[0], this.col[1], this.col[2], alpha);
 
   const s = this.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - a));

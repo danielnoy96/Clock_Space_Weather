@@ -25,7 +25,6 @@ const XRAY_MICRO_BURST_SCALE = 0.18;
 const ALPHA_SCALE = 1.15;
 const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
-const DRAW_GRID_SIZE = 3;
 
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -2034,30 +2033,23 @@ function updateParticles(T) {
 function drawParticles() {
   noStroke();
 
-  // Grid-occupancy draw to prevent overdraw/whitening in dense regions.
-  const cols = floor(width / DRAW_GRID_SIZE);
-  const rows = floor(height / DRAW_GRID_SIZE);
-  const used = new Int32Array(cols * rows);
-  used.fill(-1);
-
-  const drawByKind = (kind) => {
-    for (let i = 0; i < particles.length; i++) {
-      const p = particles[i];
-      if (!p || p.kind !== kind) continue;
-      const gx = floor(p.pos.x / DRAW_GRID_SIZE);
-      const gy = floor(p.pos.y / DRAW_GRID_SIZE);
-      if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
-      const idx = gx + gy * cols;
-      if (used[idx] !== -1) continue;
-      used[idx] = i;
-      p.draw();
-    }
-  };
-
+  // Use conservative blending for most layers to preserve color identity.
   push();
   blendMode(BLEND);
-  for (const kind of ["protons", "h_ions", "mag", "electrons", "xray"]) {
-    drawByKind(kind);
+  for (const kind of ["protons", "h_ions", "mag", "electrons"]) {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (p && p.kind === kind) p.draw();
+    }
+  }
+  pop();
+
+  // X-rays stay additive so pulses read as "hot", but alpha is reduced to avoid whitening.
+  push();
+  blendMode(ADD);
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (p && p.kind === "xray") p.draw();
   }
   pop();
 }
@@ -2198,12 +2190,8 @@ function drawHUD() {
     x, y + 38
   );
   text(
-    `Particles: ${particles.length} | fill ${nf((particles.length / CAPACITY) * 100, 1, 1)}%`,
-    x, y + 54
-  );
-  text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
-    x, y + 70
+    x, y + 54
   );
 }
 
