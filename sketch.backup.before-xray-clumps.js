@@ -25,7 +25,6 @@ const XRAY_MICRO_BURST_SCALE = 0.18;
 const ALPHA_SCALE = 1.15;
 const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
-const XRAY_ALPHA_BOOST = 1.6;
 
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -85,10 +84,10 @@ const PARTICLE_PROFILE = {
     eddyMult: 0.35,
     reservoirJitterMult: 0.8,
     flickerHz: 0.12,
-    cohesionRadius: 280,
-    cohesionStrength: 0.70,
-    cohesionMaxNeighbors: 22,
-    cohesionMaxForce: 0.65,
+    cohesionRadius: 240,
+    cohesionStrength: 0.50,
+    cohesionMaxNeighbors: 18,
+    cohesionMaxForce: 0.45,
     separationRadiusMult: 0.70,
     separationStrength: 0.35,
     layerRadiusFrac: 0.0,
@@ -304,11 +303,11 @@ function applyXrayBlobForce(p) {
   const nx = dx / d;
   const ny = dy / d;
 
-  // Springy "viscosity": keep particles within a tighter radius for visible clumps.
-  const desired = blob.radius * 0.6;
+  // Springy "viscosity": keep particles within a radius, but allow drift.
+  const desired = blob.radius;
   const over = max(0, d - desired);
-  const pull = (0.018 + 0.050 * s) * (1.0 + over / max(1, desired));
-  const maxPull = 0.45;
+  const pull = (0.010 + 0.030 * s) * (1.0 + over / max(1, desired));
+  const maxPull = 0.28;
   const fx = constrain(nx * pull, -maxPull, maxPull);
   const fy = constrain(ny * pull, -maxPull, maxPull);
   p.vel.x += fx;
@@ -2364,9 +2363,7 @@ Particle.prototype.draw = function() {
   if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + this.seed * 6.0);
   if (this.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + this.seed * 10.0);
 
-  let alpha = (prof.alphaBase + prof.alphaStrength * strength) * a * flick * ALPHA_SCALE;
-  if (this.kind === "xray") alpha *= XRAY_ALPHA_BOOST;
-  alpha = constrain(alpha, 0, 255);
+  const alpha = (prof.alphaBase + prof.alphaStrength * strength) * a * flick * ALPHA_SCALE;
   fill(this.col[0], this.col[1], this.col[2], alpha);
 
   const s = this.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - a));
