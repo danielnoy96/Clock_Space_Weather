@@ -23,7 +23,6 @@ const CHANGE_GAIN = 10.0;
 const CHANGE_KNEE = 3.0;
 const XRAY_MICRO_BURST_SCALE = 0.18;
 const ALPHA_SCALE = 1.15;
-const VISCOSITY_BASE = 0.020;
 
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -58,7 +57,7 @@ let FIELD_UPDATE_EVERY = 2;    // update face field buffers every N frames
 let RESERVOIR_UPDATE_EVERY = 1; // update hand reservoir every N frames
 let COLLISION_ITERS = 3;       // position-based collision solver iterations (space only)
 // How strongly collisions correct positions (lower = softer, less vibration)
-let COLLISION_PUSH = 0.08;
+let COLLISION_PUSH = 0.25;
 let cohesionGridCache = null;
 let cohesionGridFrame = -1;
 let fpsSmoothed = 60;
@@ -77,7 +76,6 @@ const PARTICLE_PROFILE = {
     alphaStrength: 135,
     sizeMult: 1.0,
     dragMult: 0.992,
-    viscMult: 0.90,
     swirlMult: 0.45,
     jitterMult: 1.15,
     eddyMult: 0.35,
@@ -97,7 +95,6 @@ const PARTICLE_PROFILE = {
     alphaStrength: 90,
     sizeMult: 1.0,
     dragMult: 0.992,
-    viscMult: 0.45,
     swirlMult: 1.35,
     jitterMult: 0.55,
     eddyMult: 1.0,
@@ -118,7 +115,6 @@ const PARTICLE_PROFILE = {
     alphaStrength: 70,
     sizeMult: 1.0,
     dragMult: 0.995,
-    viscMult: 0.65,
     swirlMult: 0.55,
     jitterMult: 0.35,
     eddyMult: 0.55,
@@ -139,7 +135,6 @@ const PARTICLE_PROFILE = {
     alphaStrength: 95,
     sizeMult: 1.0,
     dragMult: 0.980,
-    viscMult: 0.20,
     swirlMult: 0.85,
     jitterMult: 1.55,
     eddyMult: 0.65,
@@ -160,7 +155,6 @@ const PARTICLE_PROFILE = {
     alphaStrength: 85,
     sizeMult: 1.0,
     dragMult: 0.999,
-    viscMult: 0.75,
     swirlMult: 0.95,
     jitterMult: 0.30,
     eddyMult: 0.45,
@@ -349,12 +343,6 @@ let chamberFillFrac = 0;
 // Temporary: disable any ring/layer forcing while we tune the core physics.
 const DISABLE_RINGS = true;
 
-// When dense, keep motion smooth by disabling noisy forces.
-const DENSE_SMOOTH_FLOW = true;
-
-// Force a globally smooth flow by disabling noisy forces at all times.
-const GLOBAL_SMOOTH_FLOW = true;
-
 // Collision/packing: make collision radius match visual size (helps prevent overlap/whitening).
 const COLLISION_RADIUS_SCALE = 2;
 
@@ -363,21 +351,10 @@ const COLLISION_RADIUS_SCALE = 2;
 const DENSITY_W = 64;
 const DENSITY_H = 64;
 const DENSITY_UPDATE_EVERY = 2;
-const DENSITY_PRESSURE = 0.04;
+const DENSITY_PRESSURE = 0.085;
 const DENSE_DISABLE_COHESION = true;
 let densityGrid = null;
 let densityGridFrame = -1;
-const DENSITY_VISCOSITY = 0.25;
-const DENSITY_DAMPING = 0.35;
-const DENSE_VEL_SMOOTH = 0.45;
-
-// Gentle alignment so dense regions flow together instead of colliding.
-const ALIGNMENT_RADIUS = 85;
-const ALIGNMENT_STRENGTH = 0.035;
-const ALIGNMENT_EVERY = 2;
-const ALIGNMENT_STRIDE = 2;
-let alignmentGridCache = null;
-let alignmentGridFrame = -1;
 
 // ---------- Visual systems ----------
 let particles = [];
@@ -534,14 +511,6 @@ function buildNeighborGrid(list, cellSize) {
   return grid;
 }
 
-function getAlignmentGrid(list, cellSize) {
-  if (!alignmentGridCache || (frameCount - alignmentGridFrame) >= ALIGNMENT_EVERY) {
-    alignmentGridCache = buildNeighborGrid(list, cellSize);
-    alignmentGridFrame = frameCount;
-  }
-  return alignmentGridCache;
-}
-
 function computeCollisionRadius(p) {
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const s = p.size * (prof.sizeMult || 1.0) * PARTICLE_SIZE_SCALE;
@@ -594,59 +563,6 @@ function applyDensityPressure(p) {
   const k = DENSITY_PRESSURE * (0.6 + chamberFillFrac * 0.8) * (1.0 - protons * 0.35);
   p.vel.x += (-gxN / m) * k;
   p.vel.y += (-gyN / m) * k;
-
-  // Local viscosity: dense cells slow down and flow together more smoothly.
-  const visc = constrain((c - 2) * 0.03, 0, 1) * DENSITY_VISCOSITY;
-  if (visc > 0) {
-    p.vel.mult(1.0 - visc);
-  }
-  if (visc > 0 && DENSE_VEL_SMOOTH > 0) {
-    p.vel.x = lerp(p.vel.x, 0, visc * DENSE_VEL_SMOOTH);
-    p.vel.y = lerp(p.vel.y, 0, visc * DENSE_VEL_SMOOTH);
-  }
-}
-
-function applyAlignment(p, index, grid, cellSize) {
-  if (!grid || ALIGNMENT_STRENGTH <= 0) return;
-
-  const r = ALIGNMENT_RADIUS;
-  const r2 = r * r;
-  const cx = floor(p.pos.x / cellSize);
-  const cy = floor(p.pos.y / cellSize);
-
-  let ax = 0, ay = 0, n = 0;
-
-  for (let oy = -1; oy <= 1; oy++) {
-    for (let ox = -1; ox <= 1; ox++) {
-      const key = (((cx + ox) & 0xffff) << 16) | ((cy + oy) & 0xffff);
-      const cell = grid.get(key);
-      if (!cell) continue;
-      for (let j = 0; j < cell.length; j++) {
-        const k = cell[j];
-        if (k === index) continue;
-        const q = particles[k];
-        if (!q) continue;
-        const dx = q.pos.x - p.pos.x;
-        const dy = q.pos.y - p.pos.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 > r2) continue;
-        ax += q.vel.x;
-        ay += q.vel.y;
-        n++;
-        if (n >= 18) break;
-      }
-      if (n >= 18) break;
-    }
-    if (n >= 18) break;
-  }
-
-  if (n <= 0) return;
-
-  ax /= n;
-  ay /= n;
-  const steer = ALIGNMENT_STRENGTH;
-  p.vel.x += (ax - p.vel.x) * steer;
-  p.vel.y += (ay - p.vel.y) * steer;
 }
 
 function resolveSpaceCollisions(particleList, center, radius, iterations) {
@@ -711,7 +627,7 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
 
             // Softly remove relative normal velocity to reduce vibration/bounce
             const rv = (p.vel.x - q.vel.x) * nx + (p.vel.y - q.vel.y) * ny;
-            const dampFactor = 0.15 + DENSITY_DAMPING * 0.5; // more damping for smoother dense flow
+            const dampFactor = 0.15; // small damping fraction
             const impulse = rv * dampFactor;
             p.vel.x -= nx * impulse;
             p.vel.y -= ny * impulse;
@@ -895,17 +811,15 @@ function applyCalmOrbit(p, center) {
   const d = max(30, r.mag());
   const tang = createVector(-r.y, r.x).mult(1.0 / d);
   const inward = r.copy().mult(-1.0 / d);
-  const edgeFrac = constrain(d / (min(width, height) * 0.42), 0, 1);
-  const edgeBias = pow(edgeFrac, 1.8); // stronger pull near rim, weak near center
 
   // Base orbit + audio wobble
   const swirl = 0.20 + 0.40 * mag + 0.20 * protons;         // smooth orbit
-  const driftIn = (0.010 + 0.04 * h_ions + 0.02 * mag) * edgeBias; // gentle inward spiral, rim-weighted
+  const driftIn = 0.035 + 0.06 * h_ions + 0.03 * mag;        // gentle inward spiral
   const jitter = 0.06 + 0.45 * electrons;                   // reduced micro-turbulence
   const soften = 1.0 - 0.65 * protons;                       // high protons = less distortion
 
   p.vel.add(tang.mult(swirl * 0.40));
-  p.vel.add(inward.mult(driftIn * 0.22));
+  p.vel.add(inward.mult(driftIn * 0.25));
   p.vel.add(p5.Vector.random2D().mult(jitter * 0.04 * soften));
 }
 
@@ -1972,8 +1886,6 @@ function updateParticles(T) {
   // free-space particles only (hand reservoir particles are updated separately)
   chamberFillFrac = constrain(particles.length / CAPACITY, 0, 1);
   const denseMode = chamberFillFrac >= DENSE_MODE_THRESHOLD;
-  const smoothDense = denseMode && DENSE_SMOOTH_FLOW;
-  const smoothAll = GLOBAL_SMOOTH_FLOW || smoothDense;
 
   const drag = 0.985 + protons * 0.01;
   const swirlBoost = 1.0 + mag * 0.8;
@@ -1981,9 +1893,6 @@ function updateParticles(T) {
   const cohesionGrid = getCohesionGrid(particles, cohesionCellSize);
   const stridePhase = frameCount % COHESION_APPLY_STRIDE;
   const heavyPhase = frameCount % HEAVY_FIELD_STRIDE;
-  const alignmentPhase = frameCount % ALIGNMENT_STRIDE;
-  const alignmentCellSize = 110;
-  const alignmentGrid = (denseMode ? getAlignmentGrid(particles, alignmentCellSize) : null);
 
   if (denseMode && ((frameCount - densityGridFrame) >= DENSITY_UPDATE_EVERY)) {
     rebuildDensityGrid();
@@ -1995,7 +1904,7 @@ function updateParticles(T) {
 
     if (!disableFrameForces) {
       applyCalmOrbit(p, T.c);
-      if (!smoothAll && (i % HEAVY_FIELD_STRIDE) === heavyPhase) {
+      if ((i % HEAVY_FIELD_STRIDE) === heavyPhase) {
         applyEddyField(p, T);
         if (!DISABLE_RINGS && !denseMode) applyMagRings(p, T);
         applyHIonStreams(p, T);
@@ -2004,14 +1913,10 @@ function updateParticles(T) {
     }
     applyXrayBlobForce(p);
     if (!DISABLE_RINGS && !denseMode) applyLayerStratification(p, T);
-    if (!smoothAll) applyVolumetricMix(p, T);
+    applyVolumetricMix(p, T);
 
     if (denseMode) {
       applyDensityPressure(p);
-    }
-
-    if (denseMode && (i % ALIGNMENT_STRIDE) === alignmentPhase) {
-      applyAlignment(p, i, alignmentGrid, alignmentCellSize);
     }
 
     if (!denseMode || !DENSE_DISABLE_COHESION) {
@@ -2342,8 +2247,7 @@ Particle.prototype.update = function(drag, swirlBoost) {
   }
 
   // integrate
-  const visc = VISCOSITY_BASE * (prof.viscMult || 0) * (0.5 + 0.7 * s);
-  this.vel.mult(drag * prof.dragMult * (1.0 - visc));
+  this.vel.mult(drag * prof.dragMult);
   this.pos.add(this.vel);
 
   // life only decreases when we explicitly "prune" due to overcrowding
