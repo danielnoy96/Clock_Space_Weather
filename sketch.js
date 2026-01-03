@@ -30,6 +30,166 @@ const SPAWN_BUDGET_MAX = 800;
 let spawnBudget = SPAWN_BUDGET_MAX;
 const COMPACT_EVERY = 10; // compact null holes in-order every N frames
 
+// PERF: Runtime profiler (timing + optional heap usage in Chrome) with downloadable JSON report.
+let PROF_ENABLED = false;
+let PROF_RECORDING = false;
+const PROF_MAX_FRAMES = 900; // keep last N frames in report
+let profFrameStartT = 0;
+let profMarks = Object.create(null); // name -> {t, heap}
+let profAgg = Object.create(null); // name -> {sum,max,n, heapSum,heapMax,heapMin,heapN}
+let profSamples = [];
+
+function profNow() {
+  return (typeof performance !== "undefined" && performance.now) ? performance.now() : millis();
+}
+
+function profHeapMB() {
+  try {
+    const pm = (typeof performance !== "undefined") ? performance.memory : null;
+    if (!pm || typeof pm.usedJSHeapSize !== "number") return null;
+    return pm.usedJSHeapSize / (1024 * 1024);
+  } catch (e) {
+    return null;
+  }
+}
+
+function profStart(name) {
+  if (!PROF_ENABLED) return;
+  profMarks[name] = { t: profNow(), heap: profHeapMB() };
+}
+
+function profEnd(name) {
+  if (!PROF_ENABLED) return;
+  const m = profMarks[name];
+  if (!m) return;
+  const t1 = profNow();
+  const dt = t1 - m.t;
+  const heapAfter = profHeapMB();
+  const dHeap = (heapAfter != null && m.heap != null) ? (heapAfter - m.heap) : null;
+  let a = profAgg[name];
+  if (!a) a = profAgg[name] = { sum: 0, max: 0, n: 0, heapSum: 0, heapMax: -1e9, heapMin: 1e9, heapN: 0 };
+  a.sum += dt;
+  a.n += 1;
+  if (dt > a.max) a.max = dt;
+  if (dHeap != null && isFinite(dHeap)) {
+    a.heapSum += dHeap;
+    a.heapN += 1;
+    if (dHeap > a.heapMax) a.heapMax = dHeap;
+    if (dHeap < a.heapMin) a.heapMin = dHeap;
+  }
+  profMarks[name] = null;
+}
+
+function profFrameStart() {
+  if (!PROF_ENABLED) return;
+  profFrameStartT = profNow();
+  profAgg = Object.create(null);
+}
+
+function profFrameEnd(extra) {
+  if (!PROF_ENABLED) return;
+  const frameMs = profNow() - profFrameStartT;
+  const heapMB = profHeapMB();
+
+  if (PROF_RECORDING) {
+    const rows = [];
+    for (const k in profAgg) {
+      const a = profAgg[k];
+      const avgMs = a.sum / max(1, a.n);
+      const avgHeapDeltaMB = (a.heapN > 0) ? (a.heapSum / a.heapN) : null;
+      const maxHeapDeltaMB = (a.heapN > 0) ? a.heapMax : null;
+      const minHeapDeltaMB = (a.heapN > 0) ? a.heapMin : null;
+      rows.push({ name: k, avgMs, maxMs: a.max, avgHeapDeltaMB, maxHeapDeltaMB, minHeapDeltaMB });
+    }
+    rows.sort((a, b) => b.avgMs - a.avgMs);
+    profSamples.push({
+      frame: frameCount || 0,
+      frameMs,
+      fps: frameRate(),
+      heapMB,
+      top: rows.slice(0, 12),
+      ...extra,
+    });
+    if (profSamples.length > PROF_MAX_FRAMES) profSamples.shift();
+  }
+
+  profAgg.__frame = { sum: frameMs, max: frameMs, n: 1 };
+  if (heapMB != null) profAgg.__heap = { sum: heapMB, max: heapMB, n: 1 };
+}
+
+function profDownloadReport() {
+  if (!profSamples.length) return;
+  const report = {
+    at: new Date().toISOString(),
+    userAgent: (typeof navigator !== "undefined" ? navigator.userAgent : ""),
+    capacity: CAPACITY,
+    drawGrid: DRAW_GRID_SIZE,
+    densityGrid: { w: DENSITY_W, h: DENSITY_H, every: DENSITY_UPDATE_EVERY },
+    poolTarget: POOL_TARGET,
+    samples: profSamples,
+  };
+  try {
+    if (typeof saveJSON === "function") {
+      saveJSON(report, "profile-report.json");
+      return;
+    }
+  } catch (e) {}
+  try {
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "profile-report.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {}
+}
+
+function drawProfilerHUD() {
+  if (!PROF_ENABLED) return;
+  const x = 14;
+  const y = height - 190;
+  const heapMB = profHeapMB();
+
+  const rows = [];
+  for (const k in profAgg) {
+    if (k.startsWith("__")) continue;
+    const a = profAgg[k];
+    rows.push({
+      name: k,
+      avg: a.sum / max(1, a.n),
+      max: a.max,
+      avgHeap: (a.heapN > 0) ? (a.heapSum / a.heapN) : null,
+      maxHeap: (a.heapN > 0) ? a.heapMax : null,
+    });
+  }
+  rows.sort((a, b) => b.avg - a.avg);
+
+  push();
+  noStroke();
+  fill(0, 170);
+  rect(x - 8, y - 8, 560, 176, 10);
+  fill(255, 230);
+  textAlign(LEFT, TOP);
+  textSize(12);
+  text(
+    `PROF ${PROF_RECORDING ? "REC" : "ON"} | frame ${nf(profAgg.__frame?.sum || 0, 1, 2)}ms | fps ${nf(frameRate(), 2, 1)}` +
+      (heapMB != null ? ` | heap ${nf(heapMB, 1, 1)}MB` : ` | heap N/A`) +
+      ` | Shift+R save`,
+    x,
+    y
+  );
+  const n = min(7, rows.length);
+  for (let i = 0; i < n; i++) {
+    const r = rows[i];
+    const heapTxt = (r.avgHeap != null) ? ` | Δheap avg ${nf(r.avgHeap, 1, 3)}MB` : "";
+    text(`${r.name}: avg ${nf(r.avg, 1, 2)}ms | max ${nf(r.max, 1, 2)}ms${heapTxt}`, x, y + 18 + i * 18);
+  }
+  pop();
+}
+
 // ---------- Proxies ----------
 let xray = 0, mag = 0, h_ions = 0, electrons = 0, protons = 0, overallAmp = 0;
 let raw = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
@@ -59,6 +219,16 @@ const DISABLE_FPS_THROTTLE = true;
 let SPACE_SWIRL_MULT = 1.0;    // tangential orbit strength
 let SPACE_DRIFTIN_MULT = 1.0;  // inward spiral strength
 let SPACE_JITTER_MULT = 1.0;   // micro-turbulence strength
+
+// Age spiral: newest near rim, oldest toward center (independent of kind).
+// Toggle for A/B comparisons.
+const DEBUG_DISABLE_AGE_SPIRAL = false;
+const AGE_WINDOW_FRAMES = 60 * 30; // 30 seconds @ 60fps
+const AGE_OUTER_FRAC = 0.98;
+const AGE_INNER_FRAC = 0.20;
+const AGE_PULL = 0.0016;
+const AGE_SWIRL = 0.0011;
+const AGE_EASE = 1.6;
 
 // Visual behavior profiles (make each force readable by "shape in motion")
 const LAYER_BEHAVIOR = {
@@ -617,6 +787,8 @@ let chamberFillFrac = 0;
 
 // Temporary: disable any ring/layer forcing while we tune the core physics.
 const DISABLE_RINGS = true;
+// Stronger guarantee: disable any kind-based radial targets (prevents "each kind sits on a ring").
+const DISABLE_KIND_RINGS = true;
 
 // When dense, keep motion smooth by disabling noisy forces.
 const DENSE_SMOOTH_FLOW = true;
@@ -1199,12 +1371,11 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
 
   // PERF: cache the collision grid across frames (reduces Map churn / GC spikes).
   const relCell = abs(cellSize - collisionGridCellSizeCache) / max(1e-6, collisionGridCellSizeCache || 1);
-  const relCount = abs(n - collisionGridCountCache);
   const needRebuild =
     !collisionGridCache ||
     (frameCount - collisionGridFrame) >= COLLISION_GRID_EVERY ||
     relCell > 0.15 ||
-    relCount > 64;
+    n !== collisionGridCountCache;
   if (needRebuild) {
     collisionGridCache = rebuildNeighborGridInto(particleList, cellSize, collisionGridCache, collisionCellsInUse, collisionCellPool);
     collisionGridFrame = frameCount;
@@ -1232,7 +1403,9 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
           for (let ci = 0; ci < cell.length; ci++) {
             const k = cell[ci];
             if (k <= i) continue; // handle each pair once
+            if (k < 0 || k >= n) continue; // PERF/SAFETY: cached grids can be stale; avoid crashes.
             const q = particleList[k];
+            if (!q) continue;
 
             const dx = p.pos.x - q.pos.x;
             const dy = p.pos.y - q.pos.y;
@@ -1290,7 +1463,9 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
         for (let ci = 0; ci < cell.length; ci++) {
           const k = cell[ci];
           if (k <= i) continue;
+          if (k < 0 || k >= n) continue;
           const q = particleList[k];
+          if (!q) continue;
           const dx = p.pos.x - q.pos.x;
           const dy = p.pos.y - q.pos.y;
           const d2 = dx * dx + dy * dy;
@@ -1471,6 +1646,31 @@ function applyCalmOrbit(p, center) {
   const j = jitter * 0.04 * soften;
   p.vel.x += jx * j;
   p.vel.y += jy * j;
+}
+
+function applyAgeSpiral(p, T) {
+  if (DEBUG_DISABLE_AGE_SPIRAL) return;
+  if (!p || p.birthFrame === undefined) return;
+  const age = (frameCount || 0) - p.birthFrame;
+  const age01 = constrain(age / AGE_WINDOW_FRAMES, 0, 1);
+  const outer = T.radius * AGE_OUTER_FRAC;
+  const inner = T.radius * AGE_INNER_FRAC;
+  const targetR = lerp(outer, inner, pow(age01, AGE_EASE));
+
+  const dx = p.pos.x - T.c.x;
+  const dy = p.pos.y - T.c.y;
+  const r = sqrt(dx * dx + dy * dy) + 1e-6;
+  const nx = dx / r;
+  const ny = dy / r;
+  const dr = targetR - r;
+
+  // radial correction (gentle)
+  p.vel.x += nx * dr * AGE_PULL;
+  p.vel.y += ny * dr * AGE_PULL;
+
+  // tangential swirl so it’s a spiral, not straight collapse
+  p.vel.x += (-ny) * AGE_SWIRL;
+  p.vel.y += ( nx) * AGE_SWIRL;
 }
 
 function applyLayerBehavior(p, T) {
@@ -2117,42 +2317,82 @@ function guideInHand(p, T) {
 
 
 function draw() {
+  profFrameStart();
+
+  profStart("background");
   background(...COL.bg);
+  profEnd("background");
 
   // Always compute correct time (hands should never “stop rotating”)
+  profStart("time");
   const T = computeHandData(new Date());
   updateHandDeltas(T);
+  profEnd("time");
   // Hand visuals are now drawn as shapes; no per-hand particle reservoir to update.
   // PERF: per-frame spawn budget (smooths CPU spikes without removing audio variability).
   spawnBudget = SPAWN_BUDGET_MAX;
 
   // Feature update
+  profStart("audio");
   if (started && analysisOK && soundFile && soundFile.isLoaded() && soundFile.isPlaying()) {
     updateAudioFeatures();
   } else {
     // keep it alive, but once audio plays this will switch to real features
     fallbackFeatures();
   }
+  profEnd("audio");
   updateLayerMemory();
   updatePerfThrottles();
 
   // Systems
+  profStart("field");
   if (frameCount % FIELD_UPDATE_EVERY === 0) updateFaceField();
-emitEnergy(T);
+  profEnd("field");
+
+  profStart("emit");
+  emitEnergy(T);
+  profEnd("emit");
+
+  profStart("capacity");
   enforceCapacity();
+  profEnd("capacity");
 
-updateParticles(T);
+  profStart("update.particles");
+  updateParticles(T);
+  profEnd("update.particles");
 
-drawFace(T);
-drawHandShapes(T);
- drawClockHands(T);
- drawParticles();
+  profStart("draw.face");
+  drawFace(T);
+  profEnd("draw.face");
+
+  profStart("draw.hands");
+  drawHandShapes(T);
+  drawClockHands(T);
+  profEnd("draw.hands");
+
+  profStart("draw.particles");
+  drawParticles();
+  profEnd("draw.particles");
  drawDensityDebugHUD();
  if (debugHandShapes) drawHandDebug(T);
  
- drawHUD();
+  profStart("draw.hud");
+  drawHUD();
+  drawProfilerHUD();
+  profEnd("draw.hud");
 
   if (!started) drawStartOverlay();
+
+  profFrameEnd({
+    particlesActive,
+    poolSizes: {
+      xray: pools.xray.length,
+      mag: pools.mag.length,
+      h_ions: pools.h_ions.length,
+      electrons: pools.electrons.length,
+      protons: pools.protons.length,
+    },
+  });
 }
 
 // ---------- User gesture ----------
@@ -2171,6 +2411,16 @@ function keyPressed() {
   if (key === "g" || key === "G") debugDensityCoupling = !debugDensityCoupling;
   if (key === "f" || key === "F") debugPerfHUD = !debugPerfHUD;
   if (key === "p" || key === "P") debugPoolHUD = !debugPoolHUD;
+  if (key === "r" || key === "R") {
+    // R toggles profiler; Shift+R downloads report JSON.
+    if (typeof keyIsDown === "function" && keyIsDown(SHIFT)) {
+      profDownloadReport();
+    } else {
+      PROF_ENABLED = !PROF_ENABLED;
+      PROF_RECORDING = PROF_ENABLED;
+      if (!PROF_ENABLED) profSamples.length = 0;
+    }
+  }
   if (key === "0") SOLO_KIND = null;
   if (key === "1") SOLO_KIND = "xray";
   if (key === "2") SOLO_KIND = "electrons";
@@ -2632,10 +2882,12 @@ function emitFromHand(T, which, rate) {
       lastXraySegIdByHand[which] = seg.id;
       p.segId = seg.id;
     }
-    // Per-particle target radius jitter to avoid hard rings (keeps layers distinct but volumetric).
-    const prof = PARTICLE_PROFILE[kind] || PARTICLE_PROFILE.protons;
-    if (prof.layerRadiusFrac && prof.layerStrength) {
-      p.layerTargetFrac = constrain(prof.layerRadiusFrac + (random() - 0.5) * 0.14, 0.18, 0.90);
+    // Disabled: kind-based radial targets create fixed rings by kind.
+    if (!DISABLE_KIND_RINGS) {
+      const prof = PARTICLE_PROFILE[kind] || PARTICLE_PROFILE.protons;
+      if (prof.layerRadiusFrac && prof.layerStrength) {
+        p.layerTargetFrac = constrain(prof.layerRadiusFrac + (random() - 0.5) * 0.14, 0.18, 0.90);
+      }
     }
     particles.push(p);
   }
@@ -2856,14 +3108,17 @@ function updateParticles(T) {
       applyCalmOrbit(p, T.c);
       if (!smoothAll && (i % HEAVY_FIELD_STRIDE) === heavyPhase) {
         applyEddyField(p, T);
-        if (!DISABLE_RINGS && !denseMode) applyMagRings(p, T);
+        // Disabled: kind-based ring forcing breaks age/space readability.
+        // if (!DISABLE_RINGS && !denseMode) applyMagRings(p, T);
         applyHIonStreams(p, T);
         applyElectronBreath(p, T);
       }
     }
+    applyAgeSpiral(p, T);
     applyLayerBehavior(p, T);
     applyXrayBlobForce(p);
-    if (!DISABLE_RINGS && !denseMode) applyLayerStratification(p, T);
+    // Disabled: kind-based stratification breaks age/space readability.
+    // if (!DISABLE_RINGS && !denseMode) applyLayerStratification(p, T);
     if (!smoothAll) applyVolumetricMix(p, T);
 
     if (couplingMode) {
