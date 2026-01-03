@@ -8,6 +8,7 @@
  */
 
 let started = false;
+let p5Canvas = null;
 
 // ---------- Audio ----------
 let fileInput;
@@ -29,6 +30,25 @@ let pools = { xray: [], mag: [], h_ions: [], electrons: [], protons: [] };
 const SPAWN_BUDGET_MAX = 800;
 let spawnBudget = SPAWN_BUDGET_MAX;
 const COMPACT_EVERY = 10; // compact null holes in-order every N frames
+
+// Proton.js optional overlay (EXPERIMENT). Does not replace the main time-ordered particle system.
+let USE_PROTON_OVERLAY = false;
+let proton = null;
+let protonEmitters = null;
+
+// Proton.js main-engine mode (EXPERIMENT): Proton integrates particles; we keep ordering via our own ordered list.
+let ENGINE_MODE = "custom"; // "custom" | "proton"
+let protonMain = null;
+let protonMainEmitters = null; // { key: emitter }
+let protonMainOrdered = [];
+const PROTON_COMPACT_EVERY = 10;
+
+function getProtonEngineCtor() {
+  // Proton UMD exposes exports object on `window.Proton`, with the engine constructor at `Proton.default`.
+  if (typeof Proton === "undefined") return null;
+  const ctor = Proton.default || null;
+  return (typeof ctor === "function") ? ctor : null;
+}
 
 // ---------- Proxies ----------
 let xray = 0, mag = 0, h_ions = 0, electrons = 0, protons = 0, overallAmp = 0;
@@ -705,7 +725,7 @@ let statusMsg = "Click canvas to enable audio, then upload an MP3 (top-left).";
 let errorMsg = "";
 
 function setup() {
-  createCanvas(1200, 1200);
+  p5Canvas = createCanvas(1200, 1200);
   angleMode(RADIANS);
   pixelDensity(1);
 
@@ -761,6 +781,10 @@ amp.setInput();
   // PERF: prewarm particle pools (one-time load, smoother runtime).
   prewarmPools();
 
+  // Optional experiment: Proton overlay (runs only if Proton is loaded and toggled on).
+  initProtonOverlay();
+  initProtonMainEngine();
+
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
   }
@@ -768,6 +792,326 @@ amp.setInput();
 
 function windowResized() {
   resizeCanvas(1200, 1200);
+}
+
+function initProtonOverlay() {
+  // Keep the sketch fully functional without Proton.
+  const ProtonEngine = getProtonEngineCtor();
+  if (!ProtonEngine || !p5Canvas) return;
+  try {
+    proton = new ProtonEngine();
+    protonEmitters = Object.create(null);
+
+    const mkEmitter = (kind) => {
+      const e = new Proton.Emitter();
+      e.rate = new Proton.Rate(new Proton.Span(0, 0), new Proton.Span(0.05, 0.12));
+      e.addInitialize(new Proton.Mass(1));
+      e.addInitialize(new Proton.Radius(1.5, 2.2));
+      e.addInitialize(new Proton.Life(0.8, 2.6)); // short-lived overlay only
+      e.addInitialize(new Proton.Velocity(new Proton.Span(0.3, 1.8), new Proton.Span(0, 360), "polar"));
+      e.addBehaviour(new Proton.Alpha(0.35, 0));
+      // Proton.Color expects strings; use rgb() strings to match our palette.
+      const c = COL[kind] || COL.protons;
+      e.addBehaviour(new Proton.Color(`rgb(${c[0]},${c[1]},${c[2]})`));
+      e.p.x = width * 0.5;
+      e.p.y = height * 0.5;
+      e.emit();
+      proton.addEmitter(e);
+      return e;
+    };
+
+    for (const kind of KINDS) protonEmitters[kind] = mkEmitter(kind);
+  } catch (e) {
+    proton = null;
+    protonEmitters = null;
+  }
+}
+
+function updateProtonOverlay(T) {
+  if (!USE_PROTON_OVERLAY || !proton || !protonEmitters) return;
+
+  // Tie to audio continuously; this overlay is additive and does not affect core ordering rules.
+  const headByKind = {
+    xray: T.secP,
+    electrons: T.secP,
+    protons: T.minP,
+    h_ions: T.hourP,
+    mag: T.hourP,
+  };
+
+  for (const kind of KINDS) {
+    const e = protonEmitters[kind];
+    if (!e) continue;
+
+    const head = headByKind[kind];
+    e.p.x = head.x;
+    e.p.y = head.y;
+
+    const lvl = kindStrength(kind);
+    const chg = changeEmph[kind] || 0;
+    const rate = (0.5 + lvl * 4.0 + chg * 6.0) * (0.6 + overallAmp);
+    e.rate.numPan.a = 0;
+    e.rate.numPan.b = constrain(rate * 0.9, 0, 22);
+
+    // Slightly different motion signatures per kind
+    const v = e.initializes[3]; // Velocity initialize
+    if (v && v.pan && v.pan.a !== undefined) {
+      const sp = (kind === "electrons") ? (0.8 + electrons * 2.6) :
+                 (kind === "xray") ? (1.2 + xray * 3.0) :
+                 (kind === "protons") ? (0.25 + protons * 0.6) :
+                 (kind === "h_ions") ? (0.35 + h_ions * 1.1) :
+                 (0.20 + mag * 0.8);
+      v.pan.a = 0.15;
+      v.pan.b = sp;
+    }
+  }
+
+  proton.update();
+}
+
+function drawProtonOverlay() {
+  if (!USE_PROTON_OVERLAY || !protonEmitters) return;
+  // Manual draw to avoid Proton renderer touching the canvas state.
+  noStroke();
+  for (const kind of KINDS) {
+    const e = protonEmitters[kind];
+    if (!e || !e.particles) continue;
+    const c = COL[kind] || COL.protons;
+    fill(c[0], c[1], c[2], 26);
+    const arr = e.particles;
+    for (let i = 0; i < arr.length; i++) {
+      const p = arr[i];
+      if (!p) continue;
+      ellipse(p.p.x, p.p.y, 2.0, 2.0);
+    }
+  }
+}
+
+function initProtonMainEngine() {
+  const ProtonEngine = getProtonEngineCtor();
+  if (!ProtonEngine) return;
+  try {
+    protonMain = new ProtonEngine();
+    protonMainEmitters = Object.create(null);
+    protonMainOrdered = [];
+
+    const addEmitter = (hand, kind) => {
+      const e = new Proton.Emitter();
+      e.rate = new Proton.Rate(new Proton.Span(0, 0), new Proton.Span(0.05, 0.12));
+      e.addInitialize(new Proton.Mass(1));
+      e.addInitialize(new Proton.Radius(1.4, 2.2));
+      // Long-lived; removal is driven by CAPACITY (oldest first) to preserve time/age semantics.
+      e.addInitialize(new Proton.Life(999999, 999999));
+      e.addInitialize(new Proton.Velocity(new Proton.Span(0.2, 1.2), new Proton.Span(0, 360), "polar"));
+      e.addBehaviour(new Proton.Alpha(0.35, 0.35)); // we control visibility via p.alpha as well
+      const c = COL[kind] || COL.protons;
+      e.addBehaviour(new Proton.Color(`rgb(${c[0]},${c[1]},${c[2]})`));
+
+      e.p.x = width * 0.5;
+      e.p.y = height * 0.5;
+      e.emit();
+      protonMain.addEmitter(e);
+      protonMainEmitters[`${hand}_${kind}`] = e;
+      return e;
+    };
+
+    for (const hand of ["hour", "minute", "second"]) {
+      for (const kind of KINDS) addEmitter(hand, kind);
+    }
+
+    // Global field-ish behaviours (approximate current feel; tuning may be needed).
+    // Swirl (mag) + inward drift (protons/h_ions) are applied later as custom forces.
+  } catch (e) {
+    protonMain = null;
+    protonMainEmitters = null;
+    protonMainOrdered = [];
+  }
+}
+
+function protonGetKind(p) {
+  return p && (p.kind || (p.__kind || null));
+}
+
+function protonGetPos(p) {
+  return p && (p.p || p.pos || null);
+}
+
+function protonGetVel(p) {
+  return p && (p.v || p.vel || null);
+}
+
+function rebuildDensityGridsFromProton(list) {
+  ensureDensityGrids();
+  densAll.fill(0);
+  densXray.fill(0);
+  densElectrons.fill(0);
+  densProtons.fill(0);
+  densHIons.fill(0);
+  densMag.fill(0);
+
+  const sx = DENSITY_W / max(1, width);
+  const sy = DENSITY_H / max(1, height);
+
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || p.dead) continue;
+    const kind = protonGetKind(p);
+    const pos = protonGetPos(p);
+    if (!kind || !pos) continue;
+    let gx = floor(pos.x * sx);
+    let gy = floor(pos.y * sy);
+    if (gx < 0) gx = 0; else if (gx >= DENSITY_W) gx = DENSITY_W - 1;
+    if (gy < 0) gy = 0; else if (gy >= DENSITY_H) gy = DENSITY_H - 1;
+    const idx = gy * DENSITY_W + gx;
+    if (densAll[idx] < 65535) densAll[idx]++;
+    const g = getDensityGridForKind(kind);
+    if (g && g[idx] < 65535) g[idx]++;
+  }
+}
+
+function applyDensityCouplingProton(p, T) {
+  if (!densAll || !p || p.dead) return;
+  const kind = protonGetKind(p);
+  const pos = protonGetPos(p);
+  const vel = protonGetVel(p);
+  if (!kind || !pos || !vel) return;
+
+  const sx = DENSITY_W / max(1, width);
+  const sy = DENSITY_H / max(1, height);
+  let gx = floor(pos.x * sx);
+  let gy = floor(pos.y * sy);
+  if (gx < 1) gx = 1; else if (gx > DENSITY_W - 2) gx = DENSITY_W - 2;
+  if (gy < 1) gy = 1; else if (gy > DENSITY_H - 2) gy = DENSITY_H - 2;
+  const idx = gy * DENSITY_W + gx;
+  const c = densAll[idx] || 0;
+  if (c <= 1) return;
+
+  const KA = DENSITY_COUPLING[kind] || DENSITY_COUPLING.protons;
+  const base = DENSITY_PRESSURE * (0.55 + chamberFillFrac * 1.05);
+
+  let fx = 0, fy = 0;
+  for (let i = 0; i < DENSITY_KINDS.length; i++) {
+    const B = DENSITY_KINDS[i];
+    let k = KA[B] || 0;
+    if (k === 0) continue;
+    let grid = null;
+    if (B === "xray") grid = densXray;
+    else if (B === "electrons") grid = densElectrons;
+    else if (B === "protons") grid = densProtons;
+    else if (B === "h_ions") grid = densHIons;
+    else if (B === "mag") grid = densMag;
+    if (!grid) continue;
+    const grad = sampleDensityGradient(grid, idx);
+    fx += (-grad.dx) * k;
+    fy += (-grad.dy) * k;
+  }
+
+  vel.x += fx * base;
+  vel.y += fy * base;
+
+  const visc = constrain((c - 2) * 0.03, 0, 1) * DENSITY_VISCOSITY;
+  if (visc > 0) {
+    vel.x *= (1.0 - visc);
+    vel.y *= (1.0 - visc);
+  }
+}
+
+function updateProtonMain(T) {
+  if (!protonMain || !protonMainEmitters) return;
+
+  // Capture newly created particles into a stable ordered list.
+  // We rely on Proton's internal pooling but keep our own ordering/compaction.
+  for (const key in protonMainEmitters) {
+    const e = protonMainEmitters[key];
+    if (!e || !e.particles) continue;
+    const arr = e.particles;
+    for (let i = 0; i < arr.length; i++) {
+      const p = arr[i];
+      if (!p || p.__orderedSeen) continue;
+      p.__orderedSeen = true;
+      // store kind for coupling/draw without digging into emitter key each time
+      const parts = key.split("_");
+      p.__hand = parts[0];
+      p.__kind = parts[1];
+      protonMainOrdered.push(p);
+    }
+  }
+
+  // Compute fill + density coupling in terms of ordered live particles.
+  let active = 0;
+  for (let i = 0; i < protonMainOrdered.length; i++) {
+    const p = protonMainOrdered[i];
+    if (p && !p.dead) active++;
+  }
+  chamberFillFrac = constrain(active / CAPACITY, 0, 1);
+
+  if ((frameCount - densityGridFrame) >= DENSITY_UPDATE_EVERY) {
+    rebuildDensityGridsFromProton(protonMainOrdered);
+    densityGridFrame = frameCount;
+  }
+  for (let i = 0; i < protonMainOrdered.length; i++) {
+    const p = protonMainOrdered[i];
+    if (!p || p.dead) continue;
+    applyDensityCouplingProton(p, T);
+  }
+
+  // Enforce capacity: kill oldest first (preserves time ordering semantics).
+  if (active > CAPACITY) {
+    let extra = active - CAPACITY;
+    for (let i = 0; i < protonMainOrdered.length && extra > 0; i++) {
+      const p = protonMainOrdered[i];
+      if (!p || p.dead) continue;
+      p.dead = true;
+      extra--;
+    }
+  }
+
+  // Compact holes periodically (preserve in-order).
+  if ((frameCount % PROTON_COMPACT_EVERY) === 0) {
+    let w = 0;
+    for (let i = 0; i < protonMainOrdered.length; i++) {
+      const p = protonMainOrdered[i];
+      if (!p || p.dead) continue;
+      protonMainOrdered[w++] = p;
+    }
+    protonMainOrdered.length = w;
+  }
+}
+
+function drawProtonMain() {
+  if (!protonMainOrdered.length) return;
+  noStroke();
+
+  // Use same occupancy suppression to avoid whitening.
+  const cols = floor(width / DRAW_GRID_SIZE);
+  const rows = floor(height / DRAW_GRID_SIZE);
+  const nCells = cols * rows;
+  if (!usedStamp || usedCols !== cols || usedRows !== rows || usedStamp.length !== nCells) {
+    usedCols = cols;
+    usedRows = rows;
+    usedStamp = new Uint32Array(nCells);
+    usedFrameId = 1;
+  }
+  usedFrameId = (usedFrameId + 1) >>> 0;
+  if (usedFrameId === 0) { usedStamp.fill(0); usedFrameId = 1; }
+
+  for (let i = 0; i < protonMainOrdered.length; i++) {
+    const p = protonMainOrdered[i];
+    if (!p || p.dead) continue;
+    const kind = protonGetKind(p);
+    const pos = protonGetPos(p);
+    if (!kind || !pos) continue;
+    const gx = floor(pos.x / DRAW_GRID_SIZE);
+    const gy = floor(pos.y / DRAW_GRID_SIZE);
+    if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
+    const idx = gx + gy * cols;
+    if (usedStamp[idx] === usedFrameId) continue;
+    usedStamp[idx] = usedFrameId;
+    const c = COL[kind] || COL.protons;
+    const a = (kind === "xray") ? 40 : 24;
+    fill(c[0], c[1], c[2], a);
+    ellipse(pos.x, pos.y, 6, 6);
+  }
 }
 
 // PERF: pool helpers (no per-spawn object allocations).
@@ -2126,6 +2470,45 @@ function draw() {
   // PERF: per-frame spawn budget (smooths CPU spikes without removing audio variability).
   spawnBudget = SPAWN_BUDGET_MAX;
 
+  // Proton main-engine mode (toggle M). Keeps audio-driven behavior and age ordering via ordered list.
+  if (ENGINE_MODE === "proton" && protonMain && protonMainEmitters) {
+    if (started && analysisOK && soundFile && soundFile.isLoaded() && soundFile.isPlaying()) updateAudioFeatures();
+    else fallbackFeatures();
+    updateLayerMemory();
+    updatePerfThrottles();
+
+    // Update emitter positions/rates based on hands + audio.
+    for (const hand of ["hour", "minute", "second"]) {
+      const head = (hand === "hour") ? T.hourP : (hand === "minute") ? T.minP : T.secP;
+      const w = HAND_W[hand];
+      for (const kind of KINDS) {
+        const e = protonMainEmitters[`${hand}_${kind}`];
+        if (!e) continue;
+        e.p.x = head.x;
+        e.p.y = head.y;
+        const weight = (kind === "xray") ? w.x : (kind === "mag") ? w.m : (kind === "h_ions") ? w.h : (kind === "electrons") ? w.e : w.p;
+        const lvl = kindStrength(kind);
+        const chg = changeEmph[kind] || 0;
+        const rate = (0.2 + (lvl * 2.2 + chg * 3.0) * (0.6 + overallAmp)) * weight * 6.0;
+        e.rate.numPan.a = 0;
+        e.rate.numPan.b = constrain(rate, 0, 18);
+      }
+    }
+
+    protonMain.update();
+    updateProtonMain(T);
+
+    if (frameCount % FIELD_UPDATE_EVERY === 0) updateFaceField();
+    drawFace(T);
+    drawHandShapes(T);
+    drawClockHands(T);
+    drawProtonMain();
+    drawDensityDebugHUD();
+    drawHUD();
+    if (!started) drawStartOverlay();
+    return;
+  }
+
   // Feature update
   if (started && analysisOK && soundFile && soundFile.isLoaded() && soundFile.isPlaying()) {
     updateAudioFeatures();
@@ -2143,9 +2526,12 @@ emitEnergy(T);
 
 updateParticles(T);
 
-drawFace(T);
-drawHandShapes(T);
+ drawFace(T);
+ drawHandShapes(T);
  drawClockHands(T);
+ // Optional experiment (toggle O): Proton overlay particles for comparison.
+ updateProtonOverlay(T);
+ drawProtonOverlay();
  drawParticles();
  drawDensityDebugHUD();
  if (debugHandShapes) drawHandDebug(T);
@@ -2171,6 +2557,8 @@ function keyPressed() {
   if (key === "g" || key === "G") debugDensityCoupling = !debugDensityCoupling;
   if (key === "f" || key === "F") debugPerfHUD = !debugPerfHUD;
   if (key === "p" || key === "P") debugPoolHUD = !debugPoolHUD;
+  if (key === "o" || key === "O") USE_PROTON_OVERLAY = !USE_PROTON_OVERLAY;
+  if (key === "m" || key === "M") ENGINE_MODE = (ENGINE_MODE === "custom") ? "proton" : "custom";
   if (key === "0") SOLO_KIND = null;
   if (key === "1") SOLO_KIND = "xray";
   if (key === "2") SOLO_KIND = "electrons";
@@ -3097,6 +3485,16 @@ function drawHUD() {
   text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
     x, (SOLO_KIND ? (y + 86) : (y + 70))
+  );
+
+  fill(255, 180);
+  const modeY = (SOLO_KIND ? (y + 102) : (y + 86)) + (debugPoolHUD ? 34 : 0);
+  const protonOk = !!getProtonEngineCtor();
+  const protonRunning = (ENGINE_MODE === "proton");
+  text(
+    `Mode: ${ENGINE_MODE} (press M) | Proton: ${protonOk ? "loaded" : "missing"}${protonRunning ? ` | protonParticles ${protonMainOrdered.length}` : ""}`,
+    x,
+    modeY
   );
 
   if (debugPoolHUD) {
