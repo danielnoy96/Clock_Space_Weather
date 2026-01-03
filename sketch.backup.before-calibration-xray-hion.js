@@ -42,18 +42,6 @@ const LAYER_BEHAVIOR = {
   mag:       { struct:    0.16,  structFreq: 0.10, settle: 0.975 },
 };
 
-// Calibration: solo a single layer (keys: 0=all, 1=xray, 2=electrons, 3=protons, 4=h_ions, 5=mag)
-let SOLO_KIND = null;
-
-// XRAY "segments": event pulses that stay rigid and coherent (stiff sticks)
-let xraySegments = [];
-let xraySegmentIdCounter = 1;
-let xraySegIndex = Object.create(null);
-let lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
-
-// H-ions "chains": elongated streams that stick like a chain
-let lastHIonByHand = { hour: null, minute: null, second: null };
-
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let change = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -75,7 +63,7 @@ const COL = {
   protons:   [10, 30, 120],   // dark blue
 };
 
-const PARTICLE_SIZE_SCALE = 4;
+const PARTICLE_SIZE_SCALE = 6;
 // Global scaling factor for particle counts (set to 0.1 for 10% of previous counts)
 const PARTICLE_SCALE = 0.10;
 
@@ -311,96 +299,6 @@ function updateXrayBlobs() {
     }
   }
   xrayBlobs = kept;
-}
-
-function updateXraySegments() {
-  xraySegIndex = Object.create(null);
-  if (!xraySegments.length) return;
-
-  const sumsX = Object.create(null);
-  const sumsY = Object.create(null);
-  const counts = Object.create(null);
-
-  for (let i = 0; i < particles.length; i++) {
-    const p = particles[i];
-    if (!p || p.kind !== "xray" || !p.segId) continue;
-    const id = p.segId;
-    counts[id] = (counts[id] || 0) + 1;
-    sumsX[id] = (sumsX[id] || 0) + p.pos.x;
-    sumsY[id] = (sumsY[id] || 0) + p.pos.y;
-  }
-
-  const kept = [];
-  for (let i = 0; i < xraySegments.length; i++) {
-    const s = xraySegments[i];
-    const n = counts[s.id] || 0;
-    s.count = n;
-    s.age = (s.age || 0) + 1;
-    if (n > 0 && s.age < (s.ttl || 120)) {
-      s.cx = sumsX[s.id] / n;
-      s.cy = sumsY[s.id] / n;
-      kept.push(s);
-      xraySegIndex[s.id] = s;
-    }
-  }
-  xraySegments = kept;
-}
-
-function createXraySegment(head, dir, intensity) {
-  const id = xraySegmentIdCounter++;
-  const s = constrain(intensity, 0, 1);
-  const len = 50 + 120 * s;
-  const ttl = 40 + floor(120 * s);
-  const seg = {
-    id,
-    cx: head.x,
-    cy: head.y,
-    dirx: dir.x,
-    diry: dir.y,
-    len,
-    ttl,
-    age: 0,
-    count: 0,
-  };
-  xraySegments.push(seg);
-  xraySegIndex[id] = seg;
-  return seg;
-}
-
-function applyXraySegmentConstraint(p) {
-  if (!p.segId) return;
-  const seg = xraySegIndex[p.segId];
-  if (!seg) return;
-
-  const dx = p.pos.x - seg.cx;
-  const dy = p.pos.y - seg.cy;
-  const dirx = seg.dirx;
-  const diry = seg.diry;
-  const nx = -diry;
-  const ny = dirx;
-
-  const along = dx * dirx + dy * diry;
-  const perp = dx * nx + dy * ny;
-
-  const half = seg.len * 0.5;
-  const clamped = constrain(along, -half, half);
-
-  // Target point on the segment "spine"
-  const tx = seg.cx + dirx * clamped;
-  const ty = seg.cy + diry * clamped;
-
-  // Strongly pull toward the spine and keep length bounded (rigid segment feel)
-  const spineK = 0.32;
-  const perpK = 0.50;
-  p.pos.x = lerp(p.pos.x, tx, spineK);
-  p.pos.y = lerp(p.pos.y, ty, spineK);
-  p.pos.x -= nx * perp * perpK;
-  p.pos.y -= ny * perp * perpK;
-
-  // Kill perpendicular velocity to keep it stiff
-  const vperp = p.vel.x * nx + p.vel.y * ny;
-  p.vel.x -= nx * vperp * 0.85;
-  p.vel.y -= ny * vperp * 0.85;
 }
 
 function applyXrayBlobForce(p) {
@@ -1026,8 +924,8 @@ function applyCalmOrbit(p, center) {
   const edgeBias = pow(edgeFrac, 1.8); // stronger pull near rim, weak near center
 
   // Base orbit + audio wobble
-  const swirl = 0.90 + 0.40 * mag + 0.20 * protons;         // smooth orbit
-  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias; // gentle inward spiral, rim-weighted
+  const swirl = 0.20 + 0.40 * mag + 0.20 * protons;         // smooth orbit
+  const driftIn = (0.010 + 0.04 * h_ions + 0.02 * mag) * edgeBias; // gentle inward spiral, rim-weighted
   const jitter = 0.06 + 0.45 * electrons;                   // reduced micro-turbulence
   const soften = 1.0 - 0.65 * protons;                       // high protons = less distortion
 
@@ -1064,18 +962,6 @@ function applyLayerBehavior(p, T) {
     p.vel.y += fy;
     p.vel.x = lerp(p.vel.x, tang.x * (0.45 + 0.25 * h_ions), b.align);
     p.vel.y = lerp(p.vel.y, tang.y * (0.45 + 0.25 * h_ions), b.align);
-
-    // Chain tendency: stick to previous h_ion to form elongated streams.
-    if (p.link && p.link.pos) {
-      const lx = p.link.pos.x - p.pos.x;
-      const ly = p.link.pos.y - p.pos.y;
-      const dd = sqrt(lx * lx + ly * ly) + 1e-6;
-      const desired = 10;
-      const k = 0.020 + 0.040 * constrain(h_ions, 0, 1);
-      const diff = (dd - desired);
-      p.vel.x += (lx / dd) * diff * k;
-      p.vel.y += (ly / dd) * diff * k;
-    }
     return;
   }
 
@@ -1098,9 +984,6 @@ function applyLayerBehavior(p, T) {
   }
 
   if (p.kind === "xray") {
-    // If this xray belongs to a rigid segment, keep it locked to the segment shape.
-    if (p.segId) applyXraySegmentConstraint(p);
-
     const b = LAYER_BEHAVIOR.xray;
     if (p.strength !== undefined) {
       const floorS = max(COHESION_FLOOR * 0.4, kindStrength("xray") * 0.25);
@@ -1710,12 +1593,6 @@ function touchStarted() { mousePressed(); return false; }
 
 function keyPressed() {
   if (key === "d" || key === "D") debugHandShapes = !debugHandShapes;
-  if (key === "0") SOLO_KIND = null;
-  if (key === "1") SOLO_KIND = "xray";
-  if (key === "2") SOLO_KIND = "electrons";
-  if (key === "3") SOLO_KIND = "protons";
-  if (key === "4") SOLO_KIND = "h_ions";
-  if (key === "5") SOLO_KIND = "mag";
 }
 
 // ---------- File upload ----------
@@ -1773,11 +1650,6 @@ function resetVisualSystems() {
   handSlotMeta = { hour: null, minute: null, second: null };
   handFill = { hour: 0, minute: 0, second: 0 };
   xrayBlobs = [];
-  xraySegments = [];
-  xraySegIndex = Object.create(null);
-  xraySegmentIdCounter = 1;
-  lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
-  lastHIonByHand = { hour: null, minute: null, second: null };
 
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
@@ -2055,21 +1927,17 @@ function emitFromHand(T, which, rate) {
   const spread = (1.0 + electrons * 2.2 + mag * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
 
   const count = floor(rate);
-  let kindSequence = [];
-  if (SOLO_KIND) {
-    for (let i = 0; i < count; i++) kindSequence.push(SOLO_KIND);
-  } else {
-    const counts = allocateCounts(count, { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx });
-    for (const k of ["protons", "h_ions", "mag", "electrons", "xray"]) {
-      for (let j = 0; j < (counts[k] || 0); j++) kindSequence.push(k);
-    }
-    // Randomize order so types are interleaved but total proportions stay exact.
-    for (let i = kindSequence.length - 1; i > 0; i--) {
-      const j = floor(random() * (i + 1));
-      const tmp = kindSequence[i];
-      kindSequence[i] = kindSequence[j];
-      kindSequence[j] = tmp;
-    }
+  const counts = allocateCounts(count, { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx });
+  const kindSequence = [];
+  for (const k of ["protons", "h_ions", "mag", "electrons", "xray"]) {
+    for (let j = 0; j < (counts[k] || 0); j++) kindSequence.push(k);
+  }
+  // Randomize order so types are interleaved but total proportions stay exact.
+  for (let i = kindSequence.length - 1; i > 0; i--) {
+    const j = floor(random() * (i + 1));
+    const tmp = kindSequence[i];
+    kindSequence[i] = kindSequence[j];
+    kindSequence[j] = tmp;
   }
 
   for (let i = 0; i < count; i++) {
@@ -2107,17 +1975,6 @@ function emitFromHand(T, which, rate) {
 
     const p = new Particle(spawn.x, spawn.y, v.x, v.y, life, size, col, kind);
     p.strength = kindStrength(kind);
-    if (kind === "h_ions") {
-      p.link = lastHIonByHand[which];
-      lastHIonByHand[which] = p;
-    }
-    if (kind === "xray") {
-      const burst = constrain(changeEmph.xray, 0, 1);
-      const reuse = lastXraySegIdByHand[which] && xraySegIndex[lastXraySegIdByHand[which]];
-      const seg = (burst > 0.10 || !reuse) ? createXraySegment(head, dir, burst) : xraySegIndex[lastXraySegIdByHand[which]];
-      lastXraySegIdByHand[which] = seg.id;
-      p.segId = seg.id;
-    }
     // Per-particle target radius jitter to avoid hard rings (keeps layers distinct but volumetric).
     const prof = PARTICLE_PROFILE[kind] || PARTICLE_PROFILE.protons;
     if (prof.layerRadiusFrac && prof.layerStrength) {
@@ -2148,14 +2005,29 @@ function emitFromHand(T, which, rate) {
 function enforceCapacity() {
   const n = particles.length;
 
-  // Only prune when the chamber is full.
-  // Keep the visible fill capped at 100% by killing the oldest overflow immediately.
+  // Only prune when the chamber is full
   if (n <= CAPACITY) return;
 
-  const extra = n - CAPACITY;
-  for (let i = 0; i < extra; i++) {
-    const p = particles[i];
-    if (p) p.life = 0;
+  // Overcrowding ratio
+  const over = (n - CAPACITY) / CAPACITY;
+
+  // How many particles to fade this frame
+  const pruneCount = floor(1 + over * 10);
+
+  for (let k = 0; k < pruneCount; k++) {
+    const p = particles[k];
+    if (!p) continue;
+
+    // Push oldest particles toward death
+    p.life -= 6 + over * 20;
+  }
+
+  // Absolute safety cap
+  if (n > CAPACITY) {
+    const extra = n - CAPACITY;
+    for (let i = 0; i < extra; i++) {
+      if (particles[i]) particles[i].life -= 40;
+    }
   }
 }
 
@@ -2243,7 +2115,6 @@ function drawHead(p, r) {
 
 function updateParticles(T) {
   updateXrayBlobs();
-  updateXraySegments();
   // free-space particles only (hand reservoir particles are updated separately)
   chamberFillFrac = constrain(particles.length / CAPACITY, 0, 1);
   const denseMode = chamberFillFrac >= DENSE_MODE_THRESHOLD;
@@ -2331,8 +2202,9 @@ function drawParticles() {
 
   push();
   blendMode(BLEND);
-  const kinds = SOLO_KIND ? [SOLO_KIND] : ["protons", "h_ions", "mag", "electrons", "xray"];
-  for (const kind of kinds) drawByKind(kind);
+  for (const kind of ["protons", "h_ions", "mag", "electrons", "xray"]) {
+    drawByKind(kind);
+  }
   pop();
 }
 
@@ -2471,18 +2343,13 @@ function drawHUD() {
     `Audio: ${playing} | amp ${nf(overallAmp,1,3)} | x ${nf(xray,1,2)} m ${nf(mag,1,2)} h ${nf(h_ions,1,2)} e ${nf(electrons,1,2)} p ${nf(protons,1,2)}`,
     x, y + 38
   );
-  if (SOLO_KIND) {
-    fill(255, 200);
-    text(`SOLO: ${SOLO_KIND} (press 0 for all)`, x, y + 54);
-    fill(255, 150);
-  }
   text(
-    `Particles: ${particles.length} | fill ${nf(min(100, (particles.length / CAPACITY) * 100), 1, 1)}%`,
-    x, (SOLO_KIND ? (y + 70) : (y + 54))
+    `Particles: ${particles.length} | fill ${nf((particles.length / CAPACITY) * 100, 1, 1)}%`,
+    x, y + 54
   );
   text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
-    x, (SOLO_KIND ? (y + 86) : (y + 70))
+    x, y + 70
   );
 }
 

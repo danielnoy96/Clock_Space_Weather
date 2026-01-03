@@ -75,7 +75,7 @@ const COL = {
   protons:   [10, 30, 120],   // dark blue
 };
 
-const PARTICLE_SIZE_SCALE = 4;
+const PARTICLE_SIZE_SCALE = 6;
 // Global scaling factor for particle counts (set to 0.1 for 10% of previous counts)
 const PARTICLE_SCALE = 0.10;
 
@@ -1026,8 +1026,8 @@ function applyCalmOrbit(p, center) {
   const edgeBias = pow(edgeFrac, 1.8); // stronger pull near rim, weak near center
 
   // Base orbit + audio wobble
-  const swirl = 0.90 + 0.40 * mag + 0.20 * protons;         // smooth orbit
-  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias; // gentle inward spiral, rim-weighted
+  const swirl = 0.20 + 0.40 * mag + 0.20 * protons;         // smooth orbit
+  const driftIn = (0.010 + 0.04 * h_ions + 0.02 * mag) * edgeBias; // gentle inward spiral, rim-weighted
   const jitter = 0.06 + 0.45 * electrons;                   // reduced micro-turbulence
   const soften = 1.0 - 0.65 * protons;                       // high protons = less distortion
 
@@ -2148,14 +2148,29 @@ function emitFromHand(T, which, rate) {
 function enforceCapacity() {
   const n = particles.length;
 
-  // Only prune when the chamber is full.
-  // Keep the visible fill capped at 100% by killing the oldest overflow immediately.
+  // Only prune when the chamber is full
   if (n <= CAPACITY) return;
 
-  const extra = n - CAPACITY;
-  for (let i = 0; i < extra; i++) {
-    const p = particles[i];
-    if (p) p.life = 0;
+  // Overcrowding ratio
+  const over = (n - CAPACITY) / CAPACITY;
+
+  // How many particles to fade this frame
+  const pruneCount = floor(1 + over * 10);
+
+  for (let k = 0; k < pruneCount; k++) {
+    const p = particles[k];
+    if (!p) continue;
+
+    // Push oldest particles toward death
+    p.life -= 6 + over * 20;
+  }
+
+  // Absolute safety cap
+  if (n > CAPACITY) {
+    const extra = n - CAPACITY;
+    for (let i = 0; i < extra; i++) {
+      if (particles[i]) particles[i].life -= 40;
+    }
   }
 }
 
@@ -2477,7 +2492,7 @@ function drawHUD() {
     fill(255, 150);
   }
   text(
-    `Particles: ${particles.length} | fill ${nf(min(100, (particles.length / CAPACITY) * 100), 1, 1)}%`,
+    `Particles: ${particles.length} | fill ${nf((particles.length / CAPACITY) * 100, 1, 1)}%`,
     x, (SOLO_KIND ? (y + 70) : (y + 54))
   );
   text(
