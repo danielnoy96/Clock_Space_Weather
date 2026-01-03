@@ -16,8 +16,29 @@ let fft, amp;
 let bus;              // routing + analysis bus
 let analysisOK = false;
 
+// PERF: Precomputed direction LUT to avoid per-frame random vector allocations.
+const DIR_N = 256; // power of 2 (masking)
+const DIR_MASK = DIR_N - 1;
+let DIR_X = null; // Float32Array(DIR_N)
+let DIR_Y = null; // Float32Array(DIR_N)
+
+// PERF: Particle pooling (reduces GC/micro-stutter from frequent spawns/removals).
+const KINDS = ["xray", "mag", "h_ions", "electrons", "protons"];
+const POOL_TARGET = { xray: 7000, mag: 7000, h_ions: 7000, electrons: 7000, protons: 7000 };
+let pools = { xray: [], mag: [], h_ions: [], electrons: [], protons: [] };
+const SPAWN_BUDGET_MAX = 800;
+let spawnBudget = SPAWN_BUDGET_MAX;
+const COMPACT_EVERY = 10; // compact null holes in-order every N frames
+
 // ---------- Proxies ----------
 let xray = 0, mag = 0, h_ions = 0, electrons = 0, protons = 0, overallAmp = 0;
+let raw = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
+let state = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
+let prevState = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
+let dState = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
+let envX = 0;
+let CURRENT_T = null;
+let xrayEvents = [];
 const CHANGE_SMOOTH = 0.45;
 const CHANGE_GAIN = 28.0;
 const CHANGE_KNEE = 3.0;
@@ -25,13 +46,19 @@ const REACTIVITY_SCALE = 1.2;
 const REACTIVITY_KNEE = 0.6;
 const REACTIVITY_COMPRESS = 1.2;
 const XRAY_MICRO_BURST_SCALE = 0.18;
-const ALPHA_SCALE = 2.45;
+const ALPHA_SCALE = 3.0
 // Reduce how much opacity changes with strength (keeps colors more identifiable).
 const ALPHA_STRENGTH_MIX = 0.25;
 const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
 const DRAW_GRID_SIZE = 3;
 const DISABLE_FPS_THROTTLE = true;
+
+// Space-field motion controls (global multipliers).
+// Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
+let SPACE_SWIRL_MULT = 1.0;    // tangential orbit strength
+let SPACE_DRIFTIN_MULT = 1.0;  // inward spiral strength
+let SPACE_JITTER_MULT = 1.0;   // micro-turbulence strength
 
 // Visual behavior profiles (make each force readable by "shape in motion")
 const LAYER_BEHAVIOR = {
@@ -48,11 +75,30 @@ let SOLO_KIND = null;
 // XRAY "segments": event pulses that stay rigid and coherent (stiff sticks)
 let xraySegments = [];
 let xraySegmentIdCounter = 1;
-let xraySegIndex = Object.create(null);
+// PERF: keep segment index as a persistent Map (avoid per-frame Object.create(null)).
+let xraySegIndex = new Map();
 let lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
 
 // H-ions "chains": elongated streams that stick like a chain
 let lastHIonByHand = { hour: null, minute: null, second: null };
+
+// Reusable occupancy buffer for grid drawing (avoid per-frame allocations)
+let usedCols = 0, usedRows = 0;
+let usedStamp = null; // Uint32Array
+let usedFrameId = 1;
+
+const COLLISION_KINDS = { protons: true, h_ions: true };
+const COLLISION_ITERS_MASS = 3;
+
+// PERF: collision solver caches to avoid per-call allocations.
+const COLLISION_GRID_EVERY = 2;
+let radCache = null; // Float32Array
+let collisionGridCache = null; // Map
+let collisionGridFrame = -1;
+let collisionGridCellSizeCache = 0;
+let collisionGridCountCache = 0;
+let collisionListCache = [];
+let collisionGridScratch = null; // Map (for optional cleanup pass)
 
 let prevLevel = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let delta = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -72,7 +118,7 @@ const COL = {
   mag:       [255, 245, 230], // warm white
   h_ions:    [150, 70, 255],  // purple
   electrons: [0, 210, 255],   // light blue
-  protons:   [10, 30, 120],   // dark blue
+  protons:   [120, 15, 115], // dark blue
 };
 
 const PARTICLE_SIZE_SCALE = 4;
@@ -95,6 +141,8 @@ let fpsSmoothed = 60;
 // X-ray pulse "blob" system (cheap cohesion with memory)
 let xrayBlobs = [];
 let xrayBlobIdCounter = 1;
+// PERF: keep blob index as a persistent Map (avoid per-frame maps).
+let xrayBlobIndex = new Map();
 const XRAY_PULSE_BASE = 90;
 const XRAY_PULSE_MAX = 520;
 const XRAY_BLOB_BASE_RADIUS = 75;
@@ -185,7 +233,7 @@ const PARTICLE_PROFILE = {
     layerStrength: 0.020,
   },
   protons: {
-    alphaBase: 14,
+    alphaBase: 60,
     alphaStrength: 85,
     sizeMult: 1.0,
     dragMult: 0.999,
@@ -220,6 +268,88 @@ function updateLayerMemory() {
   xrayMemory = max(xrayMemory * 0.985, xray);
 }
 
+function updateControlLayer() {
+  // Derivatives from previous controlled state
+  const px = state.xray, pm = state.mag, ph = state.h_ions, pe = state.electrons, pp = state.protons, po = state.overall;
+
+  // Protons: very stable, slow mass/pressure
+  state.protons = lerp(state.protons, raw.protons, 0.08);
+
+  // Magnetic: ultra stable, very slow structure (with deadband)
+  const magDelta = raw.mag - state.mag;
+  if (abs(magDelta) > 0.01) state.mag = lerp(state.mag, raw.mag, 0.025);
+
+  // H-ions: medium smoothing + rate limit (flow)
+  const hStep = constrain(raw.h_ions - state.h_ions, -0.04, 0.04);
+  state.h_ions = lerp(state.h_ions, state.h_ions + hStep, 0.30);
+
+  // Electrons: unstable, fast continuous vibration
+  state.electrons = lerp(state.electrons, raw.electrons, 0.62);
+
+  // X-ray: event-driven (spikes over slow envelope)
+  envX = lerp(envX, raw.xray, 0.06);
+  const spike = max(0, raw.xray - envX);
+  state.xray = lerp(state.xray, raw.xray, 0.55);
+
+  // Overall amplitude (keeps "how much" separate from composition)
+  state.overall = lerp(state.overall, raw.overall, 0.35);
+
+  // Derivatives
+  dState.xray = abs(state.xray - px);
+  dState.mag = abs(state.mag - pm);
+  dState.h_ions = abs(state.h_ions - ph);
+  dState.electrons = abs(state.electrons - pe);
+  dState.protons = abs(state.protons - pp);
+  dState.overall = abs(state.overall - po);
+
+  // Emphasized change signals 0..1 (used for visual modulation only)
+  const emph = (d) => {
+    const u = constrain(d * 14.0, 0, 3.0);
+    return u / (1 + u);
+  };
+  changeEmph.xray = emph(dState.xray) + emph(spike) * 0.8;
+  changeEmph.mag = emph(dState.mag);
+  changeEmph.h_ions = emph(dState.h_ions);
+  changeEmph.electrons = emph(dState.electrons) * 1.25;
+  changeEmph.protons = emph(dState.protons) * 0.8;
+
+  // Trigger x-ray events on spikes (shapes are truth; particles are texture)
+  if (CURRENT_T && spike > 0.08) {
+    const s = constrain(spike * 6.0, 0, 1);
+    xrayEvents.push({
+      x: CURRENT_T.secP.x,
+      y: CURRENT_T.secP.y,
+      strength: s,
+      birthFrame: frameCount || 0,
+      ttl: 55 + floor(120 * s),
+      baseRadius: 14 + 34 * s,
+      expansionRate: 0.9 + 2.6 * s,
+    });
+    // Texture: small cohesive puff inside the event region
+    spawnXrayPulse(CURRENT_T, s, 0.08);
+  }
+  // Keep only active events (used for short-lived "shock" coupling, not for persistent memory).
+  if (xrayEvents.length) {
+    const now = frameCount || 0;
+    const kept = [];
+    for (let i = 0; i < xrayEvents.length; i++) {
+      const e = xrayEvents[i];
+      if (!e) continue;
+      if ((now - (e.birthFrame || 0)) < (e.ttl || 0)) kept.push(e);
+    }
+    xrayEvents = kept;
+  }
+  if (xrayEvents.length > 32) xrayEvents.splice(0, xrayEvents.length - 32);
+
+  // Publish to legacy globals so existing code keeps working.
+  xray = state.xray;
+  mag = state.mag;
+  h_ions = state.h_ions;
+  electrons = state.electrons;
+  protons = state.protons;
+  overallAmp = state.overall;
+}
+
 function updatePerfThrottles() {
   const fps = frameRate();
   if (fps && isFinite(fps)) fpsSmoothed = lerp(fpsSmoothed, fps, 0.06);
@@ -240,14 +370,16 @@ function updatePerfThrottles() {
     RESERVOIR_UPDATE_EVERY = 2;
     COLLISION_ITERS = 2;
   } else if (fpsSmoothed < 45) {
-    COHESION_GRID_EVERY = 2;
+    // PERF: rebuild cohesion grid less often (reduces Map churn).
+    COHESION_GRID_EVERY = 3;
     COHESION_APPLY_STRIDE = 3;
     HEAVY_FIELD_STRIDE = 3;
     FIELD_UPDATE_EVERY = 2;
     RESERVOIR_UPDATE_EVERY = 1;
     COLLISION_ITERS = 3;
   } else {
-    COHESION_GRID_EVERY = 2;
+    // PERF: rebuild cohesion grid less often (reduces Map churn).
+    COHESION_GRID_EVERY = 3;
     COHESION_APPLY_STRIDE = 2;
     HEAVY_FIELD_STRIDE = 2;
     FIELD_UPDATE_EVERY = 2;
@@ -264,7 +396,10 @@ function spawnXrayPulse(T, spikeStrength, countScale) {
   const rawCount = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
   const count = max(1, floor(rawCount * PARTICLE_SCALE * scale));
   const radius = constrain(XRAY_BLOB_BASE_RADIUS + s * 140 + xray * 70, XRAY_BLOB_BASE_RADIUS, XRAY_BLOB_MAX_RADIUS);
-  xrayBlobs.push({ id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, count: 0 });
+  // PERF: store accumulators on the blob (no per-frame Object.create(null) maps).
+  const blob = { id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, sumX: 0, sumY: 0, count: 0 };
+  xrayBlobs.push(blob);
+  xrayBlobIndex.set(id, blob);
 
   const pos = T.secP.copy();
   for (let i = 0; i < count; i++) {
@@ -274,7 +409,8 @@ function spawnXrayPulse(T, spikeStrength, countScale) {
     const vy = sin(ang) * spd;
     const life = 1e9;
     const size = 1.6;
-    const p = new Particle(pos.x, pos.y, vx, vy, life, size, COL.xray, "xray");
+    const p = spawnFromPool("xray", pos.x, pos.y, vx, vy, life, size, COL.xray);
+    if (!p) break;
     p.strength = max(xray, s);
     p.blobId = id;
     particles.push(p);
@@ -283,64 +419,76 @@ function spawnXrayPulse(T, spikeStrength, countScale) {
 
 function updateXrayBlobs() {
   if (!xrayBlobs.length) return;
+  // Reset accumulators.
+  for (let i = 0; i < xrayBlobs.length; i++) {
+    const b = xrayBlobs[i];
+    b.sumX = 0;
+    b.sumY = 0;
+    b.count = 0;
+  }
 
-  const sumsX = Object.create(null);
-  const sumsY = Object.create(null);
-  const counts = Object.create(null);
-
+  // Single pass over particles to accumulate.
   for (let i = 0; i < particles.length; i++) {
     const p = particles[i];
     if (!p || p.kind !== "xray" || !p.blobId) continue;
-    const id = p.blobId;
-    counts[id] = (counts[id] || 0) + 1;
-    sumsX[id] = (sumsX[id] || 0) + p.pos.x;
-    sumsY[id] = (sumsY[id] || 0) + p.pos.y;
+    const b = xrayBlobIndex.get(p.blobId);
+    if (!b) continue;
+    b.sumX += p.pos.x;
+    b.sumY += p.pos.y;
+    b.count++;
   }
 
   const kept = [];
   for (let i = 0; i < xrayBlobs.length; i++) {
     const b = xrayBlobs[i];
-    const n = counts[b.id] || 0;
-    b.count = n;
+    const n = b.count || 0;
     if (n > 0) {
-      b.cx = sumsX[b.id] / n;
-      b.cy = sumsY[b.id] / n;
+      b.cx = b.sumX / n;
+      b.cy = b.sumY / n;
       // keep blob strength "remembered" but slowly relax
       b.strength = max(b.strength * 0.996, xrayMemory);
       kept.push(b);
+    } else {
+      xrayBlobIndex.delete(b.id);
     }
   }
   xrayBlobs = kept;
 }
 
 function updateXraySegments() {
-  xraySegIndex = Object.create(null);
   if (!xraySegments.length) return;
 
-  const sumsX = Object.create(null);
-  const sumsY = Object.create(null);
-  const counts = Object.create(null);
+  // Reset accumulators.
+  for (let i = 0; i < xraySegments.length; i++) {
+    const s = xraySegments[i];
+    s.sumX = 0;
+    s.sumY = 0;
+    s.count = 0;
+  }
 
   for (let i = 0; i < particles.length; i++) {
     const p = particles[i];
     if (!p || p.kind !== "xray" || !p.segId) continue;
-    const id = p.segId;
-    counts[id] = (counts[id] || 0) + 1;
-    sumsX[id] = (sumsX[id] || 0) + p.pos.x;
-    sumsY[id] = (sumsY[id] || 0) + p.pos.y;
+    const s = xraySegIndex.get(p.segId);
+    if (!s) continue;
+    s.sumX += p.pos.x;
+    s.sumY += p.pos.y;
+    s.count++;
   }
 
   const kept = [];
   for (let i = 0; i < xraySegments.length; i++) {
     const s = xraySegments[i];
-    const n = counts[s.id] || 0;
-    s.count = n;
     s.age = (s.age || 0) + 1;
-    if (n > 0 && s.age < (s.ttl || 120)) {
-      s.cx = sumsX[s.id] / n;
-      s.cy = sumsY[s.id] / n;
+    // Keep segments as long as they still have particles.
+    // The particles themselves are the time-record; don't drop the constraint early.
+    if (s.count > 0) {
+      s.cx = s.sumX / s.count;
+      s.cy = s.sumY / s.count;
       kept.push(s);
-      xraySegIndex[s.id] = s;
+      xraySegIndex.set(s.id, s);
+    } else {
+      xraySegIndex.delete(s.id);
     }
   }
   xraySegments = kept;
@@ -361,15 +509,17 @@ function createXraySegment(head, dir, intensity) {
     ttl,
     age: 0,
     count: 0,
+    sumX: 0,
+    sumY: 0,
   };
   xraySegments.push(seg);
-  xraySegIndex[id] = seg;
+  xraySegIndex.set(id, seg);
   return seg;
 }
 
 function applyXraySegmentConstraint(p) {
   if (!p.segId) return;
-  const seg = xraySegIndex[p.segId];
+  const seg = xraySegIndex.get(p.segId);
   if (!seg) return;
 
   const dx = p.pos.x - seg.cx;
@@ -484,25 +634,63 @@ const DENSITY_H = 64;
 const DENSITY_UPDATE_EVERY = 2;
 const DENSITY_PRESSURE = 0.04;
 const DENSE_DISABLE_COHESION = false;
-let densityGrid = null;
+// Density grids (per-kind + total) for cross-kind "one medium" coupling.
+let densAll = null;
+let densXray = null;
+let densElectrons = null;
+let densProtons = null;
+let densHIons = null;
+let densMag = null;
 let densityGridFrame = -1;
 const DENSITY_VISCOSITY = 0.30;
 const DENSITY_DAMPING = 0.35;
 const DENSE_VEL_SMOOTH = 0.60;
 
+const DENSITY_KINDS = ["xray", "electrons", "protons", "h_ions", "mag"];
+const DENSITY_COUPLING = {
+  // Coefficients scale the density-gradient response; overall strength is set by DENSITY_PRESSURE.
+  // Positive = repulsion from that kind's dense regions; negative could be attraction.
+  xray:      { xray: 0.35, electrons: 0.55, protons: 0.80, h_ions: 0.60, mag: 0.10 },
+  electrons: { xray: 0.35, electrons: 0.20, protons: 1.05, h_ions: 0.55, mag: 0.08 },
+  protons:   { xray: 0.95, electrons: 0.80, protons: 1.35, h_ions: 0.95, mag: 0.15 },
+  h_ions:    { xray: 0.55, electrons: 0.45, protons: 1.00, h_ions: 0.75, mag: 0.10 },
+  mag:       { xray: 0.10, electrons: 0.08, protons: 0.18, h_ions: 0.10, mag: 0.00 },
+};
+
+const ELECTRON_TREMOR_COUPLING = 0.45; // adds diffusion/noise to others via electrons gradient
+const HION_FLOW_COUPLING = 0.28;       // adds "streamline" bias via h_ions gradient
+const MAG_ALIGN_COUPLING = 0.12;       // alignment steering strength from local mag density
+const XRAY_EVENT_SHOCK_BOOST = 1.6;    // boosts xray coupling during events
+const DENSITY_COUPLING_ENABLE_AT = 0.06; // enable coupling once chamber has a little mass
+
 // Gentle alignment so dense regions flow together instead of colliding.
 const ALIGNMENT_RADIUS = 85;
 const ALIGNMENT_STRENGTH = 0.035;
-const ALIGNMENT_EVERY = 2;
+// PERF: rebuild alignment grid slightly less often (reduces Map churn).
+const ALIGNMENT_EVERY = 3;
 const ALIGNMENT_STRIDE = 2;
 let alignmentGridCache = null;
 let alignmentGridFrame = -1;
 
+// PERF: object pooling for neighbor/cohesion grids (reduces Map/Array churn).
+let neighborCellPool = [];
+let neighborCellsInUse = [];
+let cohesionCellPool = [];
+let cohesionCellsInUse = [];
+let collisionCellPool = [];
+let collisionCellsInUse = [];
+let alignmentCellPool = [];
+let alignmentCellsInUse = [];
+
 // ---------- Visual systems ----------
 let particles = [];
+let particlesActive = 0;
 let prevHandAngles = null;
 let disableFrameForces = false;
 let debugHandShapes = false;
+let debugDensityCoupling = false;
+let debugPerfHUD = false;
+let debugPoolHUD = false;
 let handParticles = { hour: [], minute: [], second: [] };
 let handSlots = { hour: null, minute: null, second: null };
 let handSlotMeta = { hour: null, minute: null, second: null };
@@ -520,6 +708,15 @@ function setup() {
   createCanvas(1200, 1200);
   angleMode(RADIANS);
   pixelDensity(1);
+
+  // PERF: Fill direction LUT once (no random2D allocations in hot loops).
+  DIR_X = new Float32Array(DIR_N);
+  DIR_Y = new Float32Array(DIR_N);
+  for (let i = 0; i < DIR_N; i++) {
+    const a = (TWO_PI * i) / DIR_N;
+    DIR_X[i] = cos(a);
+    DIR_Y[i] = sin(a);
+  }
 
   // Make sure p5.sound exists
   if (typeof p5 === "undefined" || typeof p5.FFT === "undefined") {
@@ -561,6 +758,9 @@ amp.setInput();
     SOFT_CAP = CAPACITY;
   }
 
+  // PERF: prewarm particle pools (one-time load, smoother runtime).
+  prewarmPools();
+
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
   }
@@ -568,6 +768,35 @@ amp.setInput();
 
 function windowResized() {
   resizeCanvas(1200, 1200);
+}
+
+// PERF: pool helpers (no per-spawn object allocations).
+function prewarmPools() {
+  for (const kind of KINDS) {
+    const target = max(0, POOL_TARGET[kind] | 0);
+    const pool = pools[kind];
+    for (let i = pool.length; i < target; i++) {
+      const p = new Particle(0, 0, 0, 0, 0, 1.6, COL[kind] || COL.protons, kind);
+      p.deactivate();
+      pool.push(p);
+    }
+  }
+}
+
+function spawnFromPool(kind, x, y, vx, vy, life, size, col) {
+  if (spawnBudget <= 0) return null;
+  spawnBudget--;
+  const pool = pools[kind] || pools.protons;
+  const p = pool.length ? pool.pop() : new Particle(0, 0, 0, 0, 0, 1.6, col || COL.protons, kind);
+  p.resetFromSpawn(kind, x, y, vx, vy, life, size, col);
+  return p;
+}
+
+function returnToPool(p) {
+  if (!p || !p.kind) return;
+  p.deactivate();
+  const pool = pools[p.kind] || pools.protons;
+  pool.push(p);
 }
 
 function seedChamberParticles(T, count) {
@@ -588,37 +817,61 @@ function seedChamberParticles(T, count) {
     const col = COL[kind] || COL.protons;
 
     // Gentle initial motion: mostly tangential + tiny noise (prevents ring-lock at t=0)
-    const tang = createVector(-sin(ang), cos(ang));
-    const rad = createVector(cos(ang), sin(ang));
     const spd = 0.10 + random(0.55);
-    const v = tang.mult(spd).add(rad.mult((random() - 0.5) * 0.12));
+    const vx = (-sin(ang)) * spd + (cos(ang)) * ((random() - 0.5) * 0.12);
+    const vy = (cos(ang)) * spd + (sin(ang)) * ((random() - 0.5) * 0.12);
 
     let size = 1.6;
 
-    const p = new Particle(x, y, v.x, v.y, 1e9, size, col, kind);
+    // Pre-seed ignores per-frame budget.
+    const prev = spawnBudget;
+    spawnBudget = 1e9;
+    const p = spawnFromPool(kind, x, y, vx, vy, 1e9, size, col);
+    spawnBudget = prev;
     p.strength = 0.35; // neutral baseline; audio will take over
-    particles.push(p);
+    if (p) particles.push(p);
   }
 }
 function confineToClock(p, center, radius) {
-  const toP = p5.Vector.sub(p.pos, center);
-  const d = toP.mag();
-  if (d > radius) {
-    toP.normalize();
+  // PERF: scalar math (avoids per-particle p5.Vector allocations).
+  const dx = p.pos.x - center.x;
+  const dy = p.pos.y - center.y;
+  const r2 = radius * radius;
+  const d2 = dx * dx + dy * dy;
+  if (d2 > r2) {
+    const d = sqrt(d2) + 1e-6;
+    const nx = dx / d;
+    const ny = dy / d;
     // snap inside
-    p.pos = p5.Vector.add(center, toP.copy().mult(radius - 1));
+    const rr = radius - 1;
+    p.pos.x = center.x + nx * rr;
+    p.pos.y = center.y + ny * rr;
 
-    // reflect + damp
-    const n = toP; // outward normal
-    const vn = n.copy().mult(p.vel.dot(n));
-    const vt = p5.Vector.sub(p.vel, vn);
-    p.vel = p5.Vector.sub(vt, vn.mult(0.9));
-    p.vel.mult(0.75);
+    // reflect + damp (matches: vel = vel - 1.9 * n * dot(vel,n))
+    const vn = p.vel.x * nx + p.vel.y * ny;
+    const vnx = nx * vn;
+    const vny = ny * vn;
+    p.vel.x = (p.vel.x - 1.9 * vnx) * 0.75;
+    p.vel.y = (p.vel.y - 1.9 * vny) * 0.75;
   }
 }
 
 function buildCohesionGrid(list, cellSize) {
-  const grid = new Map();
+  // PERF: reuse a cached Map + pooled cell objects (avoid frequent allocations).
+  if (!cohesionGridCache) cohesionGridCache = new Map();
+  const grid = cohesionGridCache;
+  // recycle previous cells
+  for (let i = 0; i < cohesionCellsInUse.length; i++) {
+    const cell = cohesionCellsInUse[i];
+    cell.xray.length = 0;
+    cell.mag.length = 0;
+    cell.h_ions.length = 0;
+    cell.electrons.length = 0;
+    cell.protons.length = 0;
+    cohesionCellPool.push(cell);
+  }
+  cohesionCellsInUse.length = 0;
+  grid.clear();
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
     if (!p) continue;
@@ -627,7 +880,10 @@ function buildCohesionGrid(list, cellSize) {
     const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
     let cell = grid.get(key);
     if (!cell) {
-      cell = { xray: [], mag: [], h_ions: [], electrons: [], protons: [] };
+      cell =
+        cohesionCellPool.pop() ||
+        { xray: [], mag: [], h_ions: [], electrons: [], protons: [] };
+      cohesionCellsInUse.push(cell);
       grid.set(key, cell);
     }
     const k = p.kind;
@@ -645,6 +901,7 @@ function getCohesionGrid(list, cellSize) {
 }
 
 function buildNeighborGrid(list, cellSize) {
+  // PERF: build into a reused Map and pooled arrays.
   const grid = new Map();
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
@@ -662,9 +919,38 @@ function buildNeighborGrid(list, cellSize) {
   return grid;
 }
 
+function rebuildNeighborGridInto(list, cellSize, grid, cellsInUse, pool) {
+  if (!grid) grid = new Map();
+  // recycle previous cell arrays
+  for (let i = 0; i < cellsInUse.length; i++) {
+    const arr = cellsInUse[i];
+    arr.length = 0;
+    pool.push(arr);
+  }
+  cellsInUse.length = 0;
+  grid.clear();
+
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p) continue;
+    const cx = floor(p.pos.x / cellSize);
+    const cy = floor(p.pos.y / cellSize);
+    const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
+    let cell = grid.get(key);
+    if (!cell) {
+      cell = pool.pop() || [];
+      cellsInUse.push(cell);
+      grid.set(key, cell);
+    }
+    cell.push(i);
+  }
+  return grid;
+}
+
 function getAlignmentGrid(list, cellSize) {
   if (!alignmentGridCache || (frameCount - alignmentGridFrame) >= ALIGNMENT_EVERY) {
-    alignmentGridCache = buildNeighborGrid(list, cellSize);
+    // PERF: reuse Map + pooled arrays.
+    alignmentGridCache = rebuildNeighborGridInto(list, cellSize, alignmentGridCache, alignmentCellsInUse, alignmentCellPool);
     alignmentGridFrame = frameCount;
   }
   return alignmentGridCache;
@@ -676,9 +962,35 @@ function computeCollisionRadius(p) {
   return max(1.2, (s * 0.5) * COLLISION_RADIUS_SCALE);
 }
 
-function rebuildDensityGrid() {
-  if (!densityGrid) densityGrid = new Uint16Array(DENSITY_W * DENSITY_H);
-  densityGrid.fill(0);
+function ensureDensityGrids() {
+  const n = DENSITY_W * DENSITY_H;
+  if (!densAll || densAll.length !== n) {
+    densAll = new Uint16Array(n);
+    densXray = new Uint16Array(n);
+    densElectrons = new Uint16Array(n);
+    densProtons = new Uint16Array(n);
+    densHIons = new Uint16Array(n);
+    densMag = new Uint16Array(n);
+  }
+}
+
+function getDensityGridForKind(kind) {
+  if (kind === "xray") return densXray;
+  if (kind === "electrons") return densElectrons;
+  if (kind === "protons") return densProtons;
+  if (kind === "h_ions") return densHIons;
+  if (kind === "mag") return densMag;
+  return null;
+}
+
+function rebuildDensityGrids() {
+  ensureDensityGrids();
+  densAll.fill(0);
+  densXray.fill(0);
+  densElectrons.fill(0);
+  densProtons.fill(0);
+  densHIons.fill(0);
+  densMag.fill(0);
 
   const sx = DENSITY_W / max(1, width);
   const sy = DENSITY_H / max(1, height);
@@ -691,12 +1003,49 @@ function rebuildDensityGrid() {
     if (gx < 0) gx = 0; else if (gx >= DENSITY_W) gx = DENSITY_W - 1;
     if (gy < 0) gy = 0; else if (gy >= DENSITY_H) gy = DENSITY_H - 1;
     const idx = gy * DENSITY_W + gx;
-    if (densityGrid[idx] < 65535) densityGrid[idx]++;
+    if (densAll[idx] < 65535) densAll[idx]++;
+    const g = getDensityGridForKind(p.kind);
+    if (g && g[idx] < 65535) g[idx]++;
+  }
+
+  // X-ray events inject short-lived "shock density" so other kinds react locally.
+  if (Array.isArray(xrayEvents) && xrayEvents.length) {
+    for (let i = 0; i < xrayEvents.length; i++) {
+      const e = xrayEvents[i];
+      if (!e) continue;
+      let gx = floor(e.x * sx);
+      let gy = floor(e.y * sy);
+      if (gx < 1) gx = 1; else if (gx > DENSITY_W - 2) gx = DENSITY_W - 2;
+      if (gy < 1) gy = 1; else if (gy > DENSITY_H - 2) gy = DENSITY_H - 2;
+      const idx = gy * DENSITY_W + gx;
+      const add = floor(20 + (e.strength || 0) * 60);
+      const addTo = (j, v) => {
+        densXray[j] = min(65535, densXray[j] + v);
+        densAll[j] = min(65535, densAll[j] + v);
+      };
+      addTo(idx, add);
+      addTo(idx - 1, floor(add * 0.65));
+      addTo(idx + 1, floor(add * 0.65));
+      addTo(idx - DENSITY_W, floor(add * 0.65));
+      addTo(idx + DENSITY_W, floor(add * 0.65));
+    }
   }
 }
 
-function applyDensityPressure(p) {
-  if (!densityGrid) return;
+function sampleDensityGradient(grid, idx) {
+  const l = grid[idx - 1] || 0;
+  const r = grid[idx + 1] || 0;
+  const u = grid[idx - DENSITY_W] || 0;
+  const d = grid[idx + DENSITY_W] || 0;
+  const dx = (r - l);
+  const dy = (d - u);
+  const m = sqrt(dx * dx + dy * dy) + 1e-6;
+  // Normalized direction toward higher density.
+  return { dx: dx / m, dy: dy / m, g: min(1, (abs(dx) + abs(dy)) * 0.06) };
+}
+
+function applyDensityCoupling(p, T) {
+  if (!densAll) return;
 
   const sx = DENSITY_W / max(1, width);
   const sy = DENSITY_H / max(1, height);
@@ -706,24 +1055,61 @@ function applyDensityPressure(p) {
   if (gy < 1) gy = 1; else if (gy > DENSITY_H - 2) gy = DENSITY_H - 2;
 
   const idx = gy * DENSITY_W + gx;
-  const c = densityGrid[idx] || 0;
-  if (c <= 2) return;
+  const c = densAll[idx] || 0;
+  if (c <= 1) return;
 
-  const l = densityGrid[idx - 1] || 0;
-  const r = densityGrid[idx + 1] || 0;
-  const u = densityGrid[idx - DENSITY_W] || 0;
-  const d = densityGrid[idx + DENSITY_W] || 0;
+  const A = p.kind;
+  const KA = DENSITY_COUPLING[A] || DENSITY_COUPLING.protons;
+  const base = DENSITY_PRESSURE * (0.55 + chamberFillFrac * 1.05);
 
-  const gxN = (r - l);
-  const gyN = (d - u);
-  const m = sqrt(gxN * gxN + gyN * gyN) + 1e-6;
+  let fx = 0, fy = 0;
 
-  // push away from higher density (negative gradient)
-  const k = DENSITY_PRESSURE * (0.6 + chamberFillFrac * 0.8) * (1.0 - protons * 0.35);
-  p.vel.x += (-gxN / m) * k;
-  p.vel.y += (-gyN / m) * k;
+  // Sum repulsion from each kind's density gradient.
+  for (let i = 0; i < DENSITY_KINDS.length; i++) {
+    const B = DENSITY_KINDS[i];
+    let k = KA[B] || 0;
+    if (k === 0) continue;
 
-  // Local viscosity: dense cells slow down and flow together more smoothly.
+    let grid = null;
+    if (B === "xray") grid = densXray;
+    else if (B === "electrons") grid = densElectrons;
+    else if (B === "protons") grid = densProtons;
+    else if (B === "h_ions") grid = densHIons;
+    else if (B === "mag") grid = densMag;
+    if (!grid) continue;
+
+    const grad = sampleDensityGradient(grid, idx);
+    // Repel away from denser regions (negative gradient).
+    const ax = -grad.dx;
+    const ay = -grad.dy;
+
+    // X-ray: shock boost during events (still local because it's driven by densXray).
+    if (B === "xray") k *= (1.0 + changeEmph.xray * XRAY_EVENT_SHOCK_BOOST);
+
+    fx += ax * k;
+    fy += ay * k;
+
+    // Electrons: add diffusion/tremor to others (perpendicular, noisy).
+    if (B === "electrons" && A !== "electrons") {
+      const trem = ELECTRON_TREMOR_COUPLING * k * grad.g * (0.4 + electrons);
+      const t = millis() * 0.001;
+      const s = sin(t * (2.8 + 2.0 * electrons) + p.seed * 1.7);
+      fx += (ay * trem) * s;
+      fy += (-ax * trem) * s;
+    }
+
+    // H-ions: add flow bias so gradients read as streamlines.
+    if (B === "h_ions") {
+      const flow = HION_FLOW_COUPLING * k * grad.g * (A === "h_ions" ? 1.0 : 0.55) * (0.35 + h_ions);
+      fx += (ay * flow);
+      fy += (-ax * flow);
+    }
+  }
+
+  p.vel.x += fx * base;
+  p.vel.y += fy * base;
+
+  // Local viscosity: dense cells slow down and flow together more smoothly (all kinds).
   const visc = constrain((c - 2) * 0.03, 0, 1) * DENSITY_VISCOSITY;
   if (visc > 0) {
     p.vel.mult(1.0 - visc);
@@ -731,6 +1117,22 @@ function applyDensityPressure(p) {
   if (visc > 0 && DENSE_VEL_SMOOTH > 0) {
     p.vel.x = lerp(p.vel.x, 0, visc * DENSE_VEL_SMOOTH);
     p.vel.y = lerp(p.vel.y, 0, visc * DENSE_VEL_SMOOTH);
+  }
+
+  // Mag: does not push; it aligns others into structure.
+  if (A !== "mag") {
+    const mc = densMag[idx] || 0;
+    if (mc > 0) {
+      const rx = p.pos.x - T.c.x;
+      const ry = p.pos.y - T.c.y;
+      const d = max(30, sqrt(rx * rx + ry * ry));
+      const inv = 1.0 / d;
+      const tangx = -ry * inv;
+      const tangy = rx * inv;
+      const align = MAG_ALIGN_COUPLING * min(1, mc * 0.04) * (0.35 + mag);
+      p.vel.x += tangx * align;
+      p.vel.y += tangy * align;
+    }
   }
 }
 
@@ -782,23 +1184,38 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
 
   // Estimate cell size from average radius to keep neighbor queries small.
   let avg = 0;
-  const rad = new Array(particleList.length);
-  for (let i = 0; i < particleList.length; i++) {
+  const n = particleList.length;
+  // PERF: reuse typed radius cache instead of allocating a new Array each call.
+  if (!radCache || radCache.length < n) radCache = new Float32Array(n);
+  const rad = radCache;
+  for (let i = 0; i < n; i++) {
     const p = particleList[i];
     const r = computeCollisionRadius(p);
     rad[i] = r;
     avg += r;
   }
-  avg = avg / max(1, particleList.length);
+  avg = avg / max(1, n);
   const cellSize = max(24, avg * 3.2);
-  // Build neighbor grid once and reuse across position-based iterations.
-  // Rebuilding each iteration is more accurate but costly; reusing
-  // yields a large speedup with acceptable visual results.
-  const grid = buildNeighborGrid(particleList, cellSize);
+
+  // PERF: cache the collision grid across frames (reduces Map churn / GC spikes).
+  const relCell = abs(cellSize - collisionGridCellSizeCache) / max(1e-6, collisionGridCellSizeCache || 1);
+  const relCount = abs(n - collisionGridCountCache);
+  const needRebuild =
+    !collisionGridCache ||
+    (frameCount - collisionGridFrame) >= COLLISION_GRID_EVERY ||
+    relCell > 0.15 ||
+    relCount > 64;
+  if (needRebuild) {
+    collisionGridCache = rebuildNeighborGridInto(particleList, cellSize, collisionGridCache, collisionCellsInUse, collisionCellPool);
+    collisionGridFrame = frameCount;
+    collisionGridCellSizeCache = cellSize;
+    collisionGridCountCache = n;
+  }
+  const grid = collisionGridCache;
 
   // Pre-allocate neighbor offsets as packed keys delta to avoid recomputing strings.
   for (let it = 0; it < iterations; it++) {
-    for (let i = 0; i < particleList.length; i++) {
+    for (let i = 0; i < n; i++) {
       const p = particleList[i];
       const cx = floor(p.pos.x / cellSize);
       const cy = floor(p.pos.y / cellSize);
@@ -850,10 +1267,15 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
       }
     }
   }
-  // Final cleanup pass: rebuild neighbor grid once and resolve any remaining overlaps
-  // that occurred because the reused grid became stale as particles moved.
-  const grid2 = buildNeighborGrid(particleList, cellSize);
-  for (let i = 0; i < particleList.length; i++) {
+
+  // PERF: optional cleanup pass; build a fresh grid only when iterations are high.
+  // For small iteration counts, reusing the cached grid avoids extra Map allocations.
+  const grid2 =
+    (iterations >= 3)
+      ? rebuildNeighborGridInto(particleList, cellSize, collisionGridScratch, neighborCellsInUse, neighborCellPool)
+      : grid;
+  if (iterations >= 3) collisionGridScratch = grid2;
+  for (let i = 0; i < n; i++) {
     const p = particleList[i];
     const cx = floor(p.pos.x / cellSize);
     const cy = floor(p.pos.y / cellSize);
@@ -1017,41 +1439,61 @@ function applyCohesion(p, index, grid, cellSize) {
 }
 
 function applyCalmOrbit(p, center) {
-  // tangential swirl around center
-  const r = p5.Vector.sub(p.pos, center);
-  const d = max(30, r.mag());
-  const tang = createVector(-r.y, r.x).mult(1.0 / d);
-  const inward = r.copy().mult(-1.0 / d);
+  // tangential swirl around center (scalar math: avoids p5.Vector allocations)
+  const rx = p.pos.x - center.x;
+  const ry = p.pos.y - center.y;
+  const d = max(30, sqrt(rx * rx + ry * ry));
+  const inv = 1.0 / d;
+  const tangx = -ry * inv;
+  const tangy = rx * inv;
+  const inwardx = -rx * inv;
+  const inwardy = -ry * inv;
   const edgeFrac = constrain(d / (min(width, height) * 0.42), 0, 1);
   const edgeBias = pow(edgeFrac, 1.8); // stronger pull near rim, weak near center
 
   // Base orbit + audio wobble
-  const swirl = 0.90 + 0.40 * mag + 0.20 * protons;         // smooth orbit
-  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias; // gentle inward spiral, rim-weighted
-  const jitter = 0.06 + 0.45 * electrons;                   // reduced micro-turbulence
+  const swirl = (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT;         // smooth orbit
+  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias * SPACE_DRIFTIN_MULT; // inward spiral, rim-weighted
+  const jitter = (0.06 + 0.45 * electrons) * SPACE_JITTER_MULT;                 // micro-turbulence
   const soften = 1.0 - 0.65 * protons;                       // high protons = less distortion
 
-  p.vel.add(tang.mult(swirl * 0.40));
-  p.vel.add(inward.mult(driftIn * 0.22));
-  p.vel.add(p5.Vector.random2D().mult(jitter * 0.04 * soften));
+  p.vel.x += tangx * (swirl * 0.40);
+  p.vel.y += tangy * (swirl * 0.40);
+  p.vel.x += inwardx * (driftIn * 0.22);
+  p.vel.y += inwardy * (driftIn * 0.22);
+
+  // Deterministic micro-jitter (no per-frame random2D allocations)
+  const jt = millis() * 0.001;
+  const ang = jt * 0.9 + p.seed * 0.13;
+  const ca = cos(ang), sa = sin(ang);
+  const jx = (p.jx * ca - p.jy * sa);
+  const jy = (p.jx * sa + p.jy * ca);
+  const j = jitter * 0.04 * soften;
+  p.vel.x += jx * j;
+  p.vel.y += jy * j;
 }
 
 function applyLayerBehavior(p, T) {
+  // Scalar math to avoid per-particle p5.Vector allocations.
   const t = millis() * 0.001;
-  const rel = p5.Vector.sub(p.pos, T.c);
-  const d = max(40, rel.mag());
-  const dir = rel.copy().mult(1.0 / d);
-  const tang = createVector(-dir.y, dir.x);
+  const relx = p.pos.x - T.c.x;
+  const rely = p.pos.y - T.c.y;
+  const d = max(40, sqrt(relx * relx + rely * rely));
+  const inv = 1.0 / d;
+  const dirx = relx * inv;
+  const diry = rely * inv;
+  const tangx = -diry;
+  const tangy = dirx;
 
   if (p.kind === "electrons") {
     const b = LAYER_BEHAVIOR.electrons;
     const n = noise(p.seed * 0.1, p.pos.x * 0.003, p.pos.y * 0.003, t * b.noiseFreq);
     const a = (n - 0.5) * 2.0;
-    p.vel.x += tang.x * a * b.noiseAmp;
-    p.vel.y += tang.y * a * b.noiseAmp;
+    p.vel.x += tangx * a * b.noiseAmp;
+    p.vel.y += tangy * a * b.noiseAmp;
     const f = noise(p.seed * 0.2 + 10, t * 1.2) - 0.5;
-    p.vel.x += dir.x * f * b.flutter * 0.12;
-    p.vel.y += dir.y * f * b.flutter * 0.12;
+    p.vel.x += dirx * f * b.flutter * 0.12;
+    p.vel.y += diry * f * b.flutter * 0.12;
     return;
   }
 
@@ -1062,11 +1504,11 @@ function applyLayerBehavior(p, T) {
     const fy = sin(ang) * b.flowAmp;
     p.vel.x += fx;
     p.vel.y += fy;
-    p.vel.x = lerp(p.vel.x, tang.x * (0.45 + 0.25 * h_ions), b.align);
-    p.vel.y = lerp(p.vel.y, tang.y * (0.45 + 0.25 * h_ions), b.align);
+    p.vel.x = lerp(p.vel.x, tangx * (0.45 + 0.25 * h_ions), b.align);
+    p.vel.y = lerp(p.vel.y, tangy * (0.45 + 0.25 * h_ions), b.align);
 
     // Chain tendency: stick to previous h_ion to form elongated streams.
-    if (p.link && p.link.pos) {
+    if (p.link && p.link.active && p.link.kind === "h_ions" && p.link.generation === p.linkGen) {
       const lx = p.link.pos.x - p.pos.x;
       const ly = p.link.pos.y - p.pos.y;
       const dd = sqrt(lx * lx + ly * ly) + 1e-6;
@@ -1081,13 +1523,13 @@ function applyLayerBehavior(p, T) {
 
   if (p.kind === "mag") {
     const b = LAYER_BEHAVIOR.mag;
-    const a = atan2(rel.y, rel.x);
+    const a = atan2(rely, relx);
     const wave = sin(a * 2.0 + t * (0.25 + b.structFreq));
     const targetFrac = 0.62 + 0.10 * wave;
     const targetR = T.radius * targetFrac;
     const dr = targetR - d;
-    p.vel.x += dir.x * dr * b.struct * 0.004;
-    p.vel.y += dir.y * dr * b.struct * 0.004;
+    p.vel.x += dirx * dr * b.struct * 0.004;
+    p.vel.y += diry * dr * b.struct * 0.004;
     p.vel.mult(b.settle);
     return;
   }
@@ -1102,15 +1544,14 @@ function applyLayerBehavior(p, T) {
     if (p.segId) applyXraySegmentConstraint(p);
 
     const b = LAYER_BEHAVIOR.xray;
-    if (p.strength !== undefined) {
-      const floorS = max(COHESION_FLOOR * 0.4, kindStrength("xray") * 0.25);
-      p.strength = max(floorS, p.strength * b.eventDecay);
-    }
+    // IMPORTANT: X-ray "peak memory" is encoded by particle age/order.
+    // Do not time-decay strength here; let particles persist until they become the oldest
+    // and are removed by capacity rules.
     const spike = constrain(changeEmph.xray, 0, 1);
     if (spike > 0.02) {
       const k = b.kick * spike;
-      p.vel.x += tang.x * k;
-      p.vel.y += tang.y * k;
+      p.vel.x += tangx * k;
+      p.vel.y += tangy * k;
     }
   }
 }
@@ -1129,17 +1570,18 @@ function applyEddyField(p, T) {
   const a = t * (0.12 + 0.25 * mag) + k * 1.7;
   const ex = T.c.x + cos(a) * baseR;
   const ey = T.c.y + sin(a * 1.12) * baseR;
-  const e = createVector(ex, ey);
-
-  const toE = p5.Vector.sub(e, p.pos);
-  const d = max(40, toE.mag());
+  // PERF: scalar math (avoids createVector / p5.Vector.sub allocations).
+  let dx = ex - p.pos.x;
+  let dy = ey - p.pos.y;
+  const d = max(40, sqrt(dx * dx + dy * dy));
   const pull = (0.010 + 0.030 * s) * (40 / d);
-  toE.mult(pull);
+  dx *= pull;
+  dy *= pull;
 
   // swirl around eddy (like a small vortex)
-  const swirl = createVector(-toE.y, toE.x).mult(0.65 + 0.8 * mag);
-  p.vel.add(toE);
-  p.vel.add(swirl.mult(0.06 + 0.10 * s));
+  const sw = (0.65 + 0.8 * mag) * (0.06 + 0.10 * s);
+  p.vel.x += dx + (-dy) * sw;
+  p.vel.y += dy + (dx) * sw;
 }
 
 function applyMagRings(p, T) {
@@ -1475,7 +1917,15 @@ function addToHandReservoir(T, which, p) {
       occ.hand = null;
       const b = computeHandBasis(T, which);
       occ.pos = slotWorldPos(T, which, slots[idx]);
-      occ.vel.add(b.dir.copy().mult(1.5 + random(2.0))).add(p5.Vector.random2D().mult(0.6));
+      // PERF: avoid per-frame vector allocations (no copy(), no random2D()).
+      {
+        const kick = 1.5 + random(2.0);
+        occ.vel.x += b.dir.x * kick;
+        occ.vel.y += b.dir.y * kick;
+        const j = (occ.dirIdx + (frameCount & DIR_MASK)) & DIR_MASK;
+        occ.vel.x += DIR_X[j] * 0.6;
+        occ.vel.y += DIR_Y[j] * 0.6;
+      }
       particles.push(occ);
 
       // Reuse the freed slot immediately (pressure replacement at the leak site).
@@ -1516,7 +1966,12 @@ function updateHandReservoir(T) {
       p.pos.lerp(target, follow);
       const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
       const jitter = (0.05 + electrons * 0.20) * (0.6 + overallAmp) * prof.reservoirJitterMult;
-      p.pos.add(p5.Vector.random2D().mult(jitter));
+      // PERF: avoid p5.Vector.random2D() allocation.
+      {
+        const j = (p.dirIdx + ((frameCount * 3) & DIR_MASK)) & DIR_MASK;
+        p.pos.x += DIR_X[j] * jitter;
+        p.pos.y += DIR_Y[j] * jitter;
+      }
       // Safety clamp to clock
       const toP = p5.Vector.sub(p.pos, T.c);
       const d = toP.mag();
@@ -1668,6 +2123,8 @@ function draw() {
   const T = computeHandData(new Date());
   updateHandDeltas(T);
   // Hand visuals are now drawn as shapes; no per-hand particle reservoir to update.
+  // PERF: per-frame spawn budget (smooths CPU spikes without removing audio variability).
+  spawnBudget = SPAWN_BUDGET_MAX;
 
   // Feature update
   if (started && analysisOK && soundFile && soundFile.isLoaded() && soundFile.isPlaying()) {
@@ -1688,11 +2145,12 @@ updateParticles(T);
 
 drawFace(T);
 drawHandShapes(T);
-drawClockHands(T);
-drawParticles();
-if (debugHandShapes) drawHandDebug(T);
-
-drawHUD();
+ drawClockHands(T);
+ drawParticles();
+ drawDensityDebugHUD();
+ if (debugHandShapes) drawHandDebug(T);
+ 
+ drawHUD();
 
   if (!started) drawStartOverlay();
 }
@@ -1710,6 +2168,9 @@ function touchStarted() { mousePressed(); return false; }
 
 function keyPressed() {
   if (key === "d" || key === "D") debugHandShapes = !debugHandShapes;
+  if (key === "g" || key === "G") debugDensityCoupling = !debugDensityCoupling;
+  if (key === "f" || key === "F") debugPerfHUD = !debugPerfHUD;
+  if (key === "p" || key === "P") debugPoolHUD = !debugPoolHUD;
   if (key === "0") SOLO_KIND = null;
   if (key === "1") SOLO_KIND = "xray";
   if (key === "2") SOLO_KIND = "electrons";
@@ -1767,14 +2228,21 @@ function resetVisualSystems() {
   ripples = [];
   for (let i = 0; i < fieldBuf.length; i++) fieldBuf[i] = 0;
   for (let i = 0; i < fieldBuf2.length; i++) fieldBuf2[i] = 0;
-  particles = [];
+  // PERF: return all active particles to pools (avoid GC spikes on reload).
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (p) returnToPool(p);
+  }
+  particles.length = 0;
+  particlesActive = 0;
   handParticles = { hour: [], minute: [], second: [] };
   handSlots = { hour: null, minute: null, second: null };
   handSlotMeta = { hour: null, minute: null, second: null };
   handFill = { hour: 0, minute: 0, second: 0 };
   xrayBlobs = [];
+  xrayBlobIndex = new Map();
   xraySegments = [];
-  xraySegIndex = Object.create(null);
+  xraySegIndex = new Map();
   xraySegmentIdCounter = 1;
   lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
   lastHIonByHand = { hour: null, minute: null, second: null };
@@ -1985,43 +2453,53 @@ function emitEnergy(T) {
 
 function allocateCounts(total, weightsByKind) {
   const n = max(0, floor(total));
-  const order = ["protons", "h_ions", "mag", "electrons", "xray"];
   if (n <= 0) return { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
 
   let sum = 0;
-  for (const kind of order) sum += max(0, weightsByKind[kind] || 0);
+  // PERF: fixed order, no arrays/sorts per frame.
+  const wP = max(0, weightsByKind.protons || 0);
+  const wH = max(0, weightsByKind.h_ions || 0);
+  const wM = max(0, weightsByKind.mag || 0);
+  const wE = max(0, weightsByKind.electrons || 0);
+  const wX = max(0, weightsByKind.xray || 0);
+  sum = wP + wH + wM + wE + wX;
   if (sum <= 1e-9) return { protons: n, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
 
-  const base = Object.create(null);
-  const frac = Object.create(null);
-  let baseSum = 0;
+  const rP = (wP / sum) * n;
+  const rH = (wH / sum) * n;
+  const rM = (wM / sum) * n;
+  const rE = (wE / sum) * n;
+  const rX = (wX / sum) * n;
 
-  for (const kind of order) {
-    const r = (max(0, weightsByKind[kind] || 0) / sum) * n;
-    const b = floor(r);
-    base[kind] = b;
-    frac[kind] = r - b;
-    baseSum += b;
-  }
+  let bP = floor(rP), bH = floor(rH), bM = floor(rM), bE = floor(rE), bX = floor(rX);
+  let fP = rP - bP,  fH = rH - bH,  fM = rM - bM,  fE = rE - bE,  fX = rX - bX;
+  let baseSum = bP + bH + bM + bE + bX;
 
   let rem = n - baseSum;
   if (rem > 0) {
-    order
-      .slice()
-      .sort((a, b) => frac[b] - frac[a])
-      .forEach((kind) => {
-        if (rem <= 0) return;
-        base[kind] += 1;
-        rem -= 1;
-      });
+    // Distribute remainder to the highest fractional parts (only 5 kinds => cheap linear scans).
+    for (let k = 0; k < 5 && rem > 0; k++) {
+      let best = fP, which = 0;
+      if (fH > best) { best = fH; which = 1; }
+      if (fM > best) { best = fM; which = 2; }
+      if (fE > best) { best = fE; which = 3; }
+      if (fX > best) { best = fX; which = 4; }
+
+      if (which === 0) { bP++; fP = -1; }
+      else if (which === 1) { bH++; fH = -1; }
+      else if (which === 2) { bM++; fM = -1; }
+      else if (which === 3) { bE++; fE = -1; }
+      else { bX++; fX = -1; }
+      rem--;
+    }
   }
 
   return {
-    protons: base.protons || 0,
-    h_ions: base.h_ions || 0,
-    mag: base.mag || 0,
-    electrons: base.electrons || 0,
-    xray: base.xray || 0,
+    protons: bP,
+    h_ions: bH,
+    mag: bM,
+    electrons: bE,
+    xray: bX,
   };
 }
 
@@ -2029,8 +2507,14 @@ function emitFromHand(T, which, rate) {
   const w = HAND_W[which];
   const head = (which === "hour") ? T.hourP : (which === "minute") ? T.minP : T.secP;
 
-  const dir = p5.Vector.sub(head, T.c).normalize();
-  const nrm = createVector(-dir.y, dir.x);
+  // PERF: scalar basis (avoids p5.Vector allocations in hot spawn loop).
+  const dx = head.x - T.c.x;
+  const dy = head.y - T.c.y;
+  const dm = sqrt(dx * dx + dy * dy) + 1e-6;
+  const dirx = dx / dm;
+  const diry = dy / dm;
+  const nrmx = -diry;
+  const nrmy = dirx;
 
   // Bias emission to be stronger near the head (like your drawing)
   // Using pow(random(), k) makes values cluster near 1.0
@@ -2081,40 +2565,70 @@ function emitFromHand(T, which, rate) {
 
     // Leak point: around the anchor disk, slightly biased outward (never from the center).
     const hr = HAND_HEAD_R[which];
-    const spawn = head.copy()
-      .add(dir.copy().mult(hr * (0.15 + random(0.35))))
-      .add(nrm.copy().mult((random() - 0.5) * hr * 1.6));
+    // Leak point: around the anchor disk, slightly biased outward (never from the center).
+    let spawnX = head.x + dirx * (hr * (0.15 + random(0.35))) + nrmx * ((random() - 0.5) * hr * 1.6);
+    let spawnY = head.y + diry * (hr * (0.15 + random(0.35))) + nrmy * ((random() - 0.5) * hr * 1.6);
     // keep inside the clock
-    const toP = p5.Vector.sub(spawn, T.c);
-    const d = toP.mag();
-    if (d > T.radius - 2) spawn.set(p5.Vector.add(T.c, toP.mult((T.radius - 2) / d)));
+    const rx = spawnX - T.c.x;
+    const ry = spawnY - T.c.y;
+    const rlen = sqrt(rx * rx + ry * ry) + 1e-6;
+    if (rlen > T.radius - 2) {
+      const rr = (T.radius - 2) / rlen;
+      spawnX = T.c.x + rx * rr;
+      spawnY = T.c.y + ry * rr;
+    }
 
     // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
-    let v = dir.copy().mult(1.4 + random(1.8) + overallAmp * 2.2);
-    v.add(nrm.copy().mult((random() - 0.5) * (0.8 + mag * 1.6)));
+    let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
+    let vy = diry * (1.4 + random(1.8) + overallAmp * 2.2) + nrmy * ((random() - 0.5) * (0.8 + mag * 1.6));
 
     // parameter-specific feel (subtle—clock stays readable)
-    if (kind === "xray")      v.mult(1.8 + xray * 1.4);       // sharp, fast
-    if (kind === "electrons") v.add(p5.Vector.random2D().mult(0.8 + electrons * 1.2));
-    if (kind === "h_ions")    v.mult(0.55);                    // slow drift
-    if (kind === "protons")   v.mult(0.85);                    // steady
-    if (kind === "mag")       v.rotate((random() - 0.5) * 0.25 * mag);
+    if (kind === "xray") {    // sharp, fast
+      const m = 1.8 + xray * 1.4;
+      vx *= m;
+      vy *= m;
+    }
+    if (kind === "electrons") {
+      const a = random(TWO_PI);
+      const amp = 0.8 + electrons * 1.2;
+      vx += cos(a) * amp;
+      vy += sin(a) * amp;
+    }
+    if (kind === "h_ions") {  // slow drift
+      vx *= 0.55;
+      vy *= 0.55;
+    }
+    if (kind === "protons") { // steady
+      vx *= 0.85;
+      vy *= 0.85;
+    }
+    if (kind === "mag") {
+      const ang = (random() - 0.5) * 0.25 * mag;
+      const ca = cos(ang), sa = sin(ang);
+      const nvx = vx * ca - vy * sa;
+      const nvy = vx * sa + vy * ca;
+      vx = nvx;
+      vy = nvy;
+    }
 
     // Lifetime / size per type
     // Keep effectively infinite; only pruning should reduce life.
     let life = 1e9;
     let size = 1.6;
 
-    const p = new Particle(spawn.x, spawn.y, v.x, v.y, life, size, col, kind);
+    const p = spawnFromPool(kind, spawnX, spawnY, vx, vy, life, size, col);
+    if (!p) break;
     p.strength = kindStrength(kind);
     if (kind === "h_ions") {
       p.link = lastHIonByHand[which];
+      p.linkGen = (p.link ? p.link.generation : 0);
       lastHIonByHand[which] = p;
     }
     if (kind === "xray") {
       const burst = constrain(changeEmph.xray, 0, 1);
-      const reuse = lastXraySegIdByHand[which] && xraySegIndex[lastXraySegIdByHand[which]];
-      const seg = (burst > 0.10 || !reuse) ? createXraySegment(head, dir, burst) : xraySegIndex[lastXraySegIdByHand[which]];
+      const reuseId = lastXraySegIdByHand[which];
+      const reuse = reuseId && xraySegIndex.get(reuseId);
+      const seg = (burst > 0.10 || !reuse) ? createXraySegment(head, { x: dirx, y: diry }, burst) : reuse;
       lastXraySegIdByHand[which] = seg.id;
       p.segId = seg.id;
     }
@@ -2140,22 +2654,29 @@ function emitFromHand(T, which, rate) {
   injectFieldAtScreenPos(head.x, head.y, mix, fieldStrength);
   for (let k = 0; k < 7; k++) {
     const tt = k / 6;
-    const p = p5.Vector.lerp(T.c, head, tt);
-    injectFieldAtScreenPos(p.x, p.y, mix, fieldStrength * 0.20);
+    injectFieldAtScreenPos(
+      T.c.x + dx * tt,
+      T.c.y + dy * tt,
+      mix,
+      fieldStrength * 0.20
+    );
   }
 }
 
 function enforceCapacity() {
-  const n = particles.length;
-
   // Only prune when the chamber is full.
   // Keep the visible fill capped at 100% by killing the oldest overflow immediately.
-  if (n <= CAPACITY) return;
+  // PERF: handle null holes (pooling) without forcing a full compaction every frame.
+  let active = 0;
+  for (let i = 0; i < particles.length; i++) if (particles[i]) active++;
+  if (active <= CAPACITY) return;
 
-  const extra = n - CAPACITY;
-  for (let i = 0; i < extra; i++) {
+  let extra = active - CAPACITY;
+  for (let i = 0; i < particles.length && extra > 0; i++) {
     const p = particles[i];
-    if (p) p.life = 0;
+    if (!p) continue;
+    p.life = 0;
+    extra--;
   }
 }
 
@@ -2232,6 +2753,63 @@ function drawClockHands(T) {
   drawHead(T.secP, HAND_HEAD_R.second);
 }
 
+function drawDensityOverlay(grid, ox, oy, s, colR, colG, colB) {
+  if (!grid) return;
+  let maxV = 0;
+  for (let i = 0; i < grid.length; i++) maxV = max(maxV, grid[i]);
+  maxV = max(1, maxV);
+  noStroke();
+  for (let y = 0; y < DENSITY_H; y++) {
+    for (let x = 0; x < DENSITY_W; x++) {
+      const v = grid[x + y * DENSITY_W] / maxV;
+      if (v <= 0.01) continue;
+      fill(colR, colG, colB, floor(200 * pow(v, 0.65)));
+      rect(ox + x * s, oy + y * s, s, s);
+    }
+  }
+  stroke(255, 90);
+  noFill();
+  rect(ox, oy, DENSITY_W * s, DENSITY_H * s);
+}
+
+function drawDensityDebugHUD() {
+  if (!debugDensityCoupling) return;
+
+  const pad = 14;
+  const s = 2; // 64x64 -> 128x128
+  const ox = pad;
+  const oy = height - pad - (DENSITY_H * s) - 90;
+
+  push();
+  fill(0, 140);
+  noStroke();
+  rect(ox - 8, oy - 54, (DENSITY_W * s) * 2 + 32, (DENSITY_H * s) + 86, 10);
+
+  drawDensityOverlay(densAll, ox, oy, s, 255, 255, 255); // total
+  drawDensityOverlay(densProtons, ox + DENSITY_W * s + 16, oy, s, COL.protons[0], COL.protons[1], COL.protons[2]);
+
+  fill(255, 230);
+  textSize(12);
+  textAlign(LEFT, TOP);
+  const couplingMode = chamberFillFrac >= DENSITY_COUPLING_ENABLE_AT;
+  text(
+    `DENS coupling: ${couplingMode ? "ON" : "off"} | fill ${nf(chamberFillFrac * 100, 0, 1)}% | grid ${DENSITY_W}x${DENSITY_H}`,
+    ox,
+    oy - 44
+  );
+  text("densAll", ox + 2, oy - 26);
+  text("densProtons", ox + DENSITY_W * s + 18, oy - 26);
+
+  const row = DENSITY_COUPLING.protons;
+  text(
+    `K(protons←xray ${nf(row.xray, 0, 2)} | e ${nf(row.electrons, 0, 2)} | p ${nf(row.protons, 0, 2)} | h ${nf(row.h_ions, 0, 2)} | m ${nf(row.mag, 0, 2)})`,
+    ox,
+    oy - 10
+  );
+
+  pop();
+}
+
 function drawHead(p, r) {
   const glow = 18 + h_ions*40 + xray*30;
   noStroke();
@@ -2245,8 +2823,13 @@ function updateParticles(T) {
   updateXrayBlobs();
   updateXraySegments();
   // free-space particles only (hand reservoir particles are updated separately)
-  chamberFillFrac = constrain(particles.length / CAPACITY, 0, 1);
+  // PERF: pooling leaves null holes; compute active count for correct "fill" logic.
+  let activeCount = 0;
+  for (let i = 0; i < particles.length; i++) if (particles[i]) activeCount++;
+  particlesActive = activeCount;
+  chamberFillFrac = constrain(activeCount / CAPACITY, 0, 1);
   const denseMode = chamberFillFrac >= DENSE_MODE_THRESHOLD;
+  const couplingMode = chamberFillFrac >= DENSITY_COUPLING_ENABLE_AT;
   const smoothDense = denseMode && DENSE_SMOOTH_FLOW;
   const smoothAll = GLOBAL_SMOOTH_FLOW || smoothDense;
 
@@ -2260,13 +2843,14 @@ function updateParticles(T) {
   const alignmentCellSize = 110;
   const alignmentGrid = (denseMode ? getAlignmentGrid(particles, alignmentCellSize) : null);
 
-  if (denseMode && ((frameCount - densityGridFrame) >= DENSITY_UPDATE_EVERY)) {
-    rebuildDensityGrid();
+  if (couplingMode && ((frameCount - densityGridFrame) >= DENSITY_UPDATE_EVERY)) {
+    rebuildDensityGrids();
     densityGridFrame = frameCount;
   }
 
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
+    if (!p) continue;
 
     if (!disableFrameForces) {
       applyCalmOrbit(p, T.c);
@@ -2282,8 +2866,8 @@ function updateParticles(T) {
     if (!DISABLE_RINGS && !denseMode) applyLayerStratification(p, T);
     if (!smoothAll) applyVolumetricMix(p, T);
 
-    if (denseMode) {
-      applyDensityPressure(p);
+    if (couplingMode) {
+      applyDensityCoupling(p, T);
     }
 
     if (denseMode && (i % ALIGNMENT_STRIDE) === alignmentPhase) {
@@ -2298,12 +2882,34 @@ function updateParticles(T) {
     p.update(drag, swirlBoost);
     confineToClock(p, T.c, T.radius);
 
-    if (p.dead()) particles.splice(i, 1);
+    if (p.dead()) {
+      // PERF: return to pool and leave a hole; compact in-order periodically.
+      returnToPool(p);
+      particles[i] = null;
+    }
   }
 
-  // Hard-ish collisions (position-based) for space particles only.
-  clampSpaceVelocities(particles);
-  resolveSpaceCollisions(particles, T.c, T.radius, COLLISION_ITERS);
+  // PERF: compact holes in-order (preserves survivor ordering/age semantics).
+  if ((frameCount % COMPACT_EVERY) === 0) {
+    let w = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p) continue;
+      particles[w++] = p;
+    }
+    particles.length = w;
+  }
+
+  // Collisions only for "mass" layers (protons, optionally h_ions).
+  // PERF: reuse collision list array (avoid per-frame allocations).
+  const collisionList = collisionListCache;
+  collisionList.length = 0;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
+  }
+  clampSpaceVelocities(collisionList);
+  resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
 }
 
 function drawParticles() {
@@ -2312,8 +2918,15 @@ function drawParticles() {
   // Grid-occupancy draw to prevent overdraw/whitening in dense regions.
   const cols = floor(width / DRAW_GRID_SIZE);
   const rows = floor(height / DRAW_GRID_SIZE);
-  const used = new Int32Array(cols * rows);
-  used.fill(-1);
+  const nCells = cols * rows;
+  if (!usedStamp || usedCols !== cols || usedRows !== rows || usedStamp.length !== nCells) {
+    usedCols = cols;
+    usedRows = rows;
+    usedStamp = new Uint32Array(nCells);
+    usedFrameId = 1;
+  }
+  usedFrameId = (usedFrameId + 1) >>> 0;
+  if (usedFrameId === 0) { usedStamp.fill(0); usedFrameId = 1; }
 
   const drawByKind = (kind) => {
     for (let i = 0; i < particles.length; i++) {
@@ -2323,8 +2936,8 @@ function drawParticles() {
       const gy = floor(p.pos.y / DRAW_GRID_SIZE);
       if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
       const idx = gx + gy * cols;
-      if (used[idx] !== -1) continue;
-      used[idx] = i;
+      if (usedStamp[idx] === usedFrameId) continue;
+      usedStamp[idx] = usedFrameId;
       p.draw();
     }
   };
@@ -2477,13 +3090,34 @@ function drawHUD() {
     fill(255, 150);
   }
   text(
-    `Particles: ${particles.length} | fill ${nf(min(100, (particles.length / CAPACITY) * 100), 1, 1)}%`,
+    `Particles: ${particlesActive} | fill ${nf(min(100, (particlesActive / CAPACITY) * 100), 1, 1)}%` +
+      (debugPerfHUD ? ` | FPS ${nf(frameRate(), 2, 1)} (sm ${nf(fpsSmoothed, 2, 1)})` : ""),
     x, (SOLO_KIND ? (y + 70) : (y + 54))
   );
   text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
     x, (SOLO_KIND ? (y + 86) : (y + 70))
   );
+
+  if (debugPoolHUD) {
+    const c = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p) continue;
+      c[p.kind] = (c[p.kind] || 0) + 1;
+    }
+    const line0Y = (SOLO_KIND ? (y + 102) : (y + 86));
+    fill(255, 200);
+    text(
+      `POOL (press P): active x ${c.xray} m ${c.mag} h ${c.h_ions} e ${c.electrons} p ${c.protons}`,
+      x, line0Y
+    );
+    fill(255, 150);
+    text(
+      `pool sizes: x ${pools.xray.length} m ${pools.mag.length} h ${pools.h_ions.length} e ${pools.electrons.length} p ${pools.protons.length} | budget ${spawnBudget}`,
+      x, line0Y + 16
+    );
+  }
 }
 
 function drawStartOverlay() {
@@ -2612,10 +3246,79 @@ function Particle(x, y, vx, vy, life, size, col, kind) {
   this.col = col;
   this.kind = kind;
   this.seed = random(1000);
+  // PERF: stable jitter direction seed into LUT (avoid random2D allocations).
+  this.dirIdx = (floor(random(DIR_N)) | 0);
+  // Deterministic per-particle basis dirs (from LUT; no trig).
+  const i1 = this.dirIdx & DIR_MASK;
+  this.jx = DIR_X ? DIR_X[i1] : 1;
+  this.jy = DIR_Y ? DIR_Y[i1] : 0;
+  const i2 = (i1 + 64 + (floor(random(64)) | 0)) & DIR_MASK;
+  this.kx = DIR_X ? DIR_X[i2] : 0;
+  this.ky = DIR_Y ? DIR_Y[i2] : 1;
   this.strength = 1.0;
   this.birthFrame = frameCount || 0;
   this.layerTargetFrac = null;
+  this.inHand = false;
+  this.hand = null;
+  this.slotIndex = -1;
+  this.blobId = 0;
+  this.segId = 0;
+  this.link = null;
+  this.linkGen = 0;
+  this.active = true;
+  this.generation = 0;
 }
+
+Particle.prototype.resetFromSpawn = function(kind, x, y, vx, vy, life, size, col) {
+  // Reset ALL state aggressively to avoid "ghost memory" when reusing pooled objects.
+  this.kind = kind;
+  this.col = col || (COL[kind] || COL.protons);
+  this.size = size;
+  this.life = life;
+  this.maxLife = life;
+  this.pos.x = x; this.pos.y = y;
+  this.vel.x = vx; this.vel.y = vy;
+
+  this.seed = random(1000);
+  this.dirIdx = (floor(random(DIR_N)) | 0);
+  const i1 = this.dirIdx & DIR_MASK;
+  this.jx = DIR_X[i1];
+  this.jy = DIR_Y[i1];
+  const i2 = (i1 + 64 + (floor(random(64)) | 0)) & DIR_MASK;
+  this.kx = DIR_X[i2];
+  this.ky = DIR_Y[i2];
+
+  this.strength = 1.0;
+  this.birthFrame = frameCount || 0;
+  this.layerTargetFrac = null;
+
+  this.inHand = false;
+  this.hand = null;
+  this.slotIndex = -1;
+
+  this.blobId = 0;
+  this.segId = 0;
+  this.link = null;
+  this.linkGen = 0;
+
+  this.active = true;
+  this.generation = (this.generation + 1) | 0;
+};
+
+Particle.prototype.deactivate = function() {
+  this.active = false;
+  this.inHand = false;
+  this.hand = null;
+  this.slotIndex = -1;
+  this.blobId = 0;
+  this.segId = 0;
+  this.link = null;
+  this.linkGen = 0;
+  this.layerTargetFrac = null;
+  this.strength = 1.0;
+  this.life = 0;
+  this.maxLife = 0;
+};
 
 Particle.prototype.update = function(drag, swirlBoost) {
   const prof = PARTICLE_PROFILE[this.kind] || PARTICLE_PROFILE.protons;
@@ -2627,9 +3330,19 @@ Particle.prototype.update = function(drag, swirlBoost) {
     const w = (noise(this.seed, t * (1.2 + 3.2 * mag)) - 0.5) * 0.06 * mag * swirlBoost;
     this.vel.rotate(w);
   } else if (this.kind === "electrons") {
-    this.vel.add(p5.Vector.random2D().mult((0.03 + 0.10 * electrons) * prof.jitterMult));
+    const amp = (0.03 + 0.10 * electrons) * prof.jitterMult;
+    // PERF: no trig/no vectors; cheap LUT "vibration" that still scales with audio.
+    const j1 = (this.dirIdx + (frameCount & DIR_MASK)) & DIR_MASK;
+    const j2 = (this.dirIdx + 73 + ((frameCount * 3) & DIR_MASK)) & DIR_MASK;
+    this.vel.x += (DIR_X[j1] + 0.65 * DIR_X[j2]) * amp;
+    this.vel.y += (DIR_Y[j1] + 0.65 * DIR_Y[j2]) * amp;
   } else if (this.kind === "xray") {
-    this.vel.add(p5.Vector.random2D().mult((0.02 + 0.06 * xray) * prof.jitterMult));
+    const amp = (0.02 + 0.06 * xray) * prof.jitterMult;
+    // PERF: no trig/no vectors; sharp micro-jitter that still scales with audio.
+    const j1 = (this.dirIdx + ((frameCount * 5) & DIR_MASK)) & DIR_MASK;
+    const j2 = (this.dirIdx + 131 + (frameCount & DIR_MASK)) & DIR_MASK;
+    this.vel.x += (DIR_X[j1] + 0.50 * DIR_X[j2]) * amp;
+    this.vel.y += (DIR_Y[j1] + 0.50 * DIR_Y[j2]) * amp;
   }
 
   // integrate
