@@ -217,16 +217,19 @@ const DISABLE_FPS_THROTTLE = true;
 // Space-field motion controls (global multipliers).
 // Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
 let SPACE_SWIRL_MULT = 1.0;    // tangential orbit strength
-let SPACE_DRIFTIN_MULT = 1.0;  // inward spiral strength
+let SPACE_DRIFTIN_MULT = 0.80;  // inward spiral strength
 let SPACE_JITTER_MULT = 1.0;   // micro-turbulence strength
 
 // Age spiral: newest near rim, oldest toward center (independent of kind).
 // Toggle for A/B comparisons.
 const DEBUG_DISABLE_AGE_SPIRAL = false;
-const AGE_WINDOW_FRAMES = 60 * 30; // 30 seconds @ 60fps
+const AGE_WINDOW_FRAMES = 60 * 240; // 4 minutes @ 60fps
 const AGE_OUTER_FRAC = 0.98;
-const AGE_INNER_FRAC = 0.20;
-const AGE_PULL = 0.0016;
+// Inner target radius depends on fill: when the chamber is full, the oldest ring sits very close to center.
+const AGE_INNER_FRAC_BASE = 0.20; // low fill
+const AGE_INNER_FRAC_FULL = 0.03; // at ~100% fill (closer to center)
+const AGE_INNER_FILL_EASE = 3.4;  // higher = stays wider until near-full, then tightens quickly
+const AGE_PULL = 0.0010;
 const AGE_SWIRL = 0.0011;
 const AGE_EASE = 1.6;
 
@@ -255,6 +258,7 @@ let lastHIonByHand = { hour: null, minute: null, second: null };
 // Reusable occupancy buffer for grid drawing (avoid per-frame allocations)
 let usedCols = 0, usedRows = 0;
 let usedStamp = null; // Uint32Array
+let usedStampXray = null; // Uint32Array (xray-only occupancy so xray stays visible)
 let usedFrameId = 1;
 
 const COLLISION_KINDS = { protons: true, h_ions: true };
@@ -315,8 +319,43 @@ let xrayBlobIdCounter = 1;
 let xrayBlobIndex = new Map();
 const XRAY_PULSE_BASE = 90;
 const XRAY_PULSE_MAX = 520;
-const XRAY_BLOB_BASE_RADIUS = 75;
-const XRAY_BLOB_MAX_RADIUS = 180;
+const XRAY_BLOB_BASE_RADIUS = 110;
+const XRAY_BLOB_MAX_RADIUS = 260;
+// Make spikes readable: ensure bursts have enough particles to form a blob, even with PARTICLE_SCALE < 1.
+const XRAY_EVENT_COUNT_SCALE = 0.70;
+const XRAY_EVENT_MIN_COUNT = 120;
+// Only use rigid segments on strong spikes; otherwise X-ray should read as blobs, not lines.
+const XRAY_SEGMENT_TRIGGER = 0.60;
+// X-ray pulse shaping: keep spikes compact (blob), not long streaks.
+const XRAY_PULSE_POS_FRAC = 0.95;      // spawn across most of the blob radius (readable area, not a tiny dot)
+const XRAY_PULSE_SPEED_BASE = 0.10;    // base speed for pulse particles
+const XRAY_PULSE_SPEED_RAND = 0.35;    // random speed component
+const XRAY_PULSE_SPEED_SPIKE = 0.85;   // extra speed at s=1
+const XRAY_PULSE_TANGENTIAL = 0.45;    // tangential bias around blob center
+// X-ray burst shaping: make spikes form ONE compact blob (not a streak dragged by the fast second hand).
+const XRAY_BASELINE_EMIT_MULT = 0.08; // keep a faint background xray drizzle from hands; events are the main signal
+const XRAY_BURST_SPIKE_MIN = 0.06; // trigger only on sharp rises (derivative), not sustained highs
+const XRAY_BURST_COOLDOWN_FRAMES = 26; // refractory period to avoid "trail lines" from repeated bursts
+const XRAY_BURST_FRAMES_BASE = 16;
+const XRAY_BURST_FRAMES_MAX = 58;
+let xrayBurst = null; // { blobId, startFrame, duration, untilFrame, startCount, strength }
+let xrayBurstCooldownUntil = 0;
+let xrayBurstHandFlip = 0; // alternates burst anchor between hour/minute for variety
+
+function pickXrayBurstHand(strength01) {
+  // Prefer slower hands to avoid streaks; use hour for the strongest spikes.
+  if (strength01 >= 0.72) return "hour";
+  // Alternate minute/hour for medium spikes so blobs appear in different regions over time.
+  xrayBurstHandFlip = (xrayBurstHandFlip + 1) | 0;
+  return (xrayBurstHandFlip & 1) ? "minute" : "hour";
+}
+
+function handPoint(T, which) {
+  if (!T) return null;
+  if (which === "hour") return T.hourP;
+  if (which === "minute") return T.minP;
+  return T.secP;
+}
 
 const PARTICLE_PROFILE = {
   xray: {
@@ -330,10 +369,10 @@ const PARTICLE_PROFILE = {
     eddyMult: 0.35,
     reservoirJitterMult: 0.8,
     flickerHz: 0.12,
-    cohesionRadius: 240,
-    cohesionStrength: 0.50,
+    cohesionRadius: 280,
+    cohesionStrength: 0.66,
     cohesionMaxNeighbors: 18,
-    cohesionMaxForce: 0.45,
+    cohesionMaxForce: 0.60,
     separationRadiusMult: 0.70,
     separationStrength: 0.35,
     layerRadiusFrac: 0.0,
@@ -495,8 +534,8 @@ function updateControlLayer() {
       baseRadius: 14 + 34 * s,
       expansionRate: 0.9 + 2.6 * s,
     });
-    // Texture: small cohesive puff inside the event region
-    spawnXrayPulse(CURRENT_T, s, 0.08);
+    // Texture: a readable cohesive blob inside the event region (min particle mass to form a blob).
+    spawnXrayPulse(CURRENT_T, s, XRAY_EVENT_COUNT_SCALE, XRAY_EVENT_MIN_COUNT);
   }
   // Keep only active events (used for short-lived "shock" coupling, not for persistent memory).
   if (xrayEvents.length) {
@@ -558,37 +597,86 @@ function updatePerfThrottles() {
   }
 }
 
-function spawnXrayPulse(T, spikeStrength, countScale) {
+function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
   if (!T) T = computeHandData(new Date());
   const s = constrain(spikeStrength, 0, 1);
   const scale = (countScale === undefined ? 1.0 : countScale);
   const id = xrayBlobIdCounter++;
   const rawCount = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
-  const count = max(1, floor(rawCount * PARTICLE_SCALE * scale));
+  const minN = (minCount === undefined ? 1 : max(1, minCount | 0));
+  const count = max(minN, floor(rawCount * PARTICLE_SCALE * scale));
   const radius = constrain(XRAY_BLOB_BASE_RADIUS + s * 140 + xray * 70, XRAY_BLOB_BASE_RADIUS, XRAY_BLOB_MAX_RADIUS);
   // PERF: store accumulators on the blob (no per-frame Object.create(null) maps).
-  const blob = { id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, sumX: 0, sumY: 0, count: 0 };
+  const nowF = frameCount || 0;
+  const anchorFor = floor(lerp(12, 30, pow(s, 0.8)));
+  const blob = { id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, sumX: 0, sumY: 0, count: 0, anchorUntilFrame: nowF + anchorFor };
   xrayBlobs.push(blob);
   xrayBlobIndex.set(id, blob);
 
-  const pos = T.secP.copy();
   for (let i = 0; i < count; i++) {
+    // Spawn positions inside the blob volume (compact, avoids "spray line").
     const ang = random(TWO_PI);
-    const spd = 0.9 + random(2.4) + s * 5.0;
-    const vx = cos(ang) * spd;
-    const vy = sin(ang) * spd;
+    const rr = radius * XRAY_PULSE_POS_FRAC * sqrt(random());
+    const px = blob.cx + cos(ang) * rr;
+    const py = blob.cy + sin(ang) * rr;
+
+    // Small initial motion with a tangential bias around the blob center (keeps it cohesive).
+    const rx = px - blob.cx;
+    const ry = py - blob.cy;
+    const d = sqrt(rx * rx + ry * ry) + 1e-6;
+    const tx = -ry / d;
+    const ty = rx / d;
+    // Keep spike pulses compact: high spikes start slower to avoid immediate smearing into streaks.
+    const speedScale = lerp(1.0, 0.22, pow(s, 1.25));
+    const spd = max(0.02, (XRAY_PULSE_SPEED_BASE + random(XRAY_PULSE_SPEED_RAND) + s * XRAY_PULSE_SPEED_SPIKE) * speedScale);
+    const tang = XRAY_PULSE_TANGENTIAL * lerp(0.38, 0.16, pow(s, 1.25));
+    const vx = tx * (spd * tang) + (rx / d) * (spd * (1.0 - tang)) * 0.25;
+    const vy = ty * (spd * tang) + (ry / d) * (spd * (1.0 - tang)) * 0.25;
     const life = 1e9;
     const size = 1.6;
-    const p = spawnFromPool("xray", pos.x, pos.y, vx, vy, life, size, COL.xray);
+    const p = spawnFromPool("xray", px, py, vx, vy, life, size, COL.xray);
     if (!p) break;
     p.strength = max(xray, s);
+    p.xrayTight = max(p.xrayTight || 0, s);
+    p.xrayRadPref = random();
     p.blobId = id;
+    particles.push(p);
+  }
+}
+
+function spawnXrayIntoBlob(blob, s, count) {
+  if (!blob || count <= 0) return;
+  const radius = blob.radius;
+  for (let i = 0; i < count; i++) {
+    const ang = random(TWO_PI);
+    const rr = radius * XRAY_PULSE_POS_FRAC * sqrt(random());
+    const px = blob.cx + cos(ang) * rr;
+    const py = blob.cy + sin(ang) * rr;
+
+    const rx = px - blob.cx;
+    const ry = py - blob.cy;
+    const d = sqrt(rx * rx + ry * ry) + 1e-6;
+    const tx = -ry / d;
+    const ty = rx / d;
+    const speedScale = lerp(1.0, 0.22, pow(s, 1.25));
+    const spd = max(0.02, (XRAY_PULSE_SPEED_BASE + random(XRAY_PULSE_SPEED_RAND) + s * XRAY_PULSE_SPEED_SPIKE) * speedScale);
+    const tang = XRAY_PULSE_TANGENTIAL * lerp(0.38, 0.16, pow(s, 1.25));
+    const vx = tx * (spd * tang) + (rx / d) * (spd * (1.0 - tang)) * 0.25;
+    const vy = ty * (spd * tang) + (ry / d) * (spd * (1.0 - tang)) * 0.25;
+
+    const p = spawnFromPool("xray", px, py, vx, vy, 1e9, 1.6, COL.xray);
+    if (!p) return;
+    p.strength = max(xray, s);
+    p.xrayTight = max(p.xrayTight || 0, s);
+    p.xrayRadPref = random();
+    p.blobId = blob.id;
     particles.push(p);
   }
 }
 
 function updateXrayBlobs() {
   if (!xrayBlobs.length) return;
+  const nowF = frameCount || 0;
   // Reset accumulators.
   for (let i = 0; i < xrayBlobs.length; i++) {
     const b = xrayBlobs[i];
@@ -613,10 +701,16 @@ function updateXrayBlobs() {
     const b = xrayBlobs[i];
     const n = b.count || 0;
     if (n > 0) {
-      b.cx = b.sumX / n;
-      b.cy = b.sumY / n;
+      const mx = b.sumX / n;
+      const my = b.sumY / n;
+      // While a burst is active, keep its center fixed so it reads as a blob (not a dragged streak).
+      // After the anchor period, let the center drift slowly with the medium.
+      if (!(b.anchorUntilFrame && nowF < b.anchorUntilFrame)) {
+        b.cx = lerp(b.cx, mx, 0.14);
+        b.cy = lerp(b.cy, my, 0.14);
+      }
       // keep blob strength "remembered" but slowly relax
-      b.strength = max(b.strength * 0.996, xrayMemory);
+      b.strength = max(b.strength * 0.998, xrayMemory);
       kept.push(b);
     } else {
       xrayBlobIndex.delete(b.id);
@@ -731,7 +825,7 @@ function applyXrayBlobForce(p) {
   }
   if (!blob || blob.count <= 1) return;
 
-  const s = constrain(max(blob.strength, xrayMemory), 0, 1);
+  const s = constrain(max(blob.strength, xrayMemory, p.xrayTight || 0), 0, 1);
   if (s <= 0.0001) return;
 
   const dx = blob.cx - p.pos.x;
@@ -741,20 +835,54 @@ function applyXrayBlobForce(p) {
   const nx = dx / d;
   const ny = dy / d;
 
-  // Springy "viscosity": keep particles within a radius, but allow drift.
+  // Springy "container": keep particles inside the blob radius AND distribute them across the blob area
+  // (so it reads as a real, filled clump instead of a line or a tiny dot).
   const desired = blob.radius;
-  const over = max(0, d - desired);
-  const pull = (0.010 + 0.030 * s) * (1.0 + over / max(1, desired));
-  const maxPull = 0.28;
-  const fx = constrain(nx * pull, -maxPull, maxPull);
-  const fy = constrain(ny * pull, -maxPull, maxPull);
-  p.vel.x += fx;
-  p.vel.y += fy;
+  // Stronger hold on sharp spikes so clumps feel rigid and cohesive.
+  const stiff = pow(s, 1.8);
 
-  // Gentle swirl around the blob center so it feels alive (arcs + drift).
-  const tw = (0.010 + 0.030 * s) * (0.6 + mag);
-  p.vel.x += (-ny) * tw;
-  p.vel.y += (nx) * tw;
+  const coreFrac = 0.38; // inner "do not collapse" core (smaller core => larger filled area)
+  const maxF = 0.46 + 0.18 * stiff;
+  if (d > desired) {
+    const over = (d - desired);
+    const pullIn = (0.016 + 0.060 * s + 0.075 * stiff) * (1.0 + over / max(1, desired));
+    p.vel.x += constrain(nx * pullIn, -maxF, maxF);
+    p.vel.y += constrain(ny * pullIn, -maxF, maxF);
+  } else {
+    // Distribute radii: each particle gets a stable preferred radius within the blob
+    // so the clump quickly fills an area instead of collapsing.
+    const pref = constrain((p.xrayRadPref === undefined ? 0.5 : p.xrayRadPref), 0, 1);
+    const targetR = desired * (0.22 + 0.70 * pref);
+    const dr = targetR - d; // + => want outward, - => inward
+    const k = (0.006 + 0.030 * stiff);
+    p.vel.x += constrain((-nx) * (dr * k), -maxF, maxF);
+    p.vel.y += constrain((-ny) * (dr * k), -maxF, maxF);
+
+    // Prevent core collapse
+    if (d < desired * coreFrac) {
+      const under = (desired * coreFrac - d);
+      const pushOut = (0.010 + 0.050 * s + 0.060 * stiff) * (under / max(1, desired));
+      p.vel.x += constrain((-nx) * pushOut, -maxF, maxF);
+      p.vel.y += constrain((-ny) * pushOut, -maxF, maxF);
+    }
+  }
+
+  // Kill tangential "stretch" inside tight blobs (keeps the clump chunky, not a streak).
+  {
+    const tangx = -ny;
+    const tangy = nx;
+    const vT = p.vel.x * tangx + p.vel.y * tangy;
+    const kill = 0.55 * stiff;
+    p.vel.x -= tangx * vT * kill;
+    p.vel.y -= tangy * vT * kill;
+  }
+
+  // Extra damping inside the blob core to prevent elongation into long broken lines.
+  if (d < desired * 0.85) {
+    const damp = 0.040 + 0.10 * s + 0.08 * stiff;
+    p.vel.x *= (1.0 - damp);
+    p.vel.y *= (1.0 - damp);
+  }
 }
 
 // ---------- Hand weights (all hands emit all types) ----------
@@ -778,7 +906,7 @@ let SOFT_CAP = CAPACITY;  // only prune when the chamber is full
 
 // Start with the chamber already "full" (visual bootstrap).
 // Kept below CAPACITY by default so it doesn't freeze slower machines.
-const START_CHAMBER_FULL = true;
+const START_CHAMBER_FULL = false;
 const START_CHAMBER_FILL_COUNT = 18000; // try 12000–25000 depending on your FPS
 
 // When the chamber is already dense, avoid forces that collapse particles into rings/layers.
@@ -1190,16 +1318,17 @@ function rebuildDensityGrids() {
       if (gx < 1) gx = 1; else if (gx > DENSITY_W - 2) gx = DENSITY_W - 2;
       if (gy < 1) gy = 1; else if (gy > DENSITY_H - 2) gy = DENSITY_H - 2;
       const idx = gy * DENSITY_W + gx;
-      const add = floor(20 + (e.strength || 0) * 60);
+      // Keep the "shock" local and short-lived; avoid carving big empty holes around long-lived xray clumps.
+      const add = floor(8 + (e.strength || 0) * 22);
       const addTo = (j, v) => {
         densXray[j] = min(65535, densXray[j] + v);
         densAll[j] = min(65535, densAll[j] + v);
       };
       addTo(idx, add);
-      addTo(idx - 1, floor(add * 0.65));
-      addTo(idx + 1, floor(add * 0.65));
-      addTo(idx - DENSITY_W, floor(add * 0.65));
-      addTo(idx + DENSITY_W, floor(add * 0.65));
+      addTo(idx - 1, floor(add * 0.45));
+      addTo(idx + 1, floor(add * 0.45));
+      addTo(idx - DENSITY_W, floor(add * 0.45));
+      addTo(idx + DENSITY_W, floor(add * 0.45));
     }
   }
 }
@@ -1216,8 +1345,9 @@ function sampleDensityGradient(grid, idx) {
   return { dx: dx / m, dy: dy / m, g: min(1, (abs(dx) + abs(dy)) * 0.06) };
 }
 
-function applyDensityCoupling(p, T) {
+function applyDensityCoupling(p, T, scale) {
   if (!densAll) return;
+  if (scale === undefined) scale = 1.0;
 
   const sx = DENSITY_W / max(1, width);
   const sy = DENSITY_H / max(1, height);
@@ -1232,7 +1362,7 @@ function applyDensityCoupling(p, T) {
 
   const A = p.kind;
   const KA = DENSITY_COUPLING[A] || DENSITY_COUPLING.protons;
-  const base = DENSITY_PRESSURE * (0.55 + chamberFillFrac * 1.05);
+  const base = (DENSITY_PRESSURE * (0.55 + chamberFillFrac * 1.05)) * constrain(scale, 0, 1);
 
   let fx = 0, fy = 0;
 
@@ -1255,8 +1385,12 @@ function applyDensityCoupling(p, T) {
     const ax = -grad.dx;
     const ay = -grad.dy;
 
-    // X-ray: shock boost during events (still local because it's driven by densXray).
-    if (B === "xray") k *= (1.0 + changeEmph.xray * XRAY_EVENT_SHOCK_BOOST);
+    // X-ray: keep cross-kind coupling, but avoid carving big "empty holes" around long-lived x-ray blobs.
+    // (Otherwise dense xray regions permanently repel everything, which reads as "nothing else can exist nearby".)
+    if (B === "xray") {
+      k *= (1.0 + changeEmph.xray * 0.35); // mild emphasis on spikes
+      if (A !== "xray") k *= 0.18;         // reduce xray->others repulsion so other kinds can coexist nearby
+    }
 
     fx += ax * k;
     fy += ay * k;
@@ -1556,7 +1690,13 @@ function applyCohesion(p, index, grid, cellSize) {
   if (radius <= 0) return;
 
   let layer = kindStrength(p.kind);
-  if (p.kind === "xray") layer = max(layer, xrayMemory);
+  if (p.kind === "xray") {
+    layer = max(layer, xrayMemory, p.xrayTight || 0);
+    if (p.blobId) {
+      const b = xrayBlobIndex.get(p.blobId);
+      if (b) layer = max(layer, b.strength || 0);
+    }
+  }
   const strength = (prof.cohesionStrength || 0) * constrain(max(layer, COHESION_FLOOR), 0, 1);
   if (strength <= 0.000001) return;
 
@@ -1613,7 +1753,8 @@ function applyCohesion(p, index, grid, cellSize) {
   p.vel.y += fy;
 }
 
-function applyCalmOrbit(p, center) {
+function applyCalmOrbit(p, center, scale) {
+  if (scale === undefined) scale = 1.0;
   // tangential swirl around center (scalar math: avoids p5.Vector allocations)
   const rx = p.pos.x - center.x;
   const ry = p.pos.y - center.y;
@@ -1627,9 +1768,9 @@ function applyCalmOrbit(p, center) {
   const edgeBias = pow(edgeFrac, 1.8); // stronger pull near rim, weak near center
 
   // Base orbit + audio wobble
-  const swirl = (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT;         // smooth orbit
-  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias * SPACE_DRIFTIN_MULT; // inward spiral, rim-weighted
-  const jitter = (0.06 + 0.45 * electrons) * SPACE_JITTER_MULT;                 // micro-turbulence
+  const swirl = (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * scale;         // smooth orbit
+  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias * SPACE_DRIFTIN_MULT * scale; // inward spiral, rim-weighted
+  const jitter = (0.06 + 0.45 * electrons) * SPACE_JITTER_MULT * scale;                 // micro-turbulence
   const soften = 1.0 - 0.65 * protons;                       // high protons = less distortion
 
   p.vel.x += tangx * (swirl * 0.40);
@@ -1648,13 +1789,21 @@ function applyCalmOrbit(p, center) {
   p.vel.y += jy * j;
 }
 
-function applyAgeSpiral(p, T) {
+function applyAgeSpiral(p, T, ageRank01, scale) {
+  if (scale === undefined) scale = 1.0;
   if (DEBUG_DISABLE_AGE_SPIRAL) return;
   if (!p || p.birthFrame === undefined) return;
   const age = (frameCount || 0) - p.birthFrame;
-  const age01 = constrain(age / AGE_WINDOW_FRAMES, 0, 1);
+  const ageTime01 = constrain(age / AGE_WINDOW_FRAMES, 0, 1);
+  const rank01 = (ageRank01 === undefined ? null : constrain(ageRank01, 0, 1));
   const outer = T.radius * AGE_OUTER_FRAC;
-  const inner = T.radius * AGE_INNER_FRAC;
+  const fill01 = constrain(chamberFillFrac || 0, 0, 1);
+  const innerFrac = lerp(AGE_INNER_FRAC_BASE, AGE_INNER_FRAC_FULL, pow(fill01, AGE_INNER_FILL_EASE));
+  const inner = T.radius * innerFrac;
+  // When the chamber approaches full, use ordering (oldest->newest) to define radial age,
+  // so the oldest ring reaches the center even if the system filled quickly.
+  const useRank = (rank01 !== null) ? pow(fill01, 2.0) : 0;
+  const age01 = (rank01 !== null) ? lerp(ageTime01, rank01, useRank) : ageTime01;
   const targetR = lerp(outer, inner, pow(age01, AGE_EASE));
 
   const dx = p.pos.x - T.c.x;
@@ -1664,13 +1813,15 @@ function applyAgeSpiral(p, T) {
   const ny = dy / r;
   const dr = targetR - r;
 
-  // radial correction (gentle)
-  p.vel.x += nx * dr * AGE_PULL;
-  p.vel.y += ny * dr * AGE_PULL;
+  // radial correction (gentle); ramps up as the chamber approaches full,
+  // so the oldest particles can reach the center even if fill happens quickly.
+  const pull = AGE_PULL * (1.0 + 1.25 * useRank) * scale;
+  p.vel.x += nx * dr * pull;
+  p.vel.y += ny * dr * pull;
 
   // tangential swirl so it’s a spiral, not straight collapse
-  p.vel.x += (-ny) * AGE_SWIRL;
-  p.vel.y += ( nx) * AGE_SWIRL;
+  p.vel.x += (-ny) * (AGE_SWIRL * scale);
+  p.vel.y += ( nx) * (AGE_SWIRL * scale);
 }
 
 function applyLayerBehavior(p, T) {
@@ -1749,7 +1900,9 @@ function applyLayerBehavior(p, T) {
     // and are removed by capacity rules.
     const spike = constrain(changeEmph.xray, 0, 1);
     if (spike > 0.02) {
-      const k = b.kick * spike;
+      // Keep blob pulses compact: reduce the tangential kick for particles that belong to a blob.
+      const blobDamp = (p.blobId ? lerp(0.06, 0.28, constrain(((frameCount || 0) - (p.birthFrame || 0)) / 90, 0, 1)) : 1.0);
+      const k = b.kick * spike * blobDamp;
       p.vel.x += tangx * k;
       p.vel.y += tangy * k;
     }
@@ -2326,6 +2479,7 @@ function draw() {
   // Always compute correct time (hands should never “stop rotating”)
   profStart("time");
   const T = computeHandData(new Date());
+  CURRENT_T = T;
   updateHandDeltas(T);
   profEnd("time");
   // Hand visuals are now drawn as shapes; no per-hand particle reservoir to update.
@@ -2546,19 +2700,24 @@ function updateAudioFeatures() {
   const aE = constrain(level * 4.0, 0, 1);
 
   // shape
-  const xRaw = pow(xE, 1.15);
+  // PERF/VIS: boost low x-ray values so typical tracks still produce visible X-ray activity.
+  // (Same band mapping; just a gentler curve than pow(...,1.15) which suppresses lows.)
+  const xRaw = constrain(pow(xE, 0.72) * 1.25, 0, 1);
   const mRaw = pow(mE, 1.0);
   const hRaw = pow(hE, 1.05);
   const eRaw = pow(eE, 1.05);
   const pRaw = pow(pE, 1.0);
 
   // smooth per “time type”
+  const prevX = xray;
   xray      = lerp(xray,      xRaw, SMOOTH_FAST);
   mag       = lerp(mag,       mRaw, SMOOTH_FAST);
   electrons = lerp(electrons, eRaw, SMOOTH_FAST);
   protons   = lerp(protons,   pRaw, SMOOTH_SLOW);
   h_ions    = lerp(h_ions,    hRaw, SMOOTH_SLOW);
   overallAmp= lerp(overallAmp, aE,  SMOOTH_FAST);
+  // Raw spike measure (before global compression) to drive bursts even when baseline xray is low.
+  const xSpikeRaw = max(0, xRaw - prevX);
 
   // Global reactivity boost with soft-knee to avoid saturating at 1.0.
   const react = (v) => {
@@ -2575,13 +2734,40 @@ function updateAudioFeatures() {
 
   updateChangeSignals();
 
-  // Continuous micro-bursts (no threshold). Stronger changes yield stronger pulses.
-  const xBurst = changeEmph.xray;
-  if (xBurst > 0.001) {
-    spawnXrayPulse(null, xBurst, XRAY_MICRO_BURST_SCALE);
+  // X-ray burst model:
+  // - Start ONE compact burst on a sharp spike (derivative), and keep its center fixed for a short TTL.
+  // - Apply cooldown so we don't paint a long trail as the second hand moves.
+  const nowF = frameCount || 0;
+  if (xrayBurst && nowF < xrayBurst.untilFrame) {
+    const t01 = constrain((nowF - xrayBurst.startFrame) / max(1, xrayBurst.duration), 0, 1);
+    const rem01 = 1.0 - t01;
+    const tail = max(0, floor(xrayBurst.startCount * 0.18 * pow(rem01, 1.35)));
+    const blob = xrayBlobIndex.get(xrayBurst.blobId);
+    if (blob) spawnXrayIntoBlob(blob, xrayBurst.strength, tail);
+  } else {
+    xrayBurst = null;
   }
-  if (random() < xBurst * 0.05) {
-    spawnXrayPulse(null, min(1, xBurst * 1.8), 0.35);
+
+  if (!xrayBurst && nowF >= xrayBurstCooldownUntil && CURRENT_T && CURRENT_T.secP) {
+    const spike01 = constrain(xSpikeRaw * 6.0, 0, 1);
+    if (spike01 >= XRAY_BURST_SPIKE_MIN) {
+      const s = constrain(max(spike01, changeEmph.xray * 0.65), 0, 1);
+      const dur = floor(lerp(XRAY_BURST_FRAMES_BASE, XRAY_BURST_FRAMES_MAX, pow(s, 0.85)));
+      const rawCount = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
+      const startCount = max(XRAY_EVENT_MIN_COUNT, floor(rawCount * PARTICLE_SCALE * XRAY_EVENT_COUNT_SCALE));
+      const id = xrayBlobIdCounter++;
+      const radius = constrain(XRAY_BLOB_BASE_RADIUS + s * 140 + xray * 70, XRAY_BLOB_BASE_RADIUS, XRAY_BLOB_MAX_RADIUS);
+      const hand = pickXrayBurstHand(s);
+      const hp = handPoint(CURRENT_T, hand) || CURRENT_T.secP;
+      // Anchor burst center to a slow hand so the emission forms a compact blob, not a dragged streak.
+      const blob = { id, radius, strength: s, cx: hp.x, cy: hp.y, sumX: 0, sumY: 0, count: 0, hand, anchorUntilFrame: nowF + dur };
+      xrayBlobs.push(blob);
+      xrayBlobIndex.set(id, blob);
+      spawnXrayIntoBlob(blob, s, startCount);
+
+      xrayBurst = { blobId: id, startFrame: nowF, duration: dur, untilFrame: nowF + dur, startCount, strength: s, hand };
+      xrayBurstCooldownUntil = nowF + XRAY_BURST_COOLDOWN_FRAMES;
+    }
   }
 }
 
@@ -2771,7 +2957,8 @@ function emitFromHand(T, which, rate) {
   const headBiasK = 3.2;
 
   // How much each parameter contributes (hand weights * proxies)
-  const wx = w.x * xray;
+  // Keep baseline x-ray low (events/spikes are the readable signature).
+  const wx = w.x * xray * XRAY_BASELINE_EMIT_MULT;
   const wm = w.m * mag;
   const wh = w.h * h_ions;
   const we = w.e * electrons;
@@ -2875,12 +3062,8 @@ function emitFromHand(T, which, rate) {
       lastHIonByHand[which] = p;
     }
     if (kind === "xray") {
-      const burst = constrain(changeEmph.xray, 0, 1);
-      const reuseId = lastXraySegIdByHand[which];
-      const reuse = reuseId && xraySegIndex.get(reuseId);
-      const seg = (burst > 0.10 || !reuse) ? createXraySegment(head, { x: dirx, y: diry }, burst) : reuse;
-      lastXraySegIdByHand[which] = seg.id;
-      p.segId = seg.id;
+      // NOTE: X-ray segments (rigid line constraints) are currently disabled to keep spikes as blobs,
+      // not long broken lines. We keep the segment system in code for later re-introduction if desired.
     }
     // Disabled: kind-based radial targets create fixed rings by kind.
     if (!DISABLE_KIND_RINGS) {
@@ -3100,40 +3283,63 @@ function updateParticles(T) {
     densityGridFrame = frameCount;
   }
 
+  // PERF/READABILITY: provide a stable "age rank" (oldest->newest) without reordering arrays.
+  // We iterate newest->oldest (reverse order) and compute rank from the traversal index,
+  // skipping null holes left by pooling. This lets the age spiral reach the center at 100% fill,
+  // even if the chamber fills faster than AGE_WINDOW_FRAMES.
+  let ageRankFromNewest = 0;
+  const ageRankDen = max(1, activeCount - 1);
+
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     if (!p) continue;
 
+    const isXrayBlob = (p.kind === "xray" && !!p.blobId);
+    const xrayTight = isXrayBlob ? constrain(p.xrayTight || 0, 0, 1) : 0;
+    const ageFrames = (frameCount || 0) - (p.birthFrame || 0);
+    const ageTime01 = isXrayBlob ? constrain(ageFrames / max(1, AGE_WINDOW_FRAMES), 0, 1) : 0;
+    const xrayRelax = isXrayBlob ? pow(ageTime01, 1.6) : 1.0; // 0=new (rigid), 1=old (mixes back into medium)
+    const xrayFlowScale = isXrayBlob ? lerp(0.04, 0.55, 1.0 - pow(xrayTight, 1.3)) : 1.0;
+    const xrayAgeScale = isXrayBlob ? lerp(xrayFlowScale * 0.22, 1.0, xrayRelax) : 1.0;
+    const xrayDensityScale = isXrayBlob ? lerp(0.18, 0.70, xrayRelax) : 1.0;
+
     if (!disableFrameForces) {
-      applyCalmOrbit(p, T.c);
+      applyCalmOrbit(p, T.c, xrayFlowScale);
       if (!smoothAll && (i % HEAVY_FIELD_STRIDE) === heavyPhase) {
-        applyEddyField(p, T);
+        if (!isXrayBlob) applyEddyField(p, T);
         // Disabled: kind-based ring forcing breaks age/space readability.
         // if (!DISABLE_RINGS && !denseMode) applyMagRings(p, T);
-        applyHIonStreams(p, T);
-        applyElectronBreath(p, T);
+        if (!isXrayBlob) {
+          applyHIonStreams(p, T);
+          applyElectronBreath(p, T);
+        }
       }
     }
-    applyAgeSpiral(p, T);
+    applyAgeSpiral(p, T, ageRankFromNewest / ageRankDen, xrayAgeScale);
+    ageRankFromNewest++;
     applyLayerBehavior(p, T);
-    applyXrayBlobForce(p);
     // Disabled: kind-based stratification breaks age/space readability.
     // if (!DISABLE_RINGS && !denseMode) applyLayerStratification(p, T);
-    if (!smoothAll) applyVolumetricMix(p, T);
+    if (!smoothAll && !isXrayBlob) applyVolumetricMix(p, T);
 
     if (couplingMode) {
-      applyDensityCoupling(p, T);
+      applyDensityCoupling(p, T, xrayDensityScale);
     }
 
-    if (denseMode && (i % ALIGNMENT_STRIDE) === alignmentPhase) {
+    if (!isXrayBlob && denseMode && (i % ALIGNMENT_STRIDE) === alignmentPhase) {
       applyAlignment(p, i, alignmentGrid, alignmentCellSize);
     }
 
     if (!denseMode || !DENSE_DISABLE_COHESION) {
-      if ((i % COHESION_APPLY_STRIDE) === stridePhase) {
+      // X-ray spikes should clump immediately: apply cohesion every frame for xray blob particles.
+      if (isXrayBlob || ((i % COHESION_APPLY_STRIDE) === stridePhase)) {
         applyCohesion(p, i, cohesionGrid, cohesionCellSize);
       }
     }
+
+    // Apply blob containment late so it re-compacts after other forces.
+    applyXrayBlobForce(p);
+
     p.update(drag, swirlBoost);
     confineToClock(p, T.c, T.radius);
 
@@ -3178,21 +3384,42 @@ function drawParticles() {
     usedCols = cols;
     usedRows = rows;
     usedStamp = new Uint32Array(nCells);
+    usedStampXray = new Uint32Array(nCells);
     usedFrameId = 1;
   }
   usedFrameId = (usedFrameId + 1) >>> 0;
-  if (usedFrameId === 0) { usedStamp.fill(0); usedFrameId = 1; }
+  if (usedFrameId === 0) {
+    usedStamp.fill(0);
+    usedStampXray.fill(0);
+    usedFrameId = 1;
+  }
 
   const drawByKind = (kind) => {
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
       if (!p || p.kind !== kind) continue;
+
+      // X-ray blobs: draw all particles (no occupancy suppression) so bursts read as solid clumps.
+      // (Keeps particle size uniform; the "mass" comes from count/overdraw, not size.)
+      if (kind === "xray" && p.blobId) {
+        p.draw();
+        continue;
+      }
       const gx = floor(p.pos.x / DRAW_GRID_SIZE);
       const gy = floor(p.pos.y / DRAW_GRID_SIZE);
       if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
       const idx = gx + gy * cols;
-      if (usedStamp[idx] === usedFrameId) continue;
-      usedStamp[idx] = usedFrameId;
+
+      // Keep xray readable: it should still draw in dense regions occupied by other kinds.
+      // Use a separate xray-only occupancy buffer to avoid whitening from *xray-on-xray* overdraw,
+      // without suppressing xray behind other layers.
+      if (kind === "xray") {
+        if (usedStampXray[idx] === usedFrameId) continue;
+        usedStampXray[idx] = usedFrameId;
+      } else {
+        if (usedStamp[idx] === usedFrameId) continue;
+        usedStamp[idx] = usedFrameId;
+      }
       p.draw();
     }
   };
@@ -3520,6 +3747,8 @@ function Particle(x, y, vx, vy, life, size, col, kind) {
   this.segId = 0;
   this.link = null;
   this.linkGen = 0;
+  this.xrayTight = 0; // per-particle "rigidity" for X-ray spikes (0..1)
+  this.xrayRadPref = 0; // stable radius preference inside xray blobs (0..1)
   this.active = true;
   this.generation = 0;
 }
@@ -3555,6 +3784,8 @@ Particle.prototype.resetFromSpawn = function(kind, x, y, vx, vy, life, size, col
   this.segId = 0;
   this.link = null;
   this.linkGen = 0;
+  this.xrayTight = 0;
+  this.xrayRadPref = 0;
 
   this.active = true;
   this.generation = (this.generation + 1) | 0;
@@ -3569,6 +3800,8 @@ Particle.prototype.deactivate = function() {
   this.segId = 0;
   this.link = null;
   this.linkGen = 0;
+  this.xrayTight = 0;
+  this.xrayRadPref = 0;
   this.layerTargetFrac = null;
   this.strength = 1.0;
   this.life = 0;
@@ -3592,12 +3825,19 @@ Particle.prototype.update = function(drag, swirlBoost) {
     this.vel.x += (DIR_X[j1] + 0.65 * DIR_X[j2]) * amp;
     this.vel.y += (DIR_Y[j1] + 0.65 * DIR_Y[j2]) * amp;
   } else if (this.kind === "xray") {
-    const amp = (0.02 + 0.06 * xray) * prof.jitterMult;
+    // Keep spike-born X-ray clumps rigid: reduce micro-jitter when xrayTight is high.
+    const tight = constrain(this.xrayTight || 0, 0, 1);
+    const amp = (0.02 + 0.06 * xray) * prof.jitterMult * (1.0 - 0.78 * tight);
     // PERF: no trig/no vectors; sharp micro-jitter that still scales with audio.
     const j1 = (this.dirIdx + ((frameCount * 5) & DIR_MASK)) & DIR_MASK;
     const j2 = (this.dirIdx + 131 + (frameCount & DIR_MASK)) & DIR_MASK;
     this.vel.x += (DIR_X[j1] + 0.50 * DIR_X[j2]) * amp;
     this.vel.y += (DIR_Y[j1] + 0.50 * DIR_Y[j2]) * amp;
+    if (tight > 0.05) {
+      const damp = 0.015 + 0.08 * tight;
+      this.vel.x *= (1.0 - damp);
+      this.vel.y *= (1.0 - damp);
+    }
   }
 
   // integrate
