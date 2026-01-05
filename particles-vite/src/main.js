@@ -1,3 +1,73 @@
+import "./style.css";
+
+// STEP 4A — Worker pipeline toggle (no behavior change yet).
+const USE_WORKER = true;
+const WORKER_DEBUG_LOG = false;
+// STEP 6B: move only the core spiral force (applyCalmOrbit) to the worker.
+const WORKER_SPIRAL = true;
+
+// Lightweight profiler (low overhead) to decide what to move into the worker next.
+const PROF_LITE = true;
+const PROF_LITE_LOG = false; // optional console summary once/second
+const PROF_LITE_EMA_ALPHA = 0.12; // ~1s smoothing at 60fps
+let profLite = {
+  updMs: 0,
+  colMs: 0,
+  drawMs: 0,
+  totalMs: 0,
+  faceMs: 0,
+  fieldsMs: 0,
+  forcesMs: 0,
+  houseEmitMs: 0,
+  houseCapMs: 0,
+  houseCleanMs: 0,
+  lastFrameStart: 0,
+  lastLogT: 0,
+};
+
+function profLiteNow() {
+  return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+}
+
+function profLiteEma(prev, sample) {
+  return prev + (sample - prev) * PROF_LITE_EMA_ALPHA;
+}
+
+function drawLiteProfilerHUD() {
+  if (!PROF_LITE) return;
+  const x = 14;
+  const y = 70; // below file input / status
+  const fps = frameRate();
+  const n = particlesActive | 0;
+  const col = profLite.colMs;
+  const drw = profLite.drawMs;
+  const msFace = profLite.faceMs;
+  const msFields = profLite.fieldsMs;
+  const msForces = profLite.forcesMs;
+  const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
+  const upd = msFace + msFields + msForces + msHouse;
+  const tot = upd + col + drw;
+
+  push();
+  noStroke();
+  fill(0, 170);
+  rect(x - 8, y - 8, 640, 64, 10);
+  fill(255, 230);
+  textAlign(LEFT, TOP);
+  textSize(12);
+  text(
+    `FPS ${nf(fps, 2, 1)} | N ${n} | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | draw ${nf(drw, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
+    x,
+    y
+  );
+  text(
+    `face ${nf(msFace, 1, 2)}ms | fields ${nf(msFields, 1, 2)}ms | forces ${nf(msForces, 1, 2)}ms | house ${nf(msHouse, 1, 2)}ms`,
+    x,
+    y + 18
+  );
+  pop();
+}
+
 /**
  * CLEAN RESET — Space-Weather Energy Clock (MP3 upload, reliable reaction)
  * - 3 hands rotate correctly (time-true)
@@ -8,7 +78,6 @@
  */
 
 let started = false;
-let p5Canvas = null;
 
 // ---------- Audio ----------
 let fileInput;
@@ -30,6 +99,382 @@ let pools = { xray: [], mag: [], h_ions: [], electrons: [], protons: [] };
 const SPAWN_BUDGET_MAX = 800;
 let spawnBudget = SPAWN_BUDGET_MAX;
 const COMPACT_EVERY = 10; // compact null holes in-order every N frames
+
+// STEP 4A — Web Worker round-trip pipeline (no-op).
+let simWorker = null;
+let simWorkerReady = false;
+let simWorkerBusy = false;
+let simWorkerCap = 0; // capacity-sized arrays in worker
+let workerInited = false;
+let capacity = 0; // current capacity on main thread
+let activeN = 0; // active particles (may be <= capacity)
+let simX = null;  // Float32Array
+let simY = null;  // Float32Array
+let simVX = null; // Float32Array
+let simVY = null; // Float32Array
+let simKind = null; // Uint8Array (per particle kind id)
+let simSeed = null; // Float32Array (per particle seed)
+let simBirth = null; // Uint32Array (per particle birthFrame)
+let simRefs = []; // Particle references in array order
+let simGens = null; // Int32Array(capacity) generation snapshot (for safe reuse)
+let simInFlight = null; // { frameId, activeN }
+let simFrameId = 1;
+let simLoggedDt = false;
+let stepScheduled = false;
+
+function wlog(...args) {
+  if (WORKER_DEBUG_LOG) console.log(...args);
+}
+
+function wwarn(...args) {
+  if (WORKER_DEBUG_LOG) console.warn(...args);
+}
+
+function nextPow2(v) {
+  let x = v | 0;
+  if (x <= 1) return 1;
+  x--;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  x++;
+  return x >>> 0;
+}
+
+function chooseCapacity(n) {
+  const need = Math.max(1, n | 0);
+  const pow2 = nextPow2(need);
+  const MIN_CHUNK = 16384;
+  return (Math.max(MIN_CHUNK, pow2) | 0);
+}
+
+function ensureSimArrays(cap) {
+  if (!simX || simX.length !== cap) simX = new Float32Array(cap);
+  if (!simY || simY.length !== cap) simY = new Float32Array(cap);
+  if (!simVX || simVX.length !== cap) simVX = new Float32Array(cap);
+  if (!simVY || simVY.length !== cap) simVY = new Float32Array(cap);
+  if (!simKind || simKind.length !== cap) simKind = new Uint8Array(cap);
+  if (!simSeed || simSeed.length !== cap) simSeed = new Float32Array(cap);
+  if (!simBirth || simBirth.length !== cap) simBirth = new Uint32Array(cap);
+  if (!simGens || simGens.length !== cap) simGens = new Int32Array(cap);
+}
+
+function kindToId(kind) {
+  // Keep stable across worker/main.
+  if (kind === "xray") return 0;
+  if (kind === "electrons") return 1;
+  if (kind === "protons") return 2;
+  if (kind === "h_ions") return 3;
+  if (kind === "mag") return 4;
+  return 2;
+}
+
+function countActiveParticles() {
+  let n = 0;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (p && p.active && !p.dead()) n++;
+  }
+  return n;
+}
+
+function fillSimArraysFromParticles(cap) {
+  // Build stable refs in current `particles[]` order (preserves time/age semantics).
+  simRefs.length = 0;
+  let required = 0;
+  let filled = 0;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (!p || !p.active || p.dead()) continue;
+    required++;
+    if (filled < cap) {
+      simRefs[filled] = p;
+      simGens[filled] = (p.generation | 0);
+      simX[filled] = p.pos.x;
+      simY[filled] = p.pos.y;
+      simVX[filled] = p.vel.x;
+      simVY[filled] = p.vel.y;
+      simKind[filled] = kindToId(p.kind) & 255;
+      simSeed[filled] = +p.seed || 0.0;
+      simBirth[filled] = (p.birthFrame || 0) >>> 0;
+      filled++;
+    }
+  }
+  simRefs.length = filled;
+  return { required, filled };
+}
+
+function initWorkerCapacity(cap) {
+  if (!USE_WORKER || !simWorker) return;
+  if (simWorkerBusy) return;
+
+  ensureSimArrays(cap);
+  const { required } = fillSimArraysFromParticles(cap);
+  if (required <= 0) return;
+
+  capacity = cap;
+  simWorkerCap = cap;
+  workerInited = true;
+  simWorkerReady = false;
+  simWorkerBusy = true;
+  simInFlight = null;
+  stepScheduled = false;
+
+  simWorker.postMessage(
+    {
+      type: "init",
+      n: cap,
+      buffers: {
+        x: simX.buffer,
+        y: simY.buffer,
+        vx: simVX.buffer,
+        vy: simVY.buffer,
+        kind: simKind.buffer,
+        seed: simSeed.buffer,
+        birth: simBirth.buffer,
+      },
+    },
+    [simX.buffer, simY.buffer, simVX.buffer, simVY.buffer, simKind.buffer, simSeed.buffer, simBirth.buffer]
+  );
+
+  simX = simY = simVX = simVY = simKind = simSeed = simBirth = null;
+}
+
+function tryInitWorkerIfReady() {
+  if (!USE_WORKER || !simWorker) return;
+  if (simWorkerBusy) return;
+
+  const n = countActiveParticles();
+  if (n <= 0) return;
+
+  if (!workerInited) {
+    initWorkerCapacity(chooseCapacity(n));
+    return;
+  }
+
+  if (n > capacity) {
+    initWorkerCapacity(chooseCapacity(n));
+  }
+}
+
+function scheduleNextStep() {
+  if (!USE_WORKER || !simWorker) return;
+  if (!simWorkerReady || simWorkerBusy) return;
+  if (stepScheduled) return;
+  stepScheduled = true;
+  requestAnimationFrame(() => {
+    stepScheduled = false;
+    postStep();
+  });
+}
+
+function postStep() {
+  if (!USE_WORKER || !simWorker) return;
+  if (!simWorkerReady || simWorkerBusy) return;
+  if (!simX || !simY || !simVX || !simVY || !simKind || !simSeed || !simBirth || !simGens) {
+    wwarn("postStep: buffers not attached (waiting for worker)");
+    return;
+  }
+
+  const { required, filled } = fillSimArraysFromParticles(capacity);
+  activeN = required;
+  wlog("N", activeN);
+
+  if (required <= 0 || filled <= 0) return;
+
+  if (required > capacity) {
+    initWorkerCapacity(chooseCapacity(required));
+    return;
+  }
+
+  const dtRaw = (typeof deltaTime !== "undefined" ? (deltaTime / 16.666) : 1.0);
+  const dt = Math.min(2.0, Math.max(0.25, dtRaw));
+  if (!simLoggedDt) {
+    wlog("dt", dt);
+    simLoggedDt = true;
+  }
+  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+  const params = {
+    dt,
+    drag: (0.985 + protons * 0.01),
+    cx: T.c.x,
+    cy: T.c.y,
+    radius: T.radius,
+    w: width,
+    h: height,
+    // STEP 6B: spiral/orbit force (ported from applyCalmOrbit, without per-kind modifiers).
+    spiralEnable: !!WORKER_SPIRAL,
+    spiralSwirl: (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * 0.40,
+    spiralDrift: (0.40 + 0.04 * h_ions + 0.02 * mag) * SPACE_DRIFTIN_MULT * 0.22,
+
+    // STEP 6C: move remaining per-particle forces to worker (audio-driven parameters + time model inputs).
+    nowS: ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) * 0.001,
+    frame: (frameCount || 0) >>> 0,
+    overallAmp: +overallAmp || 0.0,
+    xray: +xray || 0.0,
+    mag: +mag || 0.0,
+    h_ions: +h_ions || 0.0,
+    electrons: +electrons || 0.0,
+    protons: +protons || 0.0,
+    fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
+    // Age spiral constants
+    ageWindow: AGE_WINDOW_FRAMES,
+    ageOuterFrac: AGE_OUTER_FRAC,
+    ageInnerBase: AGE_INNER_FRAC_BASE,
+    ageInnerFull: AGE_INNER_FRAC_FULL,
+    ageInnerEase: AGE_INNER_FILL_EASE,
+    agePull: AGE_PULL,
+    ageSwirl: AGE_SWIRL,
+    ageEase: AGE_EASE,
+  };
+
+  simWorkerBusy = true;
+  const frameId = (simFrameId++ | 0);
+  simInFlight = { frameId, activeN: filled };
+
+  wlog("post step");
+  simWorker.postMessage(
+    {
+      type: "step",
+      frameId,
+      n: capacity,
+      activeN: filled,
+      params,
+      buffers: {
+        x: simX.buffer,
+        y: simY.buffer,
+        vx: simVX.buffer,
+        vy: simVY.buffer,
+        kind: simKind.buffer,
+        seed: simSeed.buffer,
+        birth: simBirth.buffer,
+      },
+    },
+    [simX.buffer, simY.buffer, simVX.buffer, simVY.buffer, simKind.buffer, simSeed.buffer, simBirth.buffer]
+  );
+
+  simX = simY = simVX = simVY = simKind = simSeed = simBirth = null;
+}
+
+if (USE_WORKER) {
+  try {
+    simWorker = new Worker(new URL("./sim.worker.js", import.meta.url), { type: "module" });
+    wlog("worker created");
+    simWorker.onerror = (e) => console.error("worker error", e);
+    simWorker.onmessageerror = (e) => console.error("worker message error", e);
+    simWorker.onmessage = (e) => {
+      wlog("worker msg", e.data?.type);
+      const msg = e.data;
+      if (!msg || !msg.type) return;
+      if (msg.type === "initDone") {
+        const b = msg.buffers;
+        simWorkerCap = msg.n | 0;
+        capacity = simWorkerCap;
+        simX = new Float32Array(b.x);
+        simY = new Float32Array(b.y);
+        simVX = new Float32Array(b.vx);
+        simVY = new Float32Array(b.vy);
+        simKind = new Uint8Array(b.kind);
+        simSeed = new Float32Array(b.seed);
+        simBirth = new Uint32Array(b.birth);
+        simGens = new Int32Array(simWorkerCap);
+        simWorkerBusy = false;
+        simWorkerReady = true;
+        workerInited = true;
+        console.log("initDone", simWorkerCap);
+        // Start stepping at most once per animation frame.
+        scheduleNextStep();
+        return;
+      }
+      if (msg.type === "state") {
+        wlog("got state");
+        const b = msg.buffers;
+        const inflight = simInFlight;
+        simInFlight = null;
+        simWorkerBusy = false;
+        if (!inflight) return;
+
+        // Re-wrap buffers (ownership returns to main thread).
+        simX = new Float32Array(b.x);
+        simY = new Float32Array(b.y);
+        simVX = new Float32Array(b.vx);
+        simVY = new Float32Array(b.vy);
+        simKind = new Uint8Array(b.kind);
+        simSeed = new Float32Array(b.seed);
+        simBirth = new Uint32Array(b.birth);
+        // NOTE: simGens is not transferred; it must remain intact for generation checks.
+
+        // 1) Apply returned state BEFORE forces (including vx/vy).
+        const nApply = Math.min(inflight.activeN | 0, simRefs.length | 0);
+        for (let i = 0; i < nApply; i++) {
+          const p = simRefs[i];
+          if (!p || !p.active) continue;
+          if ((p.generation | 0) !== (simGens[i] | 0)) continue; // particle got recycled
+          p.pos.x = simX[i];
+          p.pos.y = simY[i];
+          p.vel.x = simVX[i];
+          p.vel.y = simVY[i];
+        }
+
+        // STEP 6C: forces are now applied in the worker. Main thread only does collisions + housekeeping.
+        // Collisions (mass layers only) remain on main for now.
+        if (PROF_LITE) {
+          profLite.forcesMs = profLiteEma(profLite.forcesMs, 0);
+          profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
+        }
+        {
+          const tCol0 = PROF_LITE ? profLiteNow() : 0;
+          const collisionList = collisionListCache;
+          collisionList.length = 0;
+          for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (!p || p.dead()) continue;
+            if (COLLISION_KINDS[p.kind]) collisionList.push(p);
+          }
+          if (collisionList.length) {
+            const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+            clampSpaceVelocities(collisionList);
+            resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
+          }
+          if (PROF_LITE) profLite.colMs = profLiteEma(profLite.colMs, profLiteNow() - tCol0);
+        }
+
+        // Cleanup: return dead particles to pool and periodically compact holes (preserves order).
+        let activeCount = 0;
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          if (!p) continue;
+          if (p.dead()) {
+            returnToPool(p);
+            particles[i] = null;
+            continue;
+          }
+          activeCount++;
+        }
+        particlesActive = activeCount;
+        chamberFillFrac = constrain(activeCount / CAPACITY, 0, 1);
+        if ((frameCount % COMPACT_EVERY) === 0) {
+          let w = 0;
+          for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (!p) continue;
+            particles[w++] = p;
+          }
+          particles.length = w;
+        }
+
+        // 3) Continue stepping (one step max per animation frame).
+        scheduleNextStep();
+      }
+    };
+  } catch (e) {
+    console.error("worker init failed", e);
+    simWorker = null;
+  }
+}
+// NOTE: worker is capacity-based (re-init only when particle count exceeds capacity).
 
 // PERF: Runtime profiler (timing + optional heap usage in Chrome) with downloadable JSON report.
 let PROF_ENABLED = false;
@@ -997,6 +1442,11 @@ let handSlots = { hour: null, minute: null, second: null };
 let handSlotMeta = { hour: null, minute: null, second: null };
 let handFill = { hour: 0, minute: 0, second: 0 };
 
+// Visual-system arrays used by resetVisualSystems().
+let jets = [];
+let sparks = [];
+let ripples = [];
+
 // Persistent energy field
 let field, fieldW = 180, fieldH = 180;
 let fieldBuf, fieldBuf2;
@@ -1006,7 +1456,7 @@ let statusMsg = "Click canvas to enable audio, then upload an MP3 (top-left).";
 let errorMsg = "";
 
 function setup() {
-  p5Canvas = createCanvas(1200, 1200);
+  createCanvas(1200, 1200);
   angleMode(RADIANS);
   pixelDensity(1);
 
@@ -1062,10 +1512,6 @@ amp.setInput();
   // PERF: prewarm particle pools (one-time load, smoother runtime).
   prewarmPools();
 
-  // Optional experiment: Proton overlay (runs only if Proton is loaded and toggled on).
-  initProtonOverlay();
-  initProtonMainEngine();
-
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
   }
@@ -1073,326 +1519,6 @@ amp.setInput();
 
 function windowResized() {
   resizeCanvas(1200, 1200);
-}
-
-function initProtonOverlay() {
-  // Keep the sketch fully functional without Proton.
-  const ProtonEngine = getProtonEngineCtor();
-  if (!ProtonEngine || !p5Canvas) return;
-  try {
-    proton = new ProtonEngine();
-    protonEmitters = Object.create(null);
-
-    const mkEmitter = (kind) => {
-      const e = new Proton.Emitter();
-      e.rate = new Proton.Rate(new Proton.Span(0, 0), new Proton.Span(0.05, 0.12));
-      e.addInitialize(new Proton.Mass(1));
-      e.addInitialize(new Proton.Radius(1.5, 2.2));
-      e.addInitialize(new Proton.Life(0.8, 2.6)); // short-lived overlay only
-      e.addInitialize(new Proton.Velocity(new Proton.Span(0.3, 1.8), new Proton.Span(0, 360), "polar"));
-      e.addBehaviour(new Proton.Alpha(0.35, 0));
-      // Proton.Color expects strings; use rgb() strings to match our palette.
-      const c = COL[kind] || COL.protons;
-      e.addBehaviour(new Proton.Color(`rgb(${c[0]},${c[1]},${c[2]})`));
-      e.p.x = width * 0.5;
-      e.p.y = height * 0.5;
-      e.emit();
-      proton.addEmitter(e);
-      return e;
-    };
-
-    for (const kind of KINDS) protonEmitters[kind] = mkEmitter(kind);
-  } catch (e) {
-    proton = null;
-    protonEmitters = null;
-  }
-}
-
-function updateProtonOverlay(T) {
-  if (!USE_PROTON_OVERLAY || !proton || !protonEmitters) return;
-
-  // Tie to audio continuously; this overlay is additive and does not affect core ordering rules.
-  const headByKind = {
-    xray: T.secP,
-    electrons: T.secP,
-    protons: T.minP,
-    h_ions: T.hourP,
-    mag: T.hourP,
-  };
-
-  for (const kind of KINDS) {
-    const e = protonEmitters[kind];
-    if (!e) continue;
-
-    const head = headByKind[kind];
-    e.p.x = head.x;
-    e.p.y = head.y;
-
-    const lvl = kindStrength(kind);
-    const chg = changeEmph[kind] || 0;
-    const rate = (0.5 + lvl * 4.0 + chg * 6.0) * (0.6 + overallAmp);
-    e.rate.numPan.a = 0;
-    e.rate.numPan.b = constrain(rate * 0.9, 0, 22);
-
-    // Slightly different motion signatures per kind
-    const v = e.initializes[3]; // Velocity initialize
-    if (v && v.pan && v.pan.a !== undefined) {
-      const sp = (kind === "electrons") ? (0.8 + electrons * 2.6) :
-                 (kind === "xray") ? (1.2 + xray * 3.0) :
-                 (kind === "protons") ? (0.25 + protons * 0.6) :
-                 (kind === "h_ions") ? (0.35 + h_ions * 1.1) :
-                 (0.20 + mag * 0.8);
-      v.pan.a = 0.15;
-      v.pan.b = sp;
-    }
-  }
-
-  proton.update();
-}
-
-function drawProtonOverlay() {
-  if (!USE_PROTON_OVERLAY || !protonEmitters) return;
-  // Manual draw to avoid Proton renderer touching the canvas state.
-  noStroke();
-  for (const kind of KINDS) {
-    const e = protonEmitters[kind];
-    if (!e || !e.particles) continue;
-    const c = COL[kind] || COL.protons;
-    fill(c[0], c[1], c[2], 26);
-    const arr = e.particles;
-    for (let i = 0; i < arr.length; i++) {
-      const p = arr[i];
-      if (!p) continue;
-      ellipse(p.p.x, p.p.y, 2.0, 2.0);
-    }
-  }
-}
-
-function initProtonMainEngine() {
-  const ProtonEngine = getProtonEngineCtor();
-  if (!ProtonEngine) return;
-  try {
-    protonMain = new ProtonEngine();
-    protonMainEmitters = Object.create(null);
-    protonMainOrdered = [];
-
-    const addEmitter = (hand, kind) => {
-      const e = new Proton.Emitter();
-      e.rate = new Proton.Rate(new Proton.Span(0, 0), new Proton.Span(0.05, 0.12));
-      e.addInitialize(new Proton.Mass(1));
-      e.addInitialize(new Proton.Radius(1.4, 2.2));
-      // Long-lived; removal is driven by CAPACITY (oldest first) to preserve time/age semantics.
-      e.addInitialize(new Proton.Life(999999, 999999));
-      e.addInitialize(new Proton.Velocity(new Proton.Span(0.2, 1.2), new Proton.Span(0, 360), "polar"));
-      e.addBehaviour(new Proton.Alpha(0.35, 0.35)); // we control visibility via p.alpha as well
-      const c = COL[kind] || COL.protons;
-      e.addBehaviour(new Proton.Color(`rgb(${c[0]},${c[1]},${c[2]})`));
-
-      e.p.x = width * 0.5;
-      e.p.y = height * 0.5;
-      e.emit();
-      protonMain.addEmitter(e);
-      protonMainEmitters[`${hand}_${kind}`] = e;
-      return e;
-    };
-
-    for (const hand of ["hour", "minute", "second"]) {
-      for (const kind of KINDS) addEmitter(hand, kind);
-    }
-
-    // Global field-ish behaviours (approximate current feel; tuning may be needed).
-    // Swirl (mag) + inward drift (protons/h_ions) are applied later as custom forces.
-  } catch (e) {
-    protonMain = null;
-    protonMainEmitters = null;
-    protonMainOrdered = [];
-  }
-}
-
-function protonGetKind(p) {
-  return p && (p.kind || (p.__kind || null));
-}
-
-function protonGetPos(p) {
-  return p && (p.p || p.pos || null);
-}
-
-function protonGetVel(p) {
-  return p && (p.v || p.vel || null);
-}
-
-function rebuildDensityGridsFromProton(list) {
-  ensureDensityGrids();
-  densAll.fill(0);
-  densXray.fill(0);
-  densElectrons.fill(0);
-  densProtons.fill(0);
-  densHIons.fill(0);
-  densMag.fill(0);
-
-  const sx = DENSITY_W / max(1, width);
-  const sy = DENSITY_H / max(1, height);
-
-  for (let i = 0; i < list.length; i++) {
-    const p = list[i];
-    if (!p || p.dead) continue;
-    const kind = protonGetKind(p);
-    const pos = protonGetPos(p);
-    if (!kind || !pos) continue;
-    let gx = floor(pos.x * sx);
-    let gy = floor(pos.y * sy);
-    if (gx < 0) gx = 0; else if (gx >= DENSITY_W) gx = DENSITY_W - 1;
-    if (gy < 0) gy = 0; else if (gy >= DENSITY_H) gy = DENSITY_H - 1;
-    const idx = gy * DENSITY_W + gx;
-    if (densAll[idx] < 65535) densAll[idx]++;
-    const g = getDensityGridForKind(kind);
-    if (g && g[idx] < 65535) g[idx]++;
-  }
-}
-
-function applyDensityCouplingProton(p, T) {
-  if (!densAll || !p || p.dead) return;
-  const kind = protonGetKind(p);
-  const pos = protonGetPos(p);
-  const vel = protonGetVel(p);
-  if (!kind || !pos || !vel) return;
-
-  const sx = DENSITY_W / max(1, width);
-  const sy = DENSITY_H / max(1, height);
-  let gx = floor(pos.x * sx);
-  let gy = floor(pos.y * sy);
-  if (gx < 1) gx = 1; else if (gx > DENSITY_W - 2) gx = DENSITY_W - 2;
-  if (gy < 1) gy = 1; else if (gy > DENSITY_H - 2) gy = DENSITY_H - 2;
-  const idx = gy * DENSITY_W + gx;
-  const c = densAll[idx] || 0;
-  if (c <= 1) return;
-
-  const KA = DENSITY_COUPLING[kind] || DENSITY_COUPLING.protons;
-  const base = DENSITY_PRESSURE * (0.55 + chamberFillFrac * 1.05);
-
-  let fx = 0, fy = 0;
-  for (let i = 0; i < DENSITY_KINDS.length; i++) {
-    const B = DENSITY_KINDS[i];
-    let k = KA[B] || 0;
-    if (k === 0) continue;
-    let grid = null;
-    if (B === "xray") grid = densXray;
-    else if (B === "electrons") grid = densElectrons;
-    else if (B === "protons") grid = densProtons;
-    else if (B === "h_ions") grid = densHIons;
-    else if (B === "mag") grid = densMag;
-    if (!grid) continue;
-    const grad = sampleDensityGradient(grid, idx);
-    fx += (-grad.dx) * k;
-    fy += (-grad.dy) * k;
-  }
-
-  vel.x += fx * base;
-  vel.y += fy * base;
-
-  const visc = constrain((c - 2) * 0.03, 0, 1) * DENSITY_VISCOSITY;
-  if (visc > 0) {
-    vel.x *= (1.0 - visc);
-    vel.y *= (1.0 - visc);
-  }
-}
-
-function updateProtonMain(T) {
-  if (!protonMain || !protonMainEmitters) return;
-
-  // Capture newly created particles into a stable ordered list.
-  // We rely on Proton's internal pooling but keep our own ordering/compaction.
-  for (const key in protonMainEmitters) {
-    const e = protonMainEmitters[key];
-    if (!e || !e.particles) continue;
-    const arr = e.particles;
-    for (let i = 0; i < arr.length; i++) {
-      const p = arr[i];
-      if (!p || p.__orderedSeen) continue;
-      p.__orderedSeen = true;
-      // store kind for coupling/draw without digging into emitter key each time
-      const parts = key.split("_");
-      p.__hand = parts[0];
-      p.__kind = parts[1];
-      protonMainOrdered.push(p);
-    }
-  }
-
-  // Compute fill + density coupling in terms of ordered live particles.
-  let active = 0;
-  for (let i = 0; i < protonMainOrdered.length; i++) {
-    const p = protonMainOrdered[i];
-    if (p && !p.dead) active++;
-  }
-  chamberFillFrac = constrain(active / CAPACITY, 0, 1);
-
-  if ((frameCount - densityGridFrame) >= DENSITY_UPDATE_EVERY) {
-    rebuildDensityGridsFromProton(protonMainOrdered);
-    densityGridFrame = frameCount;
-  }
-  for (let i = 0; i < protonMainOrdered.length; i++) {
-    const p = protonMainOrdered[i];
-    if (!p || p.dead) continue;
-    applyDensityCouplingProton(p, T);
-  }
-
-  // Enforce capacity: kill oldest first (preserves time ordering semantics).
-  if (active > CAPACITY) {
-    let extra = active - CAPACITY;
-    for (let i = 0; i < protonMainOrdered.length && extra > 0; i++) {
-      const p = protonMainOrdered[i];
-      if (!p || p.dead) continue;
-      p.dead = true;
-      extra--;
-    }
-  }
-
-  // Compact holes periodically (preserve in-order).
-  if ((frameCount % PROTON_COMPACT_EVERY) === 0) {
-    let w = 0;
-    for (let i = 0; i < protonMainOrdered.length; i++) {
-      const p = protonMainOrdered[i];
-      if (!p || p.dead) continue;
-      protonMainOrdered[w++] = p;
-    }
-    protonMainOrdered.length = w;
-  }
-}
-
-function drawProtonMain() {
-  if (!protonMainOrdered.length) return;
-  noStroke();
-
-  // Use same occupancy suppression to avoid whitening.
-  const cols = floor(width / DRAW_GRID_SIZE);
-  const rows = floor(height / DRAW_GRID_SIZE);
-  const nCells = cols * rows;
-  if (!usedStamp || usedCols !== cols || usedRows !== rows || usedStamp.length !== nCells) {
-    usedCols = cols;
-    usedRows = rows;
-    usedStamp = new Uint32Array(nCells);
-    usedFrameId = 1;
-  }
-  usedFrameId = (usedFrameId + 1) >>> 0;
-  if (usedFrameId === 0) { usedStamp.fill(0); usedFrameId = 1; }
-
-  for (let i = 0; i < protonMainOrdered.length; i++) {
-    const p = protonMainOrdered[i];
-    if (!p || p.dead) continue;
-    const kind = protonGetKind(p);
-    const pos = protonGetPos(p);
-    if (!kind || !pos) continue;
-    const gx = floor(pos.x / DRAW_GRID_SIZE);
-    const gy = floor(pos.y / DRAW_GRID_SIZE);
-    if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
-    const idx = gx + gy * cols;
-    if (usedStamp[idx] === usedFrameId) continue;
-    usedStamp[idx] = usedFrameId;
-    const c = COL[kind] || COL.protons;
-    const a = (kind === "xray") ? 40 : 24;
-    fill(c[0], c[1], c[2], a);
-    ellipse(pos.x, pos.y, 6, 6);
-  }
 }
 
 // PERF: pool helpers (no per-spawn object allocations).
@@ -1956,8 +2082,11 @@ function resolveSpaceCollisions(particleList, center, radius, iterations) {
   }
 
   // Keep inside clock boundary after pushing.
-  for (let i = 0; i < particleList.length; i++) {
-    confineToClock(particleList[i], center, radius);
+  // When running with the worker, confinement is handled there (avoid double response).
+  if (!USE_WORKER) {
+    for (let i = 0; i < particleList.length; i++) {
+      confineToClock(particleList[i], center, radius);
+    }
   }
 }
 
@@ -2796,6 +2925,9 @@ function guideInHand(p, T) {
 
 function draw() {
   profFrameStart();
+  // Worker init is deferred until particles exist (handles N==0 at startup).
+  if (USE_WORKER) tryInitWorkerIfReady();
+  if (PROF_LITE) profLite.lastFrameStart = profLiteNow();
 
   profStart("background");
   background(...COL.bg);
@@ -2811,45 +2943,6 @@ function draw() {
   // PERF: per-frame spawn budget (smooths CPU spikes without removing audio variability).
   spawnBudget = SPAWN_BUDGET_MAX;
 
-  // Proton main-engine mode (toggle M). Keeps audio-driven behavior and age ordering via ordered list.
-  if (ENGINE_MODE === "proton" && protonMain && protonMainEmitters) {
-    if (started && analysisOK && soundFile && soundFile.isLoaded() && soundFile.isPlaying()) updateAudioFeatures();
-    else fallbackFeatures();
-    updateLayerMemory();
-    updatePerfThrottles();
-
-    // Update emitter positions/rates based on hands + audio.
-    for (const hand of ["hour", "minute", "second"]) {
-      const head = (hand === "hour") ? T.hourP : (hand === "minute") ? T.minP : T.secP;
-      const w = HAND_W[hand];
-      for (const kind of KINDS) {
-        const e = protonMainEmitters[`${hand}_${kind}`];
-        if (!e) continue;
-        e.p.x = head.x;
-        e.p.y = head.y;
-        const weight = (kind === "xray") ? w.x : (kind === "mag") ? w.m : (kind === "h_ions") ? w.h : (kind === "electrons") ? w.e : w.p;
-        const lvl = kindStrength(kind);
-        const chg = changeEmph[kind] || 0;
-        const rate = (0.2 + (lvl * 2.2 + chg * 3.0) * (0.6 + overallAmp)) * weight * 6.0;
-        e.rate.numPan.a = 0;
-        e.rate.numPan.b = constrain(rate, 0, 18);
-      }
-    }
-
-    protonMain.update();
-    updateProtonMain(T);
-
-    if (frameCount % FIELD_UPDATE_EVERY === 0) updateFaceField();
-    drawFace(T);
-    drawHandShapes(T);
-    drawClockHands(T);
-    drawProtonMain();
-    drawDensityDebugHUD();
-    drawHUD();
-    if (!started) drawStartOverlay();
-    return;
-  }
-
   // Feature update
   profStart("audio");
   if (started && analysisOK && soundFile && soundFile.isLoaded() && soundFile.isPlaying()) {
@@ -2864,19 +2957,33 @@ function draw() {
 
   // Systems
   profStart("field");
-  if (frameCount % FIELD_UPDATE_EVERY === 0) updateFaceField();
+  if (frameCount % FIELD_UPDATE_EVERY === 0) {
+    const t0 = PROF_LITE ? profLiteNow() : 0;
+    updateFaceField();
+    if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
+  }
   profEnd("field");
 
   profStart("emit");
+  const tEmit0 = PROF_LITE ? profLiteNow() : 0;
   emitEnergy(T);
+  if (PROF_LITE) profLite.houseEmitMs = profLiteEma(profLite.houseEmitMs, profLiteNow() - tEmit0);
   profEnd("emit");
 
   profStart("capacity");
+  const tCap0 = PROF_LITE ? profLiteNow() : 0;
   enforceCapacity();
+  if (PROF_LITE) profLite.houseCapMs = profLiteEma(profLite.houseCapMs, profLiteNow() - tCap0);
   profEnd("capacity");
 
   profStart("update.particles");
-  updateParticles(T);
+  if (USE_WORKER) {
+    // Critical ordering: only run the per-particle force stage when the worker advanced the sim.
+    // This prevents “force accumulation without motion” when the worker lags.
+    // Physics step runs in the worker onmessage pump; draw() only renders.
+  } else {
+    updateParticles(T);
+  }
   profEnd("update.particles");
 
   profStart("draw.face");
@@ -2889,17 +2996,42 @@ function draw() {
   profEnd("draw.hands");
 
   profStart("draw.particles");
+  const tDraw0 = PROF_LITE ? profLiteNow() : 0;
   drawParticles();
+  if (PROF_LITE) profLite.drawMs = profLiteEma(profLite.drawMs, profLiteNow() - tDraw0);
   profEnd("draw.particles");
  drawDensityDebugHUD();
  if (debugHandShapes) drawHandDebug(T);
  
   profStart("draw.hud");
   drawHUD();
+  drawLiteProfilerHUD();
   drawProfilerHUD();
   profEnd("draw.hud");
 
+  // STEP 4B: enqueue the next worker step immediately after the force stage runs.
+  // If we didn’t run the force stage this frame (worker hasn’t returned yet), don’t enqueue a new step.
+  // (USE_WORKER) simulation stepping is driven by worker messages.
+
   if (!started) drawStartOverlay();
+
+  if (PROF_LITE) {
+    profLite.totalMs = profLiteEma(profLite.totalMs, profLiteNow() - profLite.lastFrameStart);
+    if (PROF_LITE_LOG) {
+      const now = profLiteNow();
+      if ((now - profLite.lastLogT) >= 1000) {
+        profLite.lastLogT = now;
+        const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
+        const updApprox = profLite.faceMs + profLite.fieldsMs + profLite.forcesMs + msHouse;
+        const totalApprox = updApprox + profLite.colMs + profLite.drawMs;
+        console.log(
+          `[prof] fps=${nf(frameRate(), 2, 1)} n=${particlesActive} upd=${updApprox.toFixed(2)}ms col=${profLite.colMs.toFixed(
+            2
+          )}ms draw=${profLite.drawMs.toFixed(2)}ms total≈${totalApprox.toFixed(2)}ms`
+        );
+      }
+    }
+  }
 
   profFrameEnd({
     particlesActive,
@@ -3619,6 +3751,8 @@ function drawHead(p, r) {
 }
 
 function updateParticles(T) {
+  const tUpd0 = PROF_LITE ? profLiteNow() : 0;
+  const tFields0 = tUpd0;
   updateXrayBlobs();
   updateXraySegments();
   // free-space particles only (hand reservoir particles are updated separately)
@@ -3647,12 +3781,100 @@ function updateParticles(T) {
     densityGridFrame = frameCount;
   }
 
+  if (PROF_LITE) {
+    profLite.fieldsMs = profLiteEma(profLite.fieldsMs, profLiteNow() - tFields0);
+  }
+
   // PERF/READABILITY: provide a stable "age rank" (oldest->newest) without reordering arrays.
   // We iterate newest->oldest (reverse order) and compute rank from the traversal index,
   // skipping null holes left by pooling. This lets the age spiral reach the center at 100% fill,
   // even if the chamber fills faster than AGE_WINDOW_FRAMES.
-  let ageRankFromNewest = 0;
   const ageRankDen = max(1, activeCount - 1);
+
+  // dt is passed for later worker-porting; current force math uses the same constants as before.
+  const dt = Math.min(2.0, Math.max(0.25, (typeof deltaTime !== "undefined" ? (deltaTime / 16.666) : 1.0)));
+  const tForces0 = PROF_LITE ? profLiteNow() : 0;
+  applyForcesMainThread(
+    T,
+    dt,
+    drag,
+    swirlBoost,
+    smoothAll,
+    couplingMode,
+    denseMode,
+    heavyPhase,
+    stridePhase,
+    alignmentPhase,
+    alignmentGrid,
+    alignmentCellSize,
+    cohesionGrid,
+    cohesionCellSize,
+    ageRankDen
+  );
+
+  if (PROF_LITE) {
+    profLite.forcesMs = profLiteEma(profLite.forcesMs, profLiteNow() - tForces0);
+  }
+
+  const tHouse0 = PROF_LITE ? profLiteNow() : 0;
+  // PERF: compact holes in-order (preserves survivor ordering/age semantics).
+  if ((frameCount % COMPACT_EVERY) === 0) {
+    let w = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p) continue;
+      particles[w++] = p;
+    }
+    particles.length = w;
+  }
+  if (PROF_LITE) {
+    profLite.houseCleanMs = profLiteEma(profLite.houseCleanMs, profLiteNow() - tHouse0);
+  }
+
+  // Collisions only for "mass" layers (protons, optionally h_ions).
+  // PERF: reuse collision list array (avoid per-frame allocations).
+  const tCol0 = PROF_LITE ? profLiteNow() : 0;
+  const collisionList = collisionListCache;
+  collisionList.length = 0;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
+  }
+  clampSpaceVelocities(collisionList);
+  resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
+
+  if (PROF_LITE) {
+    const collisionsMs = profLiteNow() - tCol0;
+    profLite.colMs = profLiteEma(profLite.colMs, collisionsMs);
+    // "update" here is everything before collisions inside updateParticles()
+    // (fields/grid prep + per-particle forces loop + cleanup/compaction).
+    const updMs = Math.max(0, tCol0 - tUpd0);
+    profLite.updMs = profLiteEma(profLite.updMs, updMs);
+  }
+}
+
+function applyForcesMainThread(
+  T,
+  dt,
+  drag,
+  swirlBoost,
+  smoothAll,
+  couplingMode,
+  denseMode,
+  heavyPhase,
+  stridePhase,
+  alignmentPhase,
+  alignmentGrid,
+  alignmentCellSize,
+  cohesionGrid,
+  cohesionCellSize,
+  ageRankDen
+) {
+  // Isolated "forces stage" (currently measured as ms_forces).
+  // IMPORTANT: keep behavior unchanged; dt is currently unused but kept for future porting.
+  void dt;
+
+  let ageRankFromNewest = 0;
 
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
@@ -3668,7 +3890,10 @@ function updateParticles(T) {
     const xrayDensityScale = isXrayBlob ? lerp(0.18, 0.70, xrayRelax) : 1.0;
 
     if (!disableFrameForces) {
-      applyCalmOrbit(p, T.c, xrayFlowScale);
+      // STEP 5 (revised): keep ALL forces on main thread; worker only integrates + confines.
+      if (!(USE_WORKER && WORKER_SPIRAL)) {
+        applyCalmOrbit(p, T.c, xrayFlowScale);
+      }
       if (!smoothAll && (i % HEAVY_FIELD_STRIDE) === heavyPhase) {
         if (!isXrayBlob) applyEddyField(p, T);
         // Disabled: kind-based ring forcing breaks age/space readability.
@@ -3704,8 +3929,14 @@ function updateParticles(T) {
     // Apply blob containment late so it re-compacts after other forces.
     applyXrayBlobForce(p);
 
-    p.update(drag, swirlBoost);
-    confineToClock(p, T.c, T.radius);
+    // STEP 4B: when worker is enabled, move only basic motion (drag+integrate+confine) to worker.
+    // Main thread keeps all forces/behaviors but does not advance position or clamp to clock.
+    if (USE_WORKER) {
+      p.update(1.0, swirlBoost, false);
+    } else {
+      p.update(drag, swirlBoost);
+      confineToClock(p, T.c, T.radius);
+    }
 
     if (p.dead()) {
       // PERF: return to pool and leave a hole; compact in-order periodically.
@@ -3713,28 +3944,6 @@ function updateParticles(T) {
       particles[i] = null;
     }
   }
-
-  // PERF: compact holes in-order (preserves survivor ordering/age semantics).
-  if ((frameCount % COMPACT_EVERY) === 0) {
-    let w = 0;
-    for (let i = 0; i < particles.length; i++) {
-      const p = particles[i];
-      if (!p) continue;
-      particles[w++] = p;
-    }
-    particles.length = w;
-  }
-
-  // Collisions only for "mass" layers (protons, optionally h_ions).
-  // PERF: reuse collision list array (avoid per-frame allocations).
-  const collisionList = collisionListCache;
-  collisionList.length = 0;
-  for (let i = 0; i < particles.length; i++) {
-    const p = particles[i];
-    if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
-  }
-  clampSpaceVelocities(collisionList);
-  resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
 }
 
 function drawParticles() {
@@ -3943,16 +4152,6 @@ function drawHUD() {
   text(
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
     x, (SOLO_KIND ? (y + 86) : (y + 70))
-  );
-
-  fill(255, 180);
-  const modeY = (SOLO_KIND ? (y + 102) : (y + 86)) + (debugPoolHUD ? 34 : 0);
-  const protonOk = !!getProtonEngineCtor();
-  const protonRunning = (ENGINE_MODE === "proton");
-  text(
-    `Mode: ${ENGINE_MODE} (press M) | Proton: ${protonOk ? "loaded" : "missing"}${protonRunning ? ` | protonParticles ${protonMainOrdered.length}` : ""}`,
-    x,
-    modeY
   );
 
   if (debugPoolHUD) {
@@ -4182,7 +4381,7 @@ Particle.prototype.deactivate = function() {
   this.maxLife = 0;
 };
 
-Particle.prototype.update = function(drag, swirlBoost) {
+Particle.prototype.update = function(drag, swirlBoost, integratePos) {
   const prof = PARTICLE_PROFILE[this.kind] || PARTICLE_PROFILE.protons;
   const s = (this.strength !== undefined ? this.strength : kindStrength(this.kind));
 
@@ -4220,7 +4419,9 @@ Particle.prototype.update = function(drag, swirlBoost) {
   this.vel.mult(drag * prof.dragMult * (1.0 - visc));
   this.vel.x = lerp(this.vel.x, 0, visc * kindSmooth);
   this.vel.y = lerp(this.vel.y, 0, visc * kindSmooth);
-  this.pos.add(this.vel);
+  if (integratePos !== false) {
+    this.pos.add(this.vel);
+  }
 
   // life only decreases when we explicitly "prune" due to overcrowding
 };
@@ -4247,3 +4448,18 @@ Particle.prototype.draw = function() {
 Particle.prototype.dead = function() {
   return this.life <= 0;
 };
+
+// Vite runs this file as an ES module, so top-level function declarations are module-scoped.
+// p5 global mode expects these callbacks on `window`.
+// IMPORTANT: use `typeof` checks so missing callbacks don't throw ReferenceError.
+if (typeof preload === "function") window.preload = preload;
+if (typeof setup === "function") window.setup = setup;
+if (typeof draw === "function") window.draw = draw;
+if (typeof mousePressed === "function") window.mousePressed = mousePressed;
+if (typeof mouseReleased === "function") window.mouseReleased = mouseReleased;
+if (typeof mouseMoved === "function") window.mouseMoved = mouseMoved;
+if (typeof mouseDragged === "function") window.mouseDragged = mouseDragged;
+if (typeof touchStarted === "function") window.touchStarted = touchStarted;
+if (typeof keyPressed === "function") window.keyPressed = keyPressed;
+if (typeof keyReleased === "function") window.keyReleased = keyReleased;
+if (typeof windowResized === "function") window.windowResized = windowResized;
