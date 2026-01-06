@@ -6,6 +6,12 @@ const WORKER_DEBUG_LOG = false;
 // STEP 6B: move only the core spiral force (applyCalmOrbit) to the worker.
 const WORKER_SPIRAL = true;
 
+// Rendering optimization (KEEP circles, KEEP all particles, no LOD):
+// Draw particles into a low-res p5.Graphics buffer, then scale up to canvas.
+const USE_LOWRES_RENDER = true;
+const PG_SCALE = 0.5;
+let pg = null;
+
 // Lightweight profiler (low overhead) to decide what to move into the worker next.
 const PROF_LITE = true;
 const PROF_LITE_LOG = false; // optional console summary once/second
@@ -14,6 +20,9 @@ let profLite = {
   updMs: 0,
   colMs: 0,
   drawMs: 0,
+  particlesDrawMs: 0,
+  clockDrawMs: 0,
+  hudDrawMs: 0,
   totalMs: 0,
   faceMs: 0,
   fieldsMs: 0,
@@ -40,13 +49,15 @@ function drawLiteProfilerHUD() {
   const fps = frameRate();
   const n = particlesActive | 0;
   const col = profLite.colMs;
-  const drw = profLite.drawMs;
+  const drw = profLite.particlesDrawMs;
+  const clk = profLite.clockDrawMs;
+  const hud = profLite.hudDrawMs;
   const msFace = profLite.faceMs;
   const msFields = profLite.fieldsMs;
   const msForces = profLite.forcesMs;
   const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
   const upd = msFace + msFields + msForces + msHouse;
-  const tot = upd + col + drw;
+  const tot = upd + col + drw + clk + hud;
 
   push();
   noStroke();
@@ -56,7 +67,7 @@ function drawLiteProfilerHUD() {
   textAlign(LEFT, TOP);
   textSize(12);
   text(
-    `FPS ${nf(fps, 2, 1)} | N ${n} | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | draw ${nf(drw, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
+    `FPS ${nf(fps, 2, 1)} | N ${n} | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | particles ${nf(drw, 1, 2)}ms | clock ${nf(clk, 1, 2)}ms | hud ${nf(hud, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
     x,
     y
   );
@@ -1460,6 +1471,11 @@ function setup() {
   angleMode(RADIANS);
   pixelDensity(1);
 
+  // Render mode info (log once on startup).
+  console.log("[render]", { USE_LOWRES_RENDER, PG_SCALE });
+
+  if (USE_LOWRES_RENDER) ensureParticleGraphics();
+
   // PERF: Fill direction LUT once (no random2D allocations in hot loops).
   DIR_X = new Float32Array(DIR_N);
   DIR_Y = new Float32Array(DIR_N);
@@ -1519,6 +1535,15 @@ amp.setInput();
 
 function windowResized() {
   resizeCanvas(1200, 1200);
+  if (USE_LOWRES_RENDER) ensureParticleGraphics();
+}
+
+function ensureParticleGraphics() {
+  const w = max(1, floor(width * PG_SCALE));
+  const h = max(1, floor(height * PG_SCALE));
+  if (pg && pg.width === w && pg.height === h) return;
+  pg = createGraphics(w, h);
+  pg.pixelDensity(1);
 }
 
 // PERF: pool helpers (no per-spawn object allocations).
@@ -2987,6 +3012,7 @@ function draw() {
   profEnd("update.particles");
 
   profStart("draw.face");
+  const tClock0 = PROF_LITE ? profLiteNow() : 0;
   drawFace(T);
   profEnd("draw.face");
 
@@ -2998,15 +3024,18 @@ function draw() {
   profStart("draw.particles");
   const tDraw0 = PROF_LITE ? profLiteNow() : 0;
   drawParticles();
-  if (PROF_LITE) profLite.drawMs = profLiteEma(profLite.drawMs, profLiteNow() - tDraw0);
+  if (PROF_LITE) profLite.particlesDrawMs = profLiteEma(profLite.particlesDrawMs, profLiteNow() - tDraw0);
   profEnd("draw.particles");
- drawDensityDebugHUD();
- if (debugHandShapes) drawHandDebug(T);
+  drawDensityDebugHUD();
+  if (debugHandShapes) drawHandDebug(T);
+  if (PROF_LITE) profLite.clockDrawMs = profLiteEma(profLite.clockDrawMs, profLiteNow() - tClock0);
  
   profStart("draw.hud");
+  const tHud0 = PROF_LITE ? profLiteNow() : 0;
   drawHUD();
   drawLiteProfilerHUD();
   drawProfilerHUD();
+  if (PROF_LITE) profLite.hudDrawMs = profLiteEma(profLite.hudDrawMs, profLiteNow() - tHud0);
   profEnd("draw.hud");
 
   // STEP 4B: enqueue the next worker step immediately after the force stage runs.
@@ -3017,17 +3046,19 @@ function draw() {
 
   if (PROF_LITE) {
     profLite.totalMs = profLiteEma(profLite.totalMs, profLiteNow() - profLite.lastFrameStart);
+    const drawSum = profLite.particlesDrawMs + profLite.clockDrawMs + profLite.hudDrawMs;
+    profLite.drawMs = profLiteEma(profLite.drawMs, drawSum);
     if (PROF_LITE_LOG) {
       const now = profLiteNow();
       if ((now - profLite.lastLogT) >= 1000) {
         profLite.lastLogT = now;
         const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
         const updApprox = profLite.faceMs + profLite.fieldsMs + profLite.forcesMs + msHouse;
-        const totalApprox = updApprox + profLite.colMs + profLite.drawMs;
+        const totalApprox = updApprox + profLite.colMs + drawSum;
         console.log(
           `[prof] fps=${nf(frameRate(), 2, 1)} n=${particlesActive} upd=${updApprox.toFixed(2)}ms col=${profLite.colMs.toFixed(
             2
-          )}ms draw=${profLite.drawMs.toFixed(2)}ms total≈${totalApprox.toFixed(2)}ms`
+          )}ms draw=${drawSum.toFixed(2)}ms total≈${totalApprox.toFixed(2)}ms`
         );
       }
     }
@@ -3947,6 +3978,50 @@ function applyForcesMainThread(
 }
 
 function drawParticles() {
+  if (USE_LOWRES_RENDER) {
+    ensureParticleGraphics();
+    if (!pg) return;
+
+    // Clear low-res buffer each frame (no trails for now).
+    pg.clear();
+    pg.noStroke();
+
+    pg.push();
+    pg.blendMode(BLEND);
+
+    const kinds = SOLO_KIND ? [SOLO_KIND] : ["protons", "h_ions", "mag", "electrons", "xray"];
+    for (let ki = 0; ki < kinds.length; ki++) {
+      const kind = kinds[ki];
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        if (!p || p.kind !== kind) continue;
+
+        // Same color/alpha logic as Particle.prototype.draw (just drawn onto pg and scaled).
+        const aLife = constrain(p.life / p.maxLife, 0, 1);
+        const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
+        const strength = constrain((p.strength !== undefined ? p.strength : kindStrength(p.kind)), 0, 1);
+
+        let flick = 1.0;
+        const hz = prof.flickerHz;
+        if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + p.seed * 6.0);
+        if (p.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + p.seed * 10.0);
+
+        const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
+        const alpha = (prof.alphaBase + alphaStrength * strength) * aLife * flick * ALPHA_SCALE;
+        pg.fill(p.col[0], p.col[1], p.col[2], alpha);
+
+        const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
+        pg.ellipse(p.pos.x * PG_SCALE, p.pos.y * PG_SCALE, s * PG_SCALE, s * PG_SCALE);
+      }
+    }
+
+    pg.pop();
+
+    // Composite scaled up.
+    image(pg, 0, 0, width, height);
+    return;
+  }
+
   noStroke();
 
   // Grid-occupancy draw to prevent overdraw/whitening in dense regions.
