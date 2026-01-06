@@ -11,6 +11,11 @@ const WORKER_SPIRAL = true;
 const USE_LOWRES_RENDER = true;
 const PG_SCALE = 0.5;
 let pg = null;
+let clockStatic = null;
+let clockStaticRedrawCount = 0;
+const DRAW_ALPHA_BUCKETS = 8;
+const DRAW_KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
+let drawBuckets = null;
 
 // Lightweight profiler (low overhead) to decide what to move into the worker next.
 const PROF_LITE = true;
@@ -19,10 +24,13 @@ const PROF_LITE_EMA_ALPHA = 0.12; // ~1s smoothing at 60fps
 let profLite = {
   updMs: 0,
   colMs: 0,
-  drawMs: 0,
   particlesDrawMs: 0,
   clockDrawMs: 0,
+  clockStaticMs: 0,
+  clockDynamicMs: 0,
+  clockOtherMs: 0,
   hudDrawMs: 0,
+  backgroundMs: 0,
   totalMs: 0,
   faceMs: 0,
   fieldsMs: 0,
@@ -51,13 +59,17 @@ function drawLiteProfilerHUD() {
   const col = profLite.colMs;
   const drw = profLite.particlesDrawMs;
   const clk = profLite.clockDrawMs;
+  const clkStatic = profLite.clockStaticMs;
+  const clkDyn = profLite.clockDynamicMs;
+  const clkOther = profLite.clockOtherMs;
   const hud = profLite.hudDrawMs;
+  const bg = profLite.backgroundMs;
   const msFace = profLite.faceMs;
   const msFields = profLite.fieldsMs;
   const msForces = profLite.forcesMs;
   const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
   const upd = msFace + msFields + msForces + msHouse;
-  const tot = upd + col + drw + clk + hud;
+  const tot = upd + col + drw + clk + hud + bg;
 
   push();
   noStroke();
@@ -67,7 +79,7 @@ function drawLiteProfilerHUD() {
   textAlign(LEFT, TOP);
   textSize(12);
   text(
-    `FPS ${nf(fps, 2, 1)} | N ${n} | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | particles ${nf(drw, 1, 2)}ms | clock ${nf(clk, 1, 2)}ms | hud ${nf(hud, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
+    `FPS ${nf(fps, 2, 1)} | N ${n} | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | bg ${nf(bg, 1, 2)}ms | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | particles ${nf(drw, 1, 2)}ms | clock ${nf(clk, 1, 2)}ms | hud ${nf(hud, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
     x,
     y
   );
@@ -75,6 +87,11 @@ function drawLiteProfilerHUD() {
     `face ${nf(msFace, 1, 2)}ms | fields ${nf(msFields, 1, 2)}ms | forces ${nf(msForces, 1, 2)}ms | house ${nf(msHouse, 1, 2)}ms`,
     x,
     y + 18
+  );
+  text(
+    `clock static ${nf(clkStatic, 1, 2)}ms | dynamic ${nf(clkDyn, 1, 2)}ms | other ${nf(clkOther, 1, 2)}ms | static redraws ${clockStaticRedrawCount}`,
+    x,
+    y + 36
   );
   pop();
 }
@@ -1475,6 +1492,7 @@ function setup() {
   console.log("[render]", { USE_LOWRES_RENDER, PG_SCALE });
 
   if (USE_LOWRES_RENDER) ensureParticleGraphics();
+  ensureClockStatic();
 
   // PERF: Fill direction LUT once (no random2D allocations in hot loops).
   DIR_X = new Float32Array(DIR_N);
@@ -1536,6 +1554,7 @@ amp.setInput();
 function windowResized() {
   resizeCanvas(1200, 1200);
   if (USE_LOWRES_RENDER) ensureParticleGraphics();
+  ensureClockStatic();
 }
 
 function ensureParticleGraphics() {
@@ -1544,6 +1563,37 @@ function ensureParticleGraphics() {
   if (pg && pg.width === w && pg.height === h) return;
   pg = createGraphics(w, h);
   pg.pixelDensity(1);
+}
+
+function ensureClockStatic() {
+  if (!clockStatic || clockStatic.width !== width || clockStatic.height !== height) {
+    clockStatic = createGraphics(width, height);
+    clockStatic.pixelDensity(1);
+  } else {
+    clockStatic.clear();
+  }
+  drawClockStatic(clockStatic);
+  clockStaticRedrawCount++;
+}
+
+function drawClockStatic(g) {
+  if (!g) return;
+  g.clear();
+  g.push();
+  g.noFill();
+  g.stroke(COL.ring[0], COL.ring[1], COL.ring[2], 140);
+  g.strokeWeight(1.2);
+  const cx = g.width * 0.5;
+  const cy = g.height * 0.5;
+  const radius = Math.min(g.width, g.height) * 0.42;
+  g.ellipse(cx, cy, radius * 2, radius * 2);
+  g.pop();
+}
+
+function ensureDrawBuckets() {
+  if (drawBuckets) return;
+  drawBuckets = new Array(DRAW_KIND_ORDER.length * DRAW_ALPHA_BUCKETS);
+  for (let i = 0; i < drawBuckets.length; i++) drawBuckets[i] = [];
 }
 
 // PERF: pool helpers (no per-spawn object allocations).
@@ -2955,7 +3005,9 @@ function draw() {
   if (PROF_LITE) profLite.lastFrameStart = profLiteNow();
 
   profStart("background");
+  const tBg0 = PROF_LITE ? profLiteNow() : 0;
   background(...COL.bg);
+  if (PROF_LITE) profLite.backgroundMs = profLiteEma(profLite.backgroundMs, profLiteNow() - tBg0);
   profEnd("background");
 
   // Always compute correct time (hands should never “stop rotating”)
@@ -3012,13 +3064,25 @@ function draw() {
   profEnd("update.particles");
 
   profStart("draw.face");
-  const tClock0 = PROF_LITE ? profLiteNow() : 0;
+  const tClockOther0 = PROF_LITE ? profLiteNow() : 0;
   drawFace(T);
+  if (PROF_LITE) profLite.clockOtherMs = profLiteEma(profLite.clockOtherMs, profLiteNow() - tClockOther0);
   profEnd("draw.face");
 
   profStart("draw.hands");
+  const tClockStatic0 = PROF_LITE ? profLiteNow() : 0;
+  if (clockStatic) image(clockStatic, 0, 0);
+  if (PROF_LITE) profLite.clockStaticMs = profLiteEma(profLite.clockStaticMs, profLiteNow() - tClockStatic0);
+
+  const tClockDyn0 = PROF_LITE ? profLiteNow() : 0;
   drawHandShapes(T);
   drawClockHands(T);
+  if (PROF_LITE) profLite.clockDynamicMs = profLiteEma(profLite.clockDynamicMs, profLiteNow() - tClockDyn0);
+
+  if (PROF_LITE) {
+    const clockMs = profLite.clockStaticMs + profLite.clockDynamicMs + profLite.clockOtherMs;
+    profLite.clockDrawMs = profLiteEma(profLite.clockDrawMs, clockMs);
+  }
   profEnd("draw.hands");
 
   profStart("draw.particles");
@@ -3028,7 +3092,6 @@ function draw() {
   profEnd("draw.particles");
   drawDensityDebugHUD();
   if (debugHandShapes) drawHandDebug(T);
-  if (PROF_LITE) profLite.clockDrawMs = profLiteEma(profLite.clockDrawMs, profLiteNow() - tClock0);
  
   profStart("draw.hud");
   const tHud0 = PROF_LITE ? profLiteNow() : 0;
@@ -3047,14 +3110,13 @@ function draw() {
   if (PROF_LITE) {
     profLite.totalMs = profLiteEma(profLite.totalMs, profLiteNow() - profLite.lastFrameStart);
     const drawSum = profLite.particlesDrawMs + profLite.clockDrawMs + profLite.hudDrawMs;
-    profLite.drawMs = profLiteEma(profLite.drawMs, drawSum);
     if (PROF_LITE_LOG) {
       const now = profLiteNow();
       if ((now - profLite.lastLogT) >= 1000) {
         profLite.lastLogT = now;
         const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
         const updApprox = profLite.faceMs + profLite.fieldsMs + profLite.forcesMs + msHouse;
-        const totalApprox = updApprox + profLite.colMs + drawSum;
+        const totalApprox = updApprox + profLite.colMs + drawSum + profLite.backgroundMs;
         console.log(
           `[prof] fps=${nf(frameRate(), 2, 1)} n=${particlesActive} upd=${updApprox.toFixed(2)}ms col=${profLite.colMs.toFixed(
             2
@@ -3702,11 +3764,6 @@ function triggerXrayBurst(T, spikeStrength) {
 // ---------- Render ----------
 function drawFace(T) {
   image(field, 0, 0, width, height);
-
-  noFill();
-  stroke(...COL.ring, 140);
-  strokeWeight(1.2);
-  ellipse(T.c.x, T.c.y, T.radius*2, T.radius*2);
 }
 
 function drawClockHands(T) {
@@ -3989,29 +4046,55 @@ function drawParticles() {
     pg.push();
     pg.blendMode(BLEND);
 
-    const kinds = SOLO_KIND ? [SOLO_KIND] : ["protons", "h_ions", "mag", "electrons", "xray"];
-    for (let ki = 0; ki < kinds.length; ki++) {
-      const kind = kinds[ki];
-      for (let i = 0; i < particles.length; i++) {
-        const p = particles[i];
-        if (!p || p.kind !== kind) continue;
+    ensureDrawBuckets();
+    for (let i = 0; i < drawBuckets.length; i++) drawBuckets[i].length = 0;
 
-        // Same color/alpha logic as Particle.prototype.draw (just drawn onto pg and scaled).
-        const aLife = constrain(p.life / p.maxLife, 0, 1);
-        const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
-        const strength = constrain((p.strength !== undefined ? p.strength : kindStrength(p.kind)), 0, 1);
+    const alphaStep = 255 / (DRAW_ALPHA_BUCKETS - 1);
+    const kindCount = DRAW_KIND_ORDER.length;
 
-        let flick = 1.0;
-        const hz = prof.flickerHz;
-        if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + p.seed * 6.0);
-        if (p.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + p.seed * 10.0);
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p) continue;
+      if (SOLO_KIND && p.kind !== SOLO_KIND) continue;
 
-        const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
-        const alpha = (prof.alphaBase + alphaStrength * strength) * aLife * flick * ALPHA_SCALE;
-        pg.fill(p.col[0], p.col[1], p.col[2], alpha);
+      // Same alpha logic as Particle.prototype.draw (quantized to reduce fill changes).
+      const aLife = constrain(p.life / p.maxLife, 0, 1);
+      const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
+      const strength = constrain((p.strength !== undefined ? p.strength : kindStrength(p.kind)), 0, 1);
 
-        const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
-        pg.ellipse(p.pos.x * PG_SCALE, p.pos.y * PG_SCALE, s * PG_SCALE, s * PG_SCALE);
+      let flick = 1.0;
+      const hz = prof.flickerHz;
+      if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + p.seed * 6.0);
+      if (p.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + p.seed * 10.0);
+
+      const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
+      const alpha = (prof.alphaBase + alphaStrength * strength) * aLife * flick * ALPHA_SCALE;
+      const bin = Math.min(DRAW_ALPHA_BUCKETS - 1, Math.max(0, Math.round(alpha / alphaStep)));
+
+      let kindIndex = 0;
+      if (p.kind === "h_ions") kindIndex = 1;
+      else if (p.kind === "mag") kindIndex = 2;
+      else if (p.kind === "electrons") kindIndex = 3;
+      else if (p.kind === "xray") kindIndex = 4;
+
+      drawBuckets[kindIndex * DRAW_ALPHA_BUCKETS + bin].push(p);
+    }
+
+    for (let ki = 0; ki < kindCount; ki++) {
+      const kind = DRAW_KIND_ORDER[ki];
+      const baseCol = COL[kind] || COL.protons;
+      for (let bi = 0; bi < DRAW_ALPHA_BUCKETS; bi++) {
+        const bucket = drawBuckets[ki * DRAW_ALPHA_BUCKETS + bi];
+        if (!bucket.length) continue;
+        const bucketAlpha = bi * alphaStep;
+        pg.fill(baseCol[0], baseCol[1], baseCol[2], bucketAlpha);
+        for (let j = 0; j < bucket.length; j++) {
+          const p = bucket[j];
+          const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
+          const aLife = constrain(p.life / p.maxLife, 0, 1);
+          const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
+          pg.ellipse(p.pos.x * PG_SCALE, p.pos.y * PG_SCALE, s * PG_SCALE, s * PG_SCALE);
+        }
       }
     }
 
