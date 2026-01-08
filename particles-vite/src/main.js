@@ -92,6 +92,18 @@ function profLiteEma(prev, sample) {
   return prev + (sample - prev) * PROF_LITE_EMA_ALPHA;
 }
 
+function setCanvasWillReadFrequently(g) {
+  if (!g) return;
+  const canvas = g.canvas || g.elt;
+  if (!canvas || !canvas.getContext) return;
+  try {
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (ctx) g.drawingContext = ctx;
+  } catch (e) {
+    // Ignore if the context can't be reconfigured.
+  }
+}
+
 function drawLiteProfilerHUD() {
   if (!PROF_LITE) return;
   const x = 14;
@@ -216,7 +228,7 @@ function nextPow2(v) {
 function chooseCapacity(n) {
   const need = Math.max(1, n | 0);
   const pow2 = nextPow2(need);
-  const MIN_CHUNK = 16384;
+  const MIN_CHUNK = 32768;
   return (Math.max(MIN_CHUNK, pow2) | 0);
 }
 
@@ -1557,6 +1569,7 @@ function setup() {
   // Field buffers
   field = createGraphics(fieldW, fieldH);
   field.pixelDensity(1);
+  setCanvasWillReadFrequently(field);
   fieldBuf  = new Float32Array(fieldW * fieldH * 3);
   fieldBuf2 = new Float32Array(fieldW * fieldH * 3);
 
@@ -3131,7 +3144,9 @@ function draw() {
 
   // Systems
   profStart("field");
-  if (frameCount % FIELD_UPDATE_EVERY === 0) {
+  const fieldEveryBase = Math.max(2, FIELD_UPDATE_EVERY);
+  const fieldEvery = (particlesActive > 20000) ? Math.max(3, fieldEveryBase) : fieldEveryBase;
+  if (frameCount % fieldEvery === 0) {
     const t0 = PROF_LITE ? profLiteNow() : 0;
     updateFaceField();
     if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
