@@ -26,6 +26,12 @@ let glSize = null;
 let glColor = null;
 let glAlpha = null;
 let glCapacity = 0;
+const FRAME_BUDGET_MS = 20;
+const SOFT_BUDGET_MS = 26;
+let frameStartTime = 0;
+let collisionsEvery = 1;
+let faceUpdatedThisFrame = false;
+let collisionsRanThisFrame = false;
 
 const PARTICLE_VERT = `
 precision mediump float;
@@ -91,6 +97,10 @@ let ftDisplay = { current: 0, worst: 0, p95: 0 };
 
 function profLiteNow() {
   return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+}
+
+function timeLeft() {
+  return SOFT_BUDGET_MS - (profLiteNow() - frameStartTime);
 }
 
 function profLiteEma(prev, sample) {
@@ -181,7 +191,7 @@ function drawLiteProfilerHUD() {
     y + 54
   );
   text(
-    `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor}`,
+    `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor} | face ${faceUpdatedThisFrame ? "yes" : "no"} | col ${collisionsRanThisFrame ? "yes" : "no"} | colEvery ${collisionsEvery}`,
     x,
     y + 72
   );
@@ -551,20 +561,29 @@ if (USE_WORKER) {
           profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
         }
         {
-          const tCol0 = PROF_LITE ? profLiteNow() : 0;
-          const collisionList = collisionListCache;
-          collisionList.length = 0;
-          for (let i = 0; i < particles.length; i++) {
-            const p = particles[i];
-            if (!p || p.dead()) continue;
-            if (COLLISION_KINDS[p.kind]) collisionList.push(p);
+          if (particles.length > 14000) collisionsEvery = 3;
+          else if (particles.length > 10000) collisionsEvery = 2;
+          else collisionsEvery = 1;
+          const shouldCollide = (timeLeft() > 8) && ((frameCount % collisionsEvery) === 0);
+          if (shouldCollide) {
+            const tCol0 = PROF_LITE ? profLiteNow() : 0;
+            const collisionList = collisionListCache;
+            collisionList.length = 0;
+            for (let i = 0; i < particles.length; i++) {
+              const p = particles[i];
+              if (!p || p.dead()) continue;
+              if (COLLISION_KINDS[p.kind]) collisionList.push(p);
+            }
+            if (collisionList.length) {
+              const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+              clampSpaceVelocities(collisionList);
+              resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
+            }
+            collisionsRanThisFrame = true;
+            if (PROF_LITE) profLite.colMs = profLiteEma(profLite.colMs, profLiteNow() - tCol0);
+          } else if (PROF_LITE) {
+            profLite.colMs = profLiteEma(profLite.colMs, 0);
           }
-          if (collisionList.length) {
-            const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
-            clampSpaceVelocities(collisionList);
-            resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
-          }
-          if (PROF_LITE) profLite.colMs = profLiteEma(profLite.colMs, profLiteNow() - tCol0);
         }
 
         // Cleanup: return dead particles to pool and periodically compact holes (preserves order).
@@ -3177,7 +3196,9 @@ function draw() {
   profFrameStart();
   // Worker init is deferred until particles exist (handles N==0 at startup).
   if (USE_WORKER) tryInitWorkerIfReady();
-  const frameStartTime = profLiteNow();
+  frameStartTime = profLiteNow();
+  faceUpdatedThisFrame = false;
+  collisionsRanThisFrame = false;
   if (PROF_LITE) profLite.lastFrameStart = frameStartTime;
 
   profStart("background");
@@ -3223,12 +3244,13 @@ function draw() {
       faceUpdateEvery = 1;
     }
 
-    if ((frameCount % faceUpdateEvery) === 0) {
+    if ((frameCount % faceUpdateEvery) === 0 && timeLeft() > 6 && deltaTime < 28) {
       const t0 = PROF_LITE ? profLiteNow() : 0;
       const y0 = faceRowCursor;
       const y1 = min(field.height - 1, y0 + faceChunkRows);
       updateFaceFieldChunk(y0, y1);
       faceRowCursor = (y1 >= field.height - 1) ? 1 : y1;
+      faceUpdatedThisFrame = true;
       if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
     }
   }
@@ -4146,18 +4168,25 @@ function updateParticles(T) {
 
   // Collisions only for "mass" layers (protons, optionally h_ions).
   // PERF: reuse collision list array (avoid per-frame allocations).
+  if (particles.length > 14000) collisionsEvery = 3;
+  else if (particles.length > 10000) collisionsEvery = 2;
+  else collisionsEvery = 1;
+  const shouldCollide = (timeLeft() > 8) && ((frameCount % collisionsEvery) === 0);
   const tCol0 = PROF_LITE ? profLiteNow() : 0;
-  const collisionList = collisionListCache;
-  collisionList.length = 0;
-  for (let i = 0; i < particles.length; i++) {
-    const p = particles[i];
-    if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
+  if (shouldCollide) {
+    const collisionList = collisionListCache;
+    collisionList.length = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
+    }
+    clampSpaceVelocities(collisionList);
+    resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
+    collisionsRanThisFrame = true;
   }
-  clampSpaceVelocities(collisionList);
-  resolveSpaceCollisions(collisionList, T.c, T.radius, min(COLLISION_ITERS, COLLISION_ITERS_MASS));
 
   if (PROF_LITE) {
-    const collisionsMs = profLiteNow() - tCol0;
+    const collisionsMs = shouldCollide ? (profLiteNow() - tCol0) : 0;
     profLite.colMs = profLiteEma(profLite.colMs, collisionsMs);
     // "update" here is everything before collisions inside updateParticles()
     // (fields/grid prep + per-particle forces loop + cleanup/compaction).
