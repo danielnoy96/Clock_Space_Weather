@@ -52,6 +52,10 @@ function stepSim(params, activeN) {
   const spiralEnable = !!params.spiralEnable;
   const spiralSwirl = +params.spiralSwirl || 0.0; // tangential strength (already scaled by 0.40 on main)
   const spiralDrift = +params.spiralDrift || 0.0; // inward strength (already scaled by 0.22 on main)
+  const enableDensity = params.enableDensity !== false;
+  const enableAgeSpiral = params.enableAgeSpiral !== false;
+  const enableCohesion = params.enableCohesion !== false;
+  const enableXrayBlobForce = params.enableXrayBlobForce !== false;
 
   // STEP 6C: remaining per-particle forces (simplified, audio-driven).
   const nowS = +params.nowS || 0.0;
@@ -126,7 +130,7 @@ function stepSim(params, activeN) {
     }
 
     // Age spiral: newest near rim, oldest toward center.
-    if (birth) {
+    if (birth && enableAgeSpiral) {
       const ageFrames = (frame - (birth[i] >>> 0)) | 0;
       const ageTime01 = clamp(ageFrames / ageWindow, 0.0, 1.0);
       const rank01 = (m > 1) ? clamp((m - 1 - i) / (m - 1), 0.0, 1.0) : 0.0;
@@ -146,7 +150,7 @@ function stepSim(params, activeN) {
 
     // Per-kind micro-behavior (approximates Particle.update + applyLayerBehavior without p5/noise).
     const k = kind ? (kind[i] | 0) : 2; // default protons
-    if (k === 4) {
+    if (k === 4 && enableCohesion) {
       // mag: tiny rotation warble based on seed + time
       const sd = seed ? seed[i] : 0.0;
       const w = (Math.sin(sd + nowS * (1.2 + 3.2 * mag)) ) * 0.03 * mag;
@@ -155,7 +159,7 @@ function stepSim(params, activeN) {
       const nvy = vxi * sa + vyi * ca;
       vxi = nvx;
       vyi = nvy;
-    } else if (k === 1) {
+    } else if (k === 1 && enableCohesion) {
       // electrons: fast vibration (LUT-based), scales with electrons proxy
       const sd = seed ? seed[i] : 0.0;
       const dirIdx = (((sd * 997.0) | 0) & DIR_MASK);
@@ -169,7 +173,7 @@ function stepSim(params, activeN) {
       const phase = Math.sin(nowS * (0.55 + 0.35 * overallAmp));
       vxi += (rx0 * inv0) * (-phase * (0.020 * electrons) * (0.8 + 0.6 * electrons));
       vyi += (ry0 * inv0) * (-phase * (0.020 * electrons) * (0.8 + 0.6 * electrons));
-    } else if (k === 0) {
+    } else if (k === 0 && enableXrayBlobForce) {
       // xray: sharp jitter, scales with xray
       const sd = seed ? seed[i] : 0.0;
       const dirIdx = (((sd * 991.0) | 0) & DIR_MASK);
@@ -178,11 +182,11 @@ function stepSim(params, activeN) {
       const ampJ = (0.02 + 0.06 * xray) * 1.15;
       vxi += (DIR_X[j1] + 0.50 * DIR_X[j2]) * ampJ;
       vyi += (DIR_Y[j1] + 0.50 * DIR_Y[j2]) * ampJ;
-    } else if (k === 2) {
+    } else if (k === 2 && enableCohesion) {
       // protons: calm (slight damping)
       vxi *= 0.985;
       vyi *= 0.985;
-    } else if (k === 3) {
+    } else if (k === 3 && enableCohesion) {
       // h_ions: flow bias (tangential), medium
       const flow = 0.06 + 0.10 * h_ions;
       vxi += tangx0 * flow;
@@ -190,7 +194,7 @@ function stepSim(params, activeN) {
     }
 
     // Density pressure: repel from dense cells to encourage "filled matter" without pairwise collisions.
-    {
+    if (enableDensity) {
       let gx = (xi0 * sx) | 0;
       let gy = (yi0 * sy) | 0;
       if (gx < 1) gx = 1;

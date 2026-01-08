@@ -70,6 +70,27 @@ const PROF_LITE = true;
 const PROF_LITE_LOG = false; // optional console summary once/second
 const PROF_LITE_EMA_ALPHA = 0.12; // ~1s smoothing at 60fps
 let showPerfHUD = true;
+// Clumping diagnostics (sampled, low overhead).
+const CLUMP_DIAG_EVERY_MS = 250;
+const CLUMP_GRID_W = 64;
+const CLUMP_GRID_H = 64;
+const CLUMP_SAMPLE_MAX = 320;
+const CLUMP_CELL_SIZE = 70;
+let debugClumpDiag = false;
+let clumpCounts = new Uint16Array(CLUMP_GRID_W * CLUMP_GRID_H);
+let clumpHead = new Int32Array(0);
+let clumpNext = new Int32Array(0);
+let clumpSampleIdx = new Int32Array(0);
+let clumpDiag = {
+  enabled: false,
+  nextAt: 0,
+  hotspotCount: 0,
+  hotspotX: 0,
+  hotspotY: 0,
+  minNN: 0,
+  overlapPct: 0,
+  diagMs: 0,
+};
 let profLite = {
   updMs: 0,
   colMs: 0,
@@ -196,6 +217,163 @@ function drawLiteProfilerHUD() {
     x,
     y + 72
   );
+  if (debugClumpDiag) {
+    text(
+      `clump: hot ${clumpDiag.hotspotCount} | minNN ${nf(clumpDiag.minNN, 1, 1)} | overlap ${nf(clumpDiag.overlapPct, 1, 1)}% | diag ${nf(clumpDiag.diagMs, 1, 2)}ms`,
+      x,
+      y + 90
+    );
+  }
+  pop();
+}
+
+function ensureClumpBuffers(sampleN, headCells) {
+  const coarseCells = CLUMP_GRID_W * CLUMP_GRID_H;
+  if (!clumpCounts || clumpCounts.length !== coarseCells) clumpCounts = new Uint16Array(coarseCells);
+  if (!clumpHead || clumpHead.length !== headCells) clumpHead = new Int32Array(headCells);
+  if (!clumpNext || clumpNext.length < sampleN) clumpNext = new Int32Array(sampleN);
+  if (!clumpSampleIdx || clumpSampleIdx.length < sampleN) clumpSampleIdx = new Int32Array(sampleN);
+}
+
+function updateClumpDiagnostics() {
+  if (!debugClumpDiag) {
+    clumpDiag.enabled = false;
+    return;
+  }
+  const now = profLiteNow();
+  if (now < clumpDiag.nextAt) return;
+  clumpDiag.nextAt = now + CLUMP_DIAG_EVERY_MS;
+  clumpDiag.enabled = true;
+
+  const t0 = profLiteNow();
+  const w = width || 1;
+  const h = height || 1;
+
+  // Coarse density grid for hotspot detection.
+  clumpCounts.fill(0);
+  const sx = CLUMP_GRID_W / w;
+  const sy = CLUMP_GRID_H / h;
+  let activeCount = 0;
+  let hotCount = 0;
+  let hotIdx = 0;
+
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (!p || !p.active || p.dead()) continue;
+    activeCount++;
+    let gx = (p.pos.x * sx) | 0;
+    let gy = (p.pos.y * sy) | 0;
+    if (gx < 0) gx = 0; else if (gx >= CLUMP_GRID_W) gx = CLUMP_GRID_W - 1;
+    if (gy < 0) gy = 0; else if (gy >= CLUMP_GRID_H) gy = CLUMP_GRID_H - 1;
+    const idx = gx + gy * CLUMP_GRID_W;
+    const v = (clumpCounts[idx] + 1) & 0xffff;
+    clumpCounts[idx] = v;
+    if (v > hotCount) {
+      hotCount = v;
+      hotIdx = idx;
+    }
+  }
+
+  const hotGX = hotIdx % CLUMP_GRID_W;
+  const hotGY = (hotIdx / CLUMP_GRID_W) | 0;
+  clumpDiag.hotspotCount = hotCount;
+  clumpDiag.hotspotX = (hotGX + 0.5) * (w / CLUMP_GRID_W);
+  clumpDiag.hotspotY = (hotGY + 0.5) * (h / CLUMP_GRID_H);
+
+  // Sampled nearest-neighbor/overlap check.
+  const sampleN = Math.min(CLUMP_SAMPLE_MAX, Math.max(0, activeCount));
+  if (sampleN <= 1) {
+    clumpDiag.minNN = 0;
+    clumpDiag.overlapPct = 0;
+    clumpDiag.diagMs = profLiteNow() - t0;
+    return;
+  }
+
+  const gridW = Math.max(1, Math.floor(w / CLUMP_CELL_SIZE));
+  const gridH = Math.max(1, Math.floor(h / CLUMP_CELL_SIZE));
+  const headCells = gridW * gridH;
+  ensureClumpBuffers(sampleN, headCells);
+  clumpHead.fill(-1);
+
+  const step = Math.max(1, Math.floor(activeCount / sampleN));
+  let sampleCount = 0;
+  let seen = 0;
+  for (let i = 0; i < particles.length && sampleCount < sampleN; i++) {
+    const p = particles[i];
+    if (!p || !p.active || p.dead()) continue;
+    if ((seen % step) === 0) {
+      clumpSampleIdx[sampleCount++] = i;
+    }
+    seen++;
+  }
+
+  for (let s = 0; s < sampleCount; s++) {
+    const p = particles[clumpSampleIdx[s]];
+    if (!p) { clumpNext[s] = -1; continue; }
+    let cx = Math.floor(p.pos.x / CLUMP_CELL_SIZE);
+    let cy = Math.floor(p.pos.y / CLUMP_CELL_SIZE);
+    if (cx < 0) cx = 0; else if (cx >= gridW) cx = gridW - 1;
+    if (cy < 0) cy = 0; else if (cy >= gridH) cy = gridH - 1;
+    const cidx = cx + cy * gridW;
+    clumpNext[s] = clumpHead[cidx];
+    clumpHead[cidx] = s;
+  }
+
+  let minNN = 1e9;
+  let overlapCount = 0;
+  for (let s = 0; s < sampleCount; s++) {
+    const p = particles[clumpSampleIdx[s]];
+    if (!p) continue;
+    const r = computeCollisionRadius(p);
+    let bestD2 = 1e12;
+    let bestRsum = 0;
+    let cx = Math.floor(p.pos.x / CLUMP_CELL_SIZE);
+    let cy = Math.floor(p.pos.y / CLUMP_CELL_SIZE);
+    if (cx < 0) cx = 0; else if (cx >= gridW) cx = gridW - 1;
+    if (cy < 0) cy = 0; else if (cy >= gridH) cy = gridH - 1;
+    for (let oy = -1; oy <= 1; oy++) {
+      const y = cy + oy;
+      if (y < 0 || y >= gridH) continue;
+      for (let ox = -1; ox <= 1; ox++) {
+        const x = cx + ox;
+        if (x < 0 || x >= gridW) continue;
+        const head = clumpHead[x + y * gridW];
+        for (let j = head; j !== -1; j = clumpNext[j]) {
+          if (j === s) continue;
+          const q = particles[clumpSampleIdx[j]];
+          if (!q) continue;
+          const dx = p.pos.x - q.pos.x;
+          const dy = p.pos.y - q.pos.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < bestD2) {
+            bestD2 = d2;
+            bestRsum = r + computeCollisionRadius(q);
+          }
+        }
+      }
+    }
+    if (bestD2 < 1e11) {
+      const d = Math.sqrt(bestD2);
+      if (d < minNN) minNN = d;
+      if (d < bestRsum * 0.9) overlapCount++;
+    }
+  }
+
+  clumpDiag.minNN = (minNN < 1e8) ? minNN : 0;
+  clumpDiag.overlapPct = (sampleCount > 0) ? (overlapCount / sampleCount) * 100 : 0;
+  clumpDiag.diagMs = profLiteNow() - t0;
+}
+
+function drawClumpDiagnosticsMarker() {
+  if (!debugClumpDiag || clumpDiag.hotspotCount <= 0) return;
+  const r = 6 + Math.min(24, clumpDiag.hotspotCount * 0.4);
+  push();
+  noFill();
+  stroke(255, 80, 80, 190);
+  strokeWeight(1.2);
+  ellipse(clumpDiag.hotspotX, clumpDiag.hotspotY, r * 2, r * 2);
+  line(clumpDiag.hotspotX - r, clumpDiag.hotspotY, clumpDiag.hotspotX + r, clumpDiag.hotspotY);
+  line(clumpDiag.hotspotX, clumpDiag.hotspotY - r, clumpDiag.hotspotX, clumpDiag.hotspotY + r);
   pop();
 }
 
@@ -456,6 +634,10 @@ function postStep() {
     electrons: +electrons || 0.0,
     protons: +protons || 0.0,
     fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
+    enableDensity: !!enableDensity,
+    enableAgeSpiral: !!enableAgeSpiral,
+    enableCohesion: !!enableCohesion,
+    enableXrayBlobForce: !!enableXrayBlobForce,
     // Age spiral constants
     ageWindow: AGE_WINDOW_FRAMES,
     ageOuterFrac: AGE_OUTER_FRAC,
@@ -3309,6 +3491,10 @@ function draw() {
   profStart("draw.particles");
   const tDraw0 = PROF_LITE ? profLiteNow() : 0;
   drawParticles();
+  if (debugClumpDiag) {
+    updateClumpDiagnostics();
+    drawClumpDiagnosticsMarker();
+  }
   if (PROF_LITE) profLite.particlesDrawMs = profLiteEma(profLite.particlesDrawMs, profLiteNow() - tDraw0);
   profEnd("draw.particles");
   drawDensityDebugHUD();
@@ -3377,6 +3563,7 @@ function keyPressed() {
   if (key === "g" || key === "G") debugDensityCoupling = !debugDensityCoupling;
   if (key === "f" || key === "F") debugPerfHUD = !debugPerfHUD;
   if (key === "h" || key === "H") showPerfHUD = !showPerfHUD;
+  if (key === "v" || key === "V") debugClumpDiag = !debugClumpDiag;
   if (key === "p" || key === "P") debugPoolHUD = !debugPoolHUD;
   if (key === "r" || key === "R") {
     // R toggles profiler; Shift+R downloads report JSON.
