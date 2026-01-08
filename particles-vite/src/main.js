@@ -83,6 +83,11 @@ let profLite = {
   lastFrameStart: 0,
   lastLogT: 0,
 };
+let fpsDisplay = 0;
+let fpsDisplayNext = 0;
+let ftHistory = [];
+let ftWindow2s = [];
+let ftDisplay = { current: 0, worst: 0, p95: 0 };
 
 function profLiteNow() {
   return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
@@ -108,7 +113,30 @@ function drawLiteProfilerHUD() {
   if (!PROF_LITE) return;
   const x = 14;
   const y = 70; // below file input / status
-  const fps = frameRate();
+  const now = millis();
+  const ft = (typeof deltaTime !== "undefined") ? deltaTime : 0;
+  ftHistory.push(ft);
+  if (ftHistory.length > 120) ftHistory.shift();
+  ftWindow2s.push({ t: now, ft });
+  while (ftWindow2s.length && (now - ftWindow2s[0].t) > 2000) ftWindow2s.shift();
+  if (!fpsDisplayNext || now >= fpsDisplayNext) {
+    fpsDisplay = frameRate();
+    fpsDisplayNext = now + 250; // update 4x/sec to keep it readable
+    let worst = 0;
+    for (let i = 0; i < ftWindow2s.length; i++) {
+      if (ftWindow2s[i].ft > worst) worst = ftWindow2s[i].ft;
+    }
+    let p95 = 0;
+    if (ftHistory.length) {
+      const sorted = ftHistory.slice().sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * 0.95) - 1));
+      p95 = sorted[idx];
+    }
+    ftDisplay.current = ft;
+    ftDisplay.worst = worst;
+    ftDisplay.p95 = p95;
+  }
+  const fps = fpsDisplay;
   const n = particlesActive | 0;
   const col = profLite.colMs;
   const drw = profLite.particlesDrawMs;
@@ -128,29 +156,34 @@ function drawLiteProfilerHUD() {
   push();
   noStroke();
   fill(0, 170);
-  rect(x - 8, y - 8, 640, 82, 10);
+  rect(x - 8, y - 8, 640, 100, 10);
   fill(255, 230);
   textAlign(LEFT, TOP);
   textSize(12);
   text(
-    `FPS ${nf(fps, 2, 1)} | N ${n} | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | bg ${nf(bg, 1, 2)}ms | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | particles ${nf(drw, 1, 2)}ms | clock ${nf(clk, 1, 2)}ms | hud ${nf(hud, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
+    `FPS ${nf(fps, 2, 1)} | ft ${nf(ftDisplay.current, 1, 1)}ms | worst ${nf(ftDisplay.worst, 1, 1)}ms | p95 ${nf(ftDisplay.p95, 1, 1)}ms`,
     x,
     y
   );
   text(
-    `face ${nf(msFace, 1, 2)}ms | fields ${nf(msFields, 1, 2)}ms | forces ${nf(msForces, 1, 2)}ms | house ${nf(msHouse, 1, 2)}ms`,
+    `N ${n} | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | bg ${nf(bg, 1, 2)}ms | upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | particles ${nf(drw, 1, 2)}ms | clock ${nf(clk, 1, 2)}ms | hud ${nf(hud, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
     x,
     y + 18
   );
   text(
-    `clock static ${nf(clkStatic, 1, 2)}ms | dynamic ${nf(clkDyn, 1, 2)}ms | other ${nf(clkOther, 1, 2)}ms | static redraws ${clockStaticRedrawCount}`,
+    `face ${nf(msFace, 1, 2)}ms | fields ${nf(msFields, 1, 2)}ms | forces ${nf(msForces, 1, 2)}ms | house ${nf(msHouse, 1, 2)}ms`,
     x,
     y + 36
   );
   text(
-    `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor}`,
+    `clock static ${nf(clkStatic, 1, 2)}ms | dynamic ${nf(clkDyn, 1, 2)}ms | other ${nf(clkOther, 1, 2)}ms | static redraws ${clockStaticRedrawCount}`,
     x,
     y + 54
+  );
+  text(
+    `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor}`,
+    x,
+    y + 72
   );
   pop();
 }
@@ -208,6 +241,7 @@ let simInFlight = null; // { frameId, activeN }
 let simFrameId = 1;
 let simLoggedDt = false;
 let stepScheduled = false;
+let dtSmooth = 1;
 
 function wlog(...args) {
   if (WORKER_DEBUG_LOG) console.log(...args);
@@ -215,6 +249,12 @@ function wlog(...args) {
 
 function wwarn(...args) {
   if (WORKER_DEBUG_LOG) console.warn(...args);
+}
+
+function getSmoothedDt() {
+  const dtRaw = Math.min(1.5, Math.max(0.25, (typeof deltaTime !== "undefined" ? (deltaTime / 16.666) : 1.0)));
+  dtSmooth = dtSmooth * 0.9 + dtRaw * 0.1;
+  return dtSmooth;
 }
 
 function nextPow2(v) {
@@ -376,8 +416,7 @@ function postStep() {
     return;
   }
 
-  const dtRaw = (typeof deltaTime !== "undefined" ? (deltaTime / 16.666) : 1.0);
-  const dt = Math.min(1.5, Math.max(0.25, dtRaw));
+  const dt = getSmoothedDt();
   if (!simLoggedDt) {
     wlog("dt", dt);
     simLoggedDt = true;
@@ -4066,7 +4105,7 @@ function updateParticles(T) {
   const ageRankDen = max(1, activeCount - 1);
 
   // dt is passed for later worker-porting; current force math uses the same constants as before.
-  const dt = Math.min(2.0, Math.max(0.25, (typeof deltaTime !== "undefined" ? (deltaTime / 16.666) : 1.0)));
+  const dt = getSmoothedDt();
   const tForces0 = PROF_LITE ? profLiteNow() : 0;
   applyForcesMainThread(
     T,
