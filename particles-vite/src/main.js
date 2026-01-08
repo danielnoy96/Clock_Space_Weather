@@ -128,7 +128,7 @@ function drawLiteProfilerHUD() {
   push();
   noStroke();
   fill(0, 170);
-  rect(x - 8, y - 8, 640, 64, 10);
+  rect(x - 8, y - 8, 640, 82, 10);
   fill(255, 230);
   textAlign(LEFT, TOP);
   textSize(12);
@@ -146,6 +146,11 @@ function drawLiteProfilerHUD() {
     `clock static ${nf(clkStatic, 1, 2)}ms | dynamic ${nf(clkDyn, 1, 2)}ms | other ${nf(clkOther, 1, 2)}ms | static redraws ${clockStaticRedrawCount}`,
     x,
     y + 36
+  );
+  text(
+    `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor}`,
+    x,
+    y + 54
   );
   pop();
 }
@@ -372,7 +377,7 @@ function postStep() {
   }
 
   const dtRaw = (typeof deltaTime !== "undefined" ? (deltaTime / 16.666) : 1.0);
-  const dt = Math.min(2.0, Math.max(0.25, dtRaw));
+  const dt = Math.min(1.5, Math.max(0.25, dtRaw));
   if (!simLoggedDt) {
     wlog("dt", dt);
     simLoggedDt = true;
@@ -741,7 +746,12 @@ const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
 const DRAW_GRID_SIZE = 3;
 const DISABLE_FPS_THROTTLE = true;
-const FACE_UPDATE_EVERY = 3;
+const FACE_SCALE = 0.5;
+const FACE_BUDGET_MS = 6;
+const DISABLE_FACE_FIELD = false;
+let faceUpdateEvery = 1;
+let faceChunkRows = 32;
+let faceRowCursor = 1;
 
 // Space-field motion controls (global multipliers).
 // Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
@@ -1531,8 +1541,9 @@ let sparks = [];
 let ripples = [];
 
 // Persistent energy field
-let field, fieldW = 180, fieldH = 180;
+let field, fieldW = 0, fieldH = 0;
 let fieldBuf, fieldBuf2;
+let faceLogOnce = false;
 
 // UI
 let statusMsg = "Click canvas to enable audio, then upload an MP3 (top-left).";
@@ -1568,11 +1579,7 @@ function setup() {
   }
 
   // Field buffers
-  field = createGraphics(fieldW, fieldH);
-  field.pixelDensity(1);
-  setCanvasWillReadFrequently(field);
-  fieldBuf  = new Float32Array(fieldW * fieldH * 3);
-  fieldBuf2 = new Float32Array(fieldW * fieldH * 3);
+  ensureFaceField();
 
   // Audio analyzers + bus routing
   fft = new p5.FFT(0.85, 1024);
@@ -1618,6 +1625,7 @@ function windowResized() {
   } else if (USE_LOWRES_RENDER) {
     ensureParticleGraphics();
   }
+  ensureFaceField();
   ensureClockStatic();
 }
 
@@ -1627,6 +1635,23 @@ function ensureParticleGraphics() {
   if (pg && pg.width === w && pg.height === h) return;
   pg = createGraphics(w, h);
   pg.pixelDensity(1);
+}
+
+function ensureFaceField() {
+  const w = max(1, floor(width * FACE_SCALE));
+  const h = max(1, floor(height * FACE_SCALE));
+  if (field && field.width === w && field.height === h) return;
+  fieldW = w;
+  fieldH = h;
+  field = createGraphics(fieldW, fieldH);
+  field.pixelDensity(1);
+  setCanvasWillReadFrequently(field);
+  fieldBuf = new Float32Array(fieldW * fieldH * 3);
+  fieldBuf2 = new Float32Array(fieldW * fieldH * 3);
+  if (!faceLogOnce) {
+    console.log("[face]", { FACE_SCALE, fieldW: field.width, fieldH: field.height });
+    faceLogOnce = true;
+  }
 }
 
 function ensureParticleGL() {
@@ -3113,7 +3138,8 @@ function draw() {
   profFrameStart();
   // Worker init is deferred until particles exist (handles N==0 at startup).
   if (USE_WORKER) tryInitWorkerIfReady();
-  if (PROF_LITE) profLite.lastFrameStart = profLiteNow();
+  const frameStartTime = profLiteNow();
+  if (PROF_LITE) profLite.lastFrameStart = frameStartTime;
 
   profStart("background");
   const tBg0 = PROF_LITE ? profLiteNow() : 0;
@@ -3145,10 +3171,27 @@ function draw() {
 
   // Systems
   profStart("field");
-  if (frameCount % FACE_UPDATE_EVERY === 0) {
-    const t0 = PROF_LITE ? profLiteNow() : 0;
-    updateFaceField();
-    if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
+  if (!DISABLE_FACE_FIELD && field) {
+    const fillPercent = (CAPACITY > 0) ? ((particlesActive / CAPACITY) * 100) : 0;
+    if (particles.length > 16000 || fillPercent > 85) {
+      faceChunkRows = 16;
+      faceUpdateEvery = 3;
+    } else if (particles.length > 12000 || fillPercent > 60) {
+      faceChunkRows = 24;
+      faceUpdateEvery = 2;
+    } else {
+      faceChunkRows = 32;
+      faceUpdateEvery = 1;
+    }
+
+    if ((frameCount % faceUpdateEvery) === 0) {
+      const t0 = PROF_LITE ? profLiteNow() : 0;
+      const y0 = faceRowCursor;
+      const y1 = min(field.height - 1, y0 + faceChunkRows);
+      updateFaceFieldChunk(y0, y1);
+      faceRowCursor = (y1 >= field.height - 1) ? 1 : y1;
+      if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
+    }
   }
   profEnd("field");
 
@@ -3484,12 +3527,18 @@ function fallbackFeatures() {
 }
 
 // ---------- Face field ----------
-function updateFaceField() {
+function updateFaceFieldChunk(yStart, yEnd) {
+  const fieldW = field.width;
+  const fieldH = field.height;
+  let y0 = max(1, yStart | 0);
+  let y1 = min(fieldH - 1, yEnd | 0);
+  if (y1 <= y0) return;
+
   const decay = 0.965 - h_ions * 0.010;
   const diff  = 0.18 * (1.0 - protons * 0.65);
 
-  // diffuse + decay
-  for (let y = 1; y < fieldH - 1; y++) {
+  // diffuse + decay (chunked rows only)
+  for (let y = y0; y < y1; y++) {
     for (let x = 1; x < fieldW - 1; x++) {
       const idx = (x + y * fieldW) * 3;
       for (let c = 0; c < 3; c++) {
@@ -3503,14 +3552,23 @@ function updateFaceField() {
       }
     }
   }
-  let tmp = fieldBuf; fieldBuf = fieldBuf2; fieldBuf2 = tmp;
 
-  // global hydrogen fog bias
-  addGlobalFog(0.0015 + h_ions * 0.010);
+  // copy chunk back into fieldBuf (leave other rows unchanged)
+  for (let y = y0; y < y1; y++) {
+    for (let x = 1; x < fieldW - 1; x++) {
+      const idx = (x + y * fieldW) * 3;
+      fieldBuf[idx + 0] = fieldBuf2[idx + 0];
+      fieldBuf[idx + 1] = fieldBuf2[idx + 1];
+      fieldBuf[idx + 2] = fieldBuf2[idx + 2];
+    }
+  }
 
-  // render to graphics
+  // global hydrogen fog bias (chunked)
+  addGlobalFogChunk(0.0015 + h_ions * 0.010, y0, y1);
+
+  // render chunk to graphics
   field.loadPixels();
-  for (let y = 0; y < fieldH; y++) {
+  for (let y = y0; y < y1; y++) {
     for (let x = 0; x < fieldW; x++) {
       const idx = (x + y * fieldW) * 3;
       let r = 1.0 - exp(-fieldBuf[idx + 0] * 0.85);
@@ -3537,6 +3595,23 @@ function addGlobalFog(amount) {
     fieldBuf[i] += rr;
     fieldBuf[i+1] += gg;
     fieldBuf[i+2] += bb;
+  }
+}
+
+function addGlobalFogChunk(amount, y0, y1) {
+  const c = COL.h_ions;
+  const rr = (c[0] / 255.0) * amount;
+  const gg = (c[1] / 255.0) * amount;
+  const bb = (c[2] / 255.0) * amount;
+  const fieldW = field.width;
+  for (let y = y0; y < y1; y++) {
+    let idx = (y * fieldW) * 3;
+    for (let x = 0; x < fieldW; x++) {
+      fieldBuf[idx + 0] += rr;
+      fieldBuf[idx + 1] += gg;
+      fieldBuf[idx + 2] += bb;
+      idx += 3;
+    }
   }
 }
 
