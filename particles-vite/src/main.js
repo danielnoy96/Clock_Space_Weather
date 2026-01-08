@@ -9,6 +9,8 @@ const WORKER_SPIRAL = true;
 // Rendering optimization (KEEP circles, KEEP all particles, no LOD):
 // Draw particles into a low-res p5.Graphics buffer, then scale up to canvas.
 const USE_LOWRES_RENDER = true;
+// GPU particles (point sprites) on a WEBGL layer.
+const USE_WEBGL_PARTICLES = true;
 const PG_SCALE = 0.5;
 let pg = null;
 let clockStatic = null;
@@ -16,6 +18,46 @@ let clockStaticRedrawCount = 0;
 const DRAW_ALPHA_BUCKETS = 8;
 const DRAW_KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
 let drawBuckets = null;
+let pgl = null;
+let particleShader = null;
+let particleGL = null;
+let glPos = null;
+let glSize = null;
+let glColor = null;
+let glAlpha = null;
+let glCapacity = 0;
+
+const PARTICLE_VERT = `
+precision mediump float;
+attribute vec2 aPosition;
+attribute float aSize;
+attribute vec3 aColor;
+attribute float aAlpha;
+uniform vec2 uResolution;
+varying vec3 vColor;
+varying float vAlpha;
+void main() {
+  vec2 zeroToOne = aPosition / uResolution;
+  vec2 clip = zeroToOne * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  gl_PointSize = aSize;
+  vColor = aColor;
+  vAlpha = aAlpha;
+}
+`;
+
+const PARTICLE_FRAG = `
+precision mediump float;
+varying vec3 vColor;
+varying float vAlpha;
+void main() {
+  vec2 uv = gl_PointCoord - 0.5;
+  float d = length(uv);
+  if (d > 0.5) discard;
+  float edge = smoothstep(0.5, 0.45, d);
+  gl_FragColor = vec4(vColor, vAlpha * edge);
+}
+`;
 
 // Lightweight profiler (low overhead) to decide what to move into the worker next.
 const PROF_LITE = true;
@@ -1489,9 +1531,13 @@ function setup() {
   pixelDensity(1);
 
   // Render mode info (log once on startup).
-  console.log("[render]", { USE_LOWRES_RENDER, PG_SCALE });
+  console.log("[render]", { USE_LOWRES_RENDER, USE_WEBGL_PARTICLES, PG_SCALE });
 
-  if (USE_LOWRES_RENDER) ensureParticleGraphics();
+  if (USE_WEBGL_PARTICLES) {
+    ensureParticleGL();
+  } else if (USE_LOWRES_RENDER) {
+    ensureParticleGraphics();
+  }
   ensureClockStatic();
 
   // PERF: Fill direction LUT once (no random2D allocations in hot loops).
@@ -1553,7 +1599,11 @@ amp.setInput();
 
 function windowResized() {
   resizeCanvas(1200, 1200);
-  if (USE_LOWRES_RENDER) ensureParticleGraphics();
+  if (USE_WEBGL_PARTICLES) {
+    ensureParticleGL();
+  } else if (USE_LOWRES_RENDER) {
+    ensureParticleGraphics();
+  }
   ensureClockStatic();
 }
 
@@ -1563,6 +1613,53 @@ function ensureParticleGraphics() {
   if (pg && pg.width === w && pg.height === h) return;
   pg = createGraphics(w, h);
   pg.pixelDensity(1);
+}
+
+function ensureParticleGL() {
+  const w = max(1, floor(width * PG_SCALE));
+  const h = max(1, floor(height * PG_SCALE));
+  if (pgl && pgl.width === w && pgl.height === h && particleShader && particleGL) return;
+
+  pgl = createGraphics(w, h, WEBGL);
+  pgl.pixelDensity(1);
+  pgl.noStroke();
+  particleShader = pgl.createShader(PARTICLE_VERT, PARTICLE_FRAG);
+  pgl.shader(particleShader);
+
+  const gl = pgl._renderer.GL;
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0, 0, 0, 0);
+
+  const program = particleShader._glProgram;
+  particleGL = {
+    gl,
+    program,
+    posBuffer: gl.createBuffer(),
+    sizeBuffer: gl.createBuffer(),
+    colorBuffer: gl.createBuffer(),
+    alphaBuffer: gl.createBuffer(),
+    attribs: {
+      pos: gl.getAttribLocation(program, "aPosition"),
+      size: gl.getAttribLocation(program, "aSize"),
+      color: gl.getAttribLocation(program, "aColor"),
+      alpha: gl.getAttribLocation(program, "aAlpha"),
+    },
+    uniforms: {
+      resolution: gl.getUniformLocation(program, "uResolution"),
+    },
+  };
+}
+
+function ensureGLArrays(count) {
+  if (count <= glCapacity && glPos && glSize && glColor && glAlpha) return;
+  glCapacity = max(256, nextPow2(count));
+  glPos = new Float32Array(glCapacity * 2);
+  glSize = new Float32Array(glCapacity);
+  glColor = new Float32Array(glCapacity * 3);
+  glAlpha = new Float32Array(glCapacity);
 }
 
 function ensureClockStatic() {
@@ -4035,6 +4132,98 @@ function applyForcesMainThread(
 }
 
 function drawParticles() {
+  if (USE_WEBGL_PARTICLES) {
+    ensureParticleGL();
+    if (!pgl || !particleGL || !particleShader) return;
+
+    const gl = particleGL.gl;
+    const program = particleGL.program;
+    const bucketN = max(2, DRAW_ALPHA_BUCKETS | 0);
+
+    // Clear WebGL layer to transparent.
+    pgl.shader(particleShader);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // Fill attribute buffers.
+    let count = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p || !p.active || p.dead()) continue;
+      if (SOLO_KIND && p.kind !== SOLO_KIND) continue;
+      count++;
+    }
+    if (count <= 0) {
+      image(pgl, 0, 0, width, height);
+      return;
+    }
+    ensureGLArrays(count);
+
+    let idx = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p || !p.active || p.dead()) continue;
+      if (SOLO_KIND && p.kind !== SOLO_KIND) continue;
+
+      const aLife = constrain(p.life / p.maxLife, 0, 1);
+      const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
+      const strength = constrain((p.strength !== undefined ? p.strength : kindStrength(p.kind)), 0, 1);
+
+      let flick = 1.0;
+      const hz = prof.flickerHz;
+      if (hz > 0) flick = 0.75 + 0.25 * sin(millis() * (hz * 2 * PI) + p.seed * 6.0);
+      if (p.kind === "xray") flick = 0.60 + 0.40 * sin(millis() * (hz * 2 * PI) + p.seed * 10.0);
+
+      const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
+      const alpha = (prof.alphaBase + alphaStrength * strength) * aLife * flick * ALPHA_SCALE;
+      const alphaNorm = constrain(alpha / 255.0, 0, 1);
+      const bucket = min(bucketN - 1, max(0, floor(alphaNorm * bucketN)));
+      const alphaQ = (bucket + 0.5) / bucketN;
+
+      const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
+      const px = p.pos.x * PG_SCALE;
+      const py = p.pos.y * PG_SCALE;
+
+      const base = p.col || COL.protons;
+      glPos[idx * 2 + 0] = px;
+      glPos[idx * 2 + 1] = py;
+      glSize[idx] = max(1.0, s * PG_SCALE);
+      glColor[idx * 3 + 0] = base[0] / 255.0;
+      glColor[idx * 3 + 1] = base[1] / 255.0;
+      glColor[idx * 3 + 2] = base[2] / 255.0;
+      glAlpha[idx] = alphaQ;
+      idx++;
+    }
+
+    // Upload buffers + draw points.
+    gl.useProgram(program);
+    gl.uniform2f(particleGL.uniforms.resolution, pgl.width, pgl.height);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleGL.posBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, glPos.subarray(0, idx * 2), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(particleGL.attribs.pos);
+    gl.vertexAttribPointer(particleGL.attribs.pos, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleGL.sizeBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, glSize.subarray(0, idx), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(particleGL.attribs.size);
+    gl.vertexAttribPointer(particleGL.attribs.size, 1, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleGL.colorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, glColor.subarray(0, idx * 3), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(particleGL.attribs.color);
+    gl.vertexAttribPointer(particleGL.attribs.color, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleGL.alphaBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, glAlpha.subarray(0, idx), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(particleGL.attribs.alpha);
+    gl.vertexAttribPointer(particleGL.attribs.alpha, 1, gl.FLOAT, false, 0, 0);
+
+    gl.drawArrays(gl.POINTS, 0, idx);
+
+    image(pgl, 0, 0, width, height);
+    return;
+  }
+
   if (USE_LOWRES_RENDER) {
     ensureParticleGraphics();
     if (!pg) return;
