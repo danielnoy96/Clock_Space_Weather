@@ -741,6 +741,7 @@ const VISCOSITY_BASE = 0.060;
 const COHESION_FLOOR = 0.35;
 const DRAW_GRID_SIZE = 3;
 const DISABLE_FPS_THROTTLE = true;
+const FACE_UPDATE_EVERY = 3;
 
 // Space-field motion controls (global multipliers).
 // Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
@@ -3144,9 +3145,7 @@ function draw() {
 
   // Systems
   profStart("field");
-  const fieldEveryBase = Math.max(2, FIELD_UPDATE_EVERY);
-  const fieldEvery = (particlesActive > 20000) ? Math.max(3, fieldEveryBase) : fieldEveryBase;
-  if (frameCount % fieldEvery === 0) {
+  if (frameCount % FACE_UPDATE_EVERY === 0) {
     const t0 = PROF_LITE ? profLiteNow() : 0;
     updateFaceField();
     if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
