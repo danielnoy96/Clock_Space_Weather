@@ -69,6 +69,7 @@ void main() {
 const PROF_LITE = true;
 const PROF_LITE_LOG = false; // optional console summary once/second
 const PROF_LITE_EMA_ALPHA = 0.12; // ~1s smoothing at 60fps
+let showPerfHUD = true;
 let profLite = {
   updMs: 0,
   colMs: 0,
@@ -564,7 +565,7 @@ if (USE_WORKER) {
           if (particles.length > 14000) collisionsEvery = 3;
           else if (particles.length > 10000) collisionsEvery = 2;
           else collisionsEvery = 1;
-          const shouldCollide = (timeLeft() > 8) && ((frameCount % collisionsEvery) === 0);
+          const shouldCollide = enableCollisions && (timeLeft() > 8) && ((frameCount % collisionsEvery) === 0);
           if (shouldCollide) {
             const tCol0 = PROF_LITE ? profLiteNow() : 0;
             const collisionList = collisionListCache;
@@ -1588,6 +1589,11 @@ let debugHandShapes = false;
 let debugDensityCoupling = false;
 let debugPerfHUD = false;
 let debugPoolHUD = false;
+let enableDensity = true;
+let enableCollisions = true;
+let enableAgeSpiral = true;
+let enableCohesion = true;
+let enableXrayBlobForce = true;
 let handParticles = { hour: [], minute: [], second: [] };
 let handSlots = { hour: null, minute: null, second: null };
 let handSlotMeta = { hour: null, minute: null, second: null };
@@ -3311,8 +3317,10 @@ function draw() {
   profStart("draw.hud");
   const tHud0 = PROF_LITE ? profLiteNow() : 0;
   drawHUD();
-  drawLiteProfilerHUD();
-  drawProfilerHUD();
+  if (showPerfHUD) {
+    drawLiteProfilerHUD();
+    drawProfilerHUD();
+  }
   if (PROF_LITE) profLite.hudDrawMs = profLiteEma(profLite.hudDrawMs, profLiteNow() - tHud0);
   profEnd("draw.hud");
 
@@ -3368,6 +3376,7 @@ function keyPressed() {
   if (key === "d" || key === "D") debugHandShapes = !debugHandShapes;
   if (key === "g" || key === "G") debugDensityCoupling = !debugDensityCoupling;
   if (key === "f" || key === "F") debugPerfHUD = !debugPerfHUD;
+  if (key === "h" || key === "H") showPerfHUD = !showPerfHUD;
   if (key === "p" || key === "P") debugPoolHUD = !debugPoolHUD;
   if (key === "r" || key === "R") {
     // R toggles profiler; Shift+R downloads report JSON.
@@ -3385,6 +3394,11 @@ function keyPressed() {
   if (key === "3") SOLO_KIND = "protons";
   if (key === "4") SOLO_KIND = "h_ions";
   if (key === "5") SOLO_KIND = "mag";
+  if (key === "z" || key === "Z") { enableDensity = !enableDensity; console.log("density", enableDensity); }
+  if (key === "x" || key === "X") { enableCollisions = !enableCollisions; console.log("collisions", enableCollisions); }
+  if (key === "a" || key === "A") { enableAgeSpiral = !enableAgeSpiral; console.log("ageSpiral", enableAgeSpiral); }
+  if (key === "s" || key === "S") { enableCohesion = !enableCohesion; console.log("cohesion", enableCohesion); }
+  if (key === "t" || key === "T") { enableXrayBlobForce = !enableXrayBlobForce; console.log("xrayBlob", enableXrayBlobForce); }
 }
 
 // ---------- File upload ----------
@@ -4171,7 +4185,7 @@ function updateParticles(T) {
   if (particles.length > 14000) collisionsEvery = 3;
   else if (particles.length > 10000) collisionsEvery = 2;
   else collisionsEvery = 1;
-  const shouldCollide = (timeLeft() > 8) && ((frameCount % collisionsEvery) === 0);
+  const shouldCollide = enableCollisions && (timeLeft() > 8) && ((frameCount % collisionsEvery) === 0);
   const tCol0 = PROF_LITE ? profLiteNow() : 0;
   if (shouldCollide) {
     const collisionList = collisionListCache;
@@ -4246,14 +4260,14 @@ function applyForcesMainThread(
         }
       }
     }
-    applyAgeSpiral(p, T, ageRankFromNewest / ageRankDen, xrayAgeScale);
+    if (enableAgeSpiral) applyAgeSpiral(p, T, ageRankFromNewest / ageRankDen, xrayAgeScale);
     ageRankFromNewest++;
     applyLayerBehavior(p, T);
     // Disabled: kind-based stratification breaks age/space readability.
     // if (!DISABLE_RINGS && !denseMode) applyLayerStratification(p, T);
     if (!smoothAll && !isXrayBlob) applyVolumetricMix(p, T);
 
-    if (couplingMode) {
+    if (couplingMode && enableDensity) {
       applyDensityCoupling(p, T, xrayDensityScale);
     }
 
@@ -4261,7 +4275,7 @@ function applyForcesMainThread(
       applyAlignment(p, i, alignmentGrid, alignmentCellSize);
     }
 
-    if (!denseMode || !DENSE_DISABLE_COHESION) {
+    if (enableCohesion && (!denseMode || !DENSE_DISABLE_COHESION)) {
       // X-ray spikes should clump immediately: apply cohesion every frame for xray blob particles.
       if (isXrayBlob || ((i % COHESION_APPLY_STRIDE) === stridePhase)) {
         applyCohesion(p, i, cohesionGrid, cohesionCellSize);
@@ -4269,7 +4283,7 @@ function applyForcesMainThread(
     }
 
     // Apply blob containment late so it re-compacts after other forces.
-    applyXrayBlobForce(p);
+    if (enableXrayBlobForce) applyXrayBlobForce(p);
 
     // STEP 4B: when worker is enabled, move only basic motion (drag+integrate+confine) to worker.
     // Main thread keeps all forces/behaviors but does not advance position or clamp to clock.
@@ -4657,6 +4671,10 @@ function drawHUD() {
     `Change: x ${nf(changeEmph.xray,1,2)} m ${nf(changeEmph.mag,1,2)} h ${nf(changeEmph.h_ions,1,2)} e ${nf(changeEmph.electrons,1,2)} p ${nf(changeEmph.protons,1,2)}`,
     x, (SOLO_KIND ? (y + 86) : (y + 70))
   );
+  text(
+    `Toggles: dens ${enableDensity ? "on" : "off"} | col ${enableCollisions ? "on" : "off"} | age ${enableAgeSpiral ? "on" : "off"} | coh ${enableCohesion ? "on" : "off"} | xray ${enableXrayBlobForce ? "on" : "off"}`,
+    x, (SOLO_KIND ? (y + 102) : (y + 86))
+  );
 
   if (debugPoolHUD) {
     const c = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -4665,7 +4683,7 @@ function drawHUD() {
       if (!p) continue;
       c[p.kind] = (c[p.kind] || 0) + 1;
     }
-    const line0Y = (SOLO_KIND ? (y + 102) : (y + 86));
+    const line0Y = (SOLO_KIND ? (y + 118) : (y + 102));
     fill(255, 200);
     text(
       `POOL (press P): active x ${c.xray} m ${c.mag} h ${c.h_ions} e ${c.electrons} p ${c.protons}`,
