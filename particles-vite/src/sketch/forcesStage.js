@@ -51,6 +51,7 @@ export function applyForcesStage(ctx) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     if (!p) continue;
+    const overlapFactor = Number.isFinite(p.overlapFactorCurrent) ? p.overlapFactorCurrent : 1.0;
 
     const isXrayBlob = p.kind === "xray" && !!p.blobId;
     const xrayTight = isXrayBlob ? constrain(p.xrayTight || 0, 0, 1) : 0;
@@ -64,23 +65,23 @@ export function applyForcesStage(ctx) {
     if (!disableFrameForces) {
       // STEP 5 (revised): keep ALL forces on main thread; worker only integrates + confines.
       if (!(USE_WORKER && WORKER_SPIRAL)) {
-        applyCalmOrbit(p, T.c, xrayFlowScale);
+        applyCalmOrbit(p, T.c, xrayFlowScale, overlapFactor);
       }
       if (!smoothAll && (i % HEAVY_FIELD_STRIDE) === heavyPhase) {
-        if (!isXrayBlob) applyEddyField(p, T);
+        if (!isXrayBlob) applyEddyField(p, T, overlapFactor);
         if (!isXrayBlob) {
           applyHIonStreams(p, T);
           applyElectronBreath(p, T);
         }
       }
     }
-    if (enableAgeSpiral) applyAgeSpiral(p, T, ageRankFromNewest / ageRankDen, xrayAgeScale);
+    if (enableAgeSpiral) applyAgeSpiral(p, T, ageRankFromNewest / ageRankDen, xrayAgeScale, overlapFactor);
     ageRankFromNewest++;
     applyLayerBehavior(p, T);
     if (!smoothAll && !isXrayBlob) applyVolumetricMix(p, T);
 
     if (couplingMode && enableDensity) {
-      applyDensityCoupling(p, T, xrayDensityScale);
+      applyDensityCoupling(p, T, xrayDensityScale * overlapFactor);
     }
 
     if (!isXrayBlob && denseMode && (i % ALIGNMENT_STRIDE) === alignmentPhase) {
@@ -90,7 +91,7 @@ export function applyForcesStage(ctx) {
     if (enableCohesion && (!denseMode || !DENSE_DISABLE_COHESION)) {
       // X-ray spikes should clump immediately: apply cohesion every frame for xray blob particles.
       if (isXrayBlob || ((i % COHESION_APPLY_STRIDE) === stridePhase)) {
-        applyCohesion(p, i, cohesionGrid, cohesionCellSize);
+        applyCohesion(p, i, cohesionGrid, cohesionCellSize, overlapFactor);
       }
     }
 
@@ -113,4 +114,3 @@ export function applyForcesStage(ctx) {
     }
   }
 }
-

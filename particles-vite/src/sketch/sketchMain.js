@@ -84,6 +84,24 @@ const COLLISION_CORR_ALPHA_BASE = 0.26;
 const COLLISION_CORR_ALPHA_LOW = 0.20;
 const COLLISION_CORR_ALPHA_HIGH = 0.32;
 const MAX_COLLISION_MOVE = 1.0;
+const OVERLAP_MIN_NN = 0.5;
+const OVERLAP_NN_RANGE = 0.7;
+const OVERLAP_NN_TRIGGER = 1.0;
+const OVERLAP_LERP = 0.20;
+const MIN_SPAWN_DIST = 2.6;
+const SPAWN_MAX_ATTEMPTS = 4;
+const SPAWN_CELL_SIZE = 24;
+const HOT_CELL_OVERLAP_THRESHOLD = 6;
+const HOT_CELL_ITERS = 2;
+const HOT_CELL_PUSH_BOOST = 0.15;
+const HOT_CELL_MAX_MOVE = 1.8;
+const TROUBLE_MIN_NN = 0.8;
+const TROUBLE_OVERLAP_PCT = 35;
+const TROUBLE_HOTSPOT = 150;
+const TROUBLE_ITERS = 8;
+const TROUBLE_CORR_ALPHA = 0.36;
+const TROUBLE_MAX_MOVE = 1.6;
+const TROUBLE_PUSH_K = 0.24;
 const COLLISION_CELL_FRAC_BASE = 0.55;
 const COLLISION_CELL_FRAC_LOW = 0.25;
 const COLLISION_CELL_FRAC_HIGH = 0.8;
@@ -93,22 +111,6 @@ const SPAWN_THROTTLE_HOLD = 2;
 let spawnThrottleFrames = 0;
 let spawnThrottleScale = 1.0;
 let overBudgetStreak = 0;
-let collisionState = {
-  overlapHigh: false,
-  lowOverlapStreak: 0,
-  itersLast: 0,
-  itersTarget: 1,
-  itersCurrent: 1,
-  corrTarget: COLLISION_CORR_ALPHA_BASE,
-  corrCurrent: COLLISION_CORR_ALPHA_BASE,
-  collisionsEveryLast: 1,
-  pairsOverlapLast: 0,
-  maxOverlapLast: 0,
-  overlapRatioLast: 0,
-  cellFracLast: 1,
-  cellsProcessedLast: 0,
-  cellsTotalLast: 0,
-};
 
 // Lightweight profiler (low overhead) to decide what to move into the worker next.
 const PROF_LITE = true;
@@ -237,6 +239,22 @@ function setCanvasWillReadFrequently(g) {
   }
 }
 
+function updateOverlapFactors(list) {
+  if (!list || !list.length) return;
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p) continue;
+    const minNN = (typeof p.minNNThisFrame === "number") ? p.minNNThisFrame : 1e9;
+    let target = 1.0;
+    if (p.collidedThisFrame || (minNN > 0 && minNN < OVERLAP_NN_TRIGGER)) {
+      target = constrain((minNN - OVERLAP_MIN_NN) / OVERLAP_NN_RANGE, 0, 1);
+    }
+    if (!Number.isFinite(target)) target = 1.0;
+    if (!Number.isFinite(p.overlapFactorCurrent)) p.overlapFactorCurrent = target;
+    else p.overlapFactorCurrent = lerp(p.overlapFactorCurrent, target, OVERLAP_LERP);
+  }
+}
+
 function drawLiteProfilerHUD() {
   const next = drawLiteProfilerHUDCore(
     { fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftDisplay },
@@ -255,6 +273,7 @@ function drawLiteProfilerHUD() {
       collisionsEvery,
       enableCollisions,
       lastCollisionSolveMs,
+      spawnRejectDisplay,
       debugCollisionAudit,
       collisionAudit,
       collisionAuditLast,
@@ -463,6 +482,7 @@ let simVY = null; // Float32Array
 let simKind = null; // Uint8Array (per particle kind id)
 let simSeed = null; // Float32Array (per particle seed)
 let simBirth = null; // Uint32Array (per particle birthFrame)
+let simOverlap = null; // Float32Array (per-particle overlap factor)
 let simRefs = []; // Particle references in array order
 let simGens = null; // Int32Array(capacity) generation snapshot (for safe reuse)
 let simInFlight = null; // { frameId, activeN }
@@ -521,6 +541,7 @@ function ensureSimArrays(cap) {
   if (!simKind || simKind.length !== cap) simKind = new Uint8Array(cap);
   if (!simSeed || simSeed.length !== cap) simSeed = new Float32Array(cap);
   if (!simBirth || simBirth.length !== cap) simBirth = new Uint32Array(cap);
+  if (!simOverlap || simOverlap.length !== cap) simOverlap = new Float32Array(cap);
   if (!simGens || simGens.length !== cap) simGens = new Int32Array(cap);
 }
 
@@ -562,6 +583,7 @@ function fillSimArraysFromParticles(cap) {
       simKind[filled] = kindToId(p.kind) & 255;
       simSeed[filled] = +p.seed || 0.0;
       simBirth[filled] = (p.birthFrame || 0) >>> 0;
+      simOverlap[filled] = (Number.isFinite(p.overlapFactorCurrent) ? p.overlapFactorCurrent : 1.0);
       filled++;
     }
   }
@@ -597,12 +619,13 @@ function initWorkerCapacity(cap) {
         kind: simKind.buffer,
         seed: simSeed.buffer,
         birth: simBirth.buffer,
+        overlap: simOverlap.buffer,
       },
     },
-    [simX.buffer, simY.buffer, simVX.buffer, simVY.buffer, simKind.buffer, simSeed.buffer, simBirth.buffer]
+    [simX.buffer, simY.buffer, simVX.buffer, simVY.buffer, simKind.buffer, simSeed.buffer, simBirth.buffer, simOverlap.buffer]
   );
 
-  simX = simY = simVX = simVY = simKind = simSeed = simBirth = null;
+  simX = simY = simVX = simVY = simKind = simSeed = simBirth = simOverlap = null;
 }
 
 function tryInitWorkerIfReady() {
@@ -636,7 +659,7 @@ function scheduleNextStep() {
 function postStep() {
   if (!USE_WORKER || !simWorker) return;
   if (!simWorkerReady || simWorkerBusy) return;
-  if (!simX || !simY || !simVX || !simVY || !simKind || !simSeed || !simBirth || !simGens) {
+  if (!simX || !simY || !simVX || !simVY || !simKind || !simSeed || !simBirth || !simOverlap || !simGens) {
     wwarn("postStep: buffers not attached (waiting for worker)");
     return;
   }
@@ -716,12 +739,13 @@ function postStep() {
         kind: simKind.buffer,
         seed: simSeed.buffer,
         birth: simBirth.buffer,
+        overlap: simOverlap.buffer,
       },
     },
-    [simX.buffer, simY.buffer, simVX.buffer, simVY.buffer, simKind.buffer, simSeed.buffer, simBirth.buffer]
+    [simX.buffer, simY.buffer, simVX.buffer, simVY.buffer, simKind.buffer, simSeed.buffer, simBirth.buffer, simOverlap.buffer]
   );
 
-  simX = simY = simVX = simVY = simKind = simSeed = simBirth = null;
+  simX = simY = simVX = simVY = simKind = simSeed = simBirth = simOverlap = null;
 }
 
 if (USE_WORKER) {
@@ -739,12 +763,13 @@ if (USE_WORKER) {
         simWorkerCap = msg.n | 0;
         capacity = simWorkerCap;
         simX = new Float32Array(b.x);
-        simY = new Float32Array(b.y);
-        simVX = new Float32Array(b.vx);
-        simVY = new Float32Array(b.vy);
-        simKind = new Uint8Array(b.kind);
-        simSeed = new Float32Array(b.seed);
-        simBirth = new Uint32Array(b.birth);
+      simY = new Float32Array(b.y);
+      simVX = new Float32Array(b.vx);
+      simVY = new Float32Array(b.vy);
+      simKind = new Uint8Array(b.kind);
+      simSeed = new Float32Array(b.seed);
+      simBirth = new Uint32Array(b.birth);
+        simOverlap = b.overlap ? new Float32Array(b.overlap) : null;
         simGens = new Int32Array(simWorkerCap);
         simWorkerBusy = false;
         simWorkerReady = true;
@@ -763,13 +788,14 @@ if (USE_WORKER) {
         if (!inflight) return;
 
         // Re-wrap buffers (ownership returns to main thread).
-        simX = new Float32Array(b.x);
-        simY = new Float32Array(b.y);
-        simVX = new Float32Array(b.vx);
-        simVY = new Float32Array(b.vy);
-        simKind = new Uint8Array(b.kind);
-        simSeed = new Float32Array(b.seed);
-        simBirth = new Uint32Array(b.birth);
+      simX = new Float32Array(b.x);
+      simY = new Float32Array(b.y);
+      simVX = new Float32Array(b.vx);
+      simVY = new Float32Array(b.vy);
+      simKind = new Uint8Array(b.kind);
+      simSeed = new Float32Array(b.seed);
+      simBirth = new Uint32Array(b.birth);
+        simOverlap = b.overlap ? new Float32Array(b.overlap) : null;
         // NOTE: simGens is not transferred; it must remain intact for generation checks.
         simRenderPrevX = simRenderNextX;
         simRenderPrevY = simRenderNextY;
@@ -814,23 +840,46 @@ if (USE_WORKER) {
               if (COLLISION_KINDS[p.kind]) collisionList.push(p);
             }
             if (collisionList.length) {
+              for (let i = 0; i < collisionList.length; i++) {
+                const p = collisionList[i];
+                if (!p) continue;
+                p.collidedThisFrame = false;
+                p.minNNThisFrame = 1e9;
+                if (!Number.isFinite(p.overlapFactorCurrent)) p.overlapFactorCurrent = 1.0;
+              }
               const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
               clampSpaceVelocities(collisionList);
-              const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
-              collisionState.itersTarget = collisionState.overlapHigh
+            const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
+            const trouble =
+              (clumpDiag.enabled && (
+                clumpDiag.minNN > 0 && clumpDiag.minNN < TROUBLE_MIN_NN ||
+                clumpDiag.overlapPct > TROUBLE_OVERLAP_PCT ||
+                clumpDiag.hotspotCount > TROUBLE_HOTSPOT
+              )) ||
+              (collisionState.overlapRatioLast > 0.12);
+            collisionState.trouble = trouble;
+            collisionState.itersTarget = trouble
+              ? TROUBLE_ITERS
+              : (collisionState.overlapHigh
                 ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
-                : (lowBudgetCollisions ? 1 : baseIters);
-              collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
-              const iters = max(1, Math.round(collisionState.itersCurrent));
-              collisionState.itersLast = iters;
-              collisionState.corrTarget = lowBudgetCollisions
+                : (lowBudgetCollisions ? 1 : baseIters));
+            collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
+            const iters = max(1, Math.round(collisionState.itersCurrent));
+            collisionState.itersLast = iters;
+            collisionState.corrTarget = trouble
+              ? TROUBLE_CORR_ALPHA
+              : (lowBudgetCollisions
                 ? COLLISION_CORR_ALPHA_LOW
-                : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
-              collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
-              let cellFrac = COLLISION_CELL_FRAC_BASE;
-              if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
-              if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
-              cellFrac = min(1, max(COLLISION_CELL_FRAC_MIN, cellFrac));
+                : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE));
+            collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
+            collisionState.maxMoveTarget = trouble ? TROUBLE_MAX_MOVE : MAX_COLLISION_MOVE;
+            collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
+            collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
+            collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
+            let cellFrac = COLLISION_CELL_FRAC_BASE;
+            if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
+            if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
+            cellFrac = min(1, max(COLLISION_CELL_FRAC_MIN, cellFrac));
               resolveSpaceCollisions(
                 collisionList,
                 T.c,
@@ -840,12 +889,28 @@ if (USE_WORKER) {
                 collisionsEvery,
                 cellFrac,
                 collisionState.corrCurrent,
-                MAX_COLLISION_MOVE
+                collisionState.maxMoveCurrent,
+                collisionState.pushKCurrent
               );
               collisionState.cellFracLast = cellFrac;
               collisionState.cellsProcessedLast = collisionAudit.cellsProcessed || 0;
               collisionState.cellsTotalLast = collisionAudit.cellsTotal || 0;
               updateCollisionStateFromAudit(collisionAudit);
+              if (trouble) {
+                resolveSpaceCollisions(
+                  collisionList,
+                  T.c,
+                  T.radius,
+                  iters,
+                  null,
+                  collisionsEvery,
+                  cellFrac,
+                  collisionState.corrCurrent,
+                  collisionState.maxMoveCurrent,
+                  collisionState.pushKCurrent
+                );
+              }
+              updateOverlapFactors(collisionList);
             }
             collisionsRanThisFrame = true;
             collisionsRanSinceLastDraw = true;
@@ -1076,6 +1141,8 @@ let collisionGridScratch = null; // Map (for optional cleanup pass)
 let collisionCellKeys = [];
 let collisionCellCursor = 0;
 let collisionCellKeysScratch = [];
+let collisionHotCounts = new Map();
+let collisionHotKeys = [];
 const COLLISION_CELL_OFF_X = [0, 1, 0, 1, -1];
 const COLLISION_CELL_OFF_Y = [0, 0, 1, 1, 1];
 
@@ -1103,6 +1170,27 @@ let RESERVOIR_UPDATE_EVERY = 1; // update hand reservoir every N frames
 let COLLISION_ITERS = 3;       // position-based collision solver iterations (space only)
 // How strongly collisions correct positions (higher = resolves overlap faster, but can vibrate more).
 let COLLISION_PUSH = 0.18;
+let collisionState = {
+  overlapHigh: false,
+  lowOverlapStreak: 0,
+  itersLast: 0,
+  itersTarget: 1,
+  itersCurrent: 1,
+  corrTarget: COLLISION_CORR_ALPHA_BASE,
+  corrCurrent: COLLISION_CORR_ALPHA_BASE,
+  maxMoveTarget: MAX_COLLISION_MOVE,
+  maxMoveCurrent: MAX_COLLISION_MOVE,
+  pushKTarget: COLLISION_PUSH,
+  pushKCurrent: COLLISION_PUSH,
+  collisionsEveryLast: 1,
+  pairsOverlapLast: 0,
+  maxOverlapLast: 0,
+  overlapRatioLast: 0,
+  cellFracLast: 1,
+  cellsProcessedLast: 0,
+  cellsTotalLast: 0,
+  trouble: false,
+};
 let cohesionGridCache = null;
 let cohesionGridFrame = -1;
 let fpsSmoothed = 60;
@@ -1707,6 +1795,13 @@ let statusMsg = "Click canvas to enable audio, then upload an MP3 (top-left).";
 let errorMsg = "";
 let kindCountsDisplay = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let kindCountsNextAt = 0;
+let spawnRejectCount = 0;
+let spawnRejectDisplay = 0;
+let spawnRejectNextAt = 0;
+let spawnGridCache = null;
+let spawnGridFrame = -1;
+let spawnCellPool = [];
+let spawnCellsInUse = [];
 
 function setup() {
   createCanvas(1200, 1200);
@@ -1957,6 +2052,63 @@ function rebuildNeighborGridInto(list, cellSize, grid, cellsInUse, pool) {
   return grid;
 }
 
+function rebuildSpawnGrid(list, cellSize, grid, cellsInUse, pool) {
+  if (!grid) grid = new Map();
+  for (let i = 0; i < cellsInUse.length; i++) {
+    const arr = cellsInUse[i];
+    arr.length = 0;
+    pool.push(arr);
+  }
+  cellsInUse.length = 0;
+  grid.clear();
+
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || !p.active || (p.dead && p.dead())) continue;
+    const cx = floor(p.pos.x / cellSize);
+    const cy = floor(p.pos.y / cellSize);
+    const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
+    let cell = grid.get(key);
+    if (!cell) {
+      cell = pool.pop() || [];
+      cellsInUse.push(cell);
+      grid.set(key, cell);
+    }
+    cell.push(p);
+  }
+  return grid;
+}
+
+function ensureSpawnGrid() {
+  if (spawnGridFrame === frameCount && spawnGridCache) return;
+  spawnGridCache = rebuildSpawnGrid(particles, SPAWN_CELL_SIZE, spawnGridCache, spawnCellsInUse, spawnCellPool);
+  spawnGridFrame = frameCount;
+}
+
+function isSpawnTooClose(x, y) {
+  ensureSpawnGrid();
+  if (!spawnGridCache) return false;
+  const minD2 = MIN_SPAWN_DIST * MIN_SPAWN_DIST;
+  const cx = floor(x / SPAWN_CELL_SIZE);
+  const cy = floor(y / SPAWN_CELL_SIZE);
+  for (let oy = -1; oy <= 1; oy++) {
+    const cyo = (cy + oy) & 0xffff;
+    for (let ox = -1; ox <= 1; ox++) {
+      const key = (((cx + ox) & 0xffff) << 16) | cyo;
+      const cell = spawnGridCache.get(key);
+      if (!cell) continue;
+      for (let i = 0; i < cell.length; i++) {
+        const p = cell[i];
+        if (!p) continue;
+        const dx = p.pos.x - x;
+        const dy = p.pos.y - y;
+        if ((dx * dx + dy * dy) < minD2) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function getAlignmentGrid(list, cellSize) {
   if (!alignmentGridCache || (frameCount - alignmentGridFrame) >= ALIGNMENT_EVERY) {
     // PERF: reuse Map + pooled arrays.
@@ -2195,10 +2347,22 @@ function applyAlignment(p, index, grid, cellSize) {
   p.vel.y += (ay - p.vel.y) * steer;
 }
 
-function resolveSpaceCollisions(particleList, center, radius, iterations, audit, frequencyScale, cellFrac, corrAlpha, maxMove) {
+function resolveSpaceCollisions(
+  particleList,
+  center,
+  radius,
+  iterations,
+  audit,
+  frequencyScale,
+  cellFrac,
+  corrAlpha,
+  maxMove,
+  pushKOverride
+) {
   if (!particleList.length || iterations <= 0) return;
   const freq = max(1, frequencyScale | 0);
-  const pushK = min(0.5, COLLISION_PUSH * freq);
+  const pushBase = (typeof pushKOverride === "number") ? pushKOverride : COLLISION_PUSH;
+  const pushK = min(0.5, pushBase * freq);
   const corr = (typeof corrAlpha === "number") ? corrAlpha : 1.0;
   const maxMovePx = (typeof maxMove === "number") ? maxMove : 1e9;
 
@@ -2266,7 +2430,10 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
     audit.postPairsOverlap = 0;
     audit.postSumOverlap = 0;
     audit.postMaxOverlap = 0;
+    audit.hotCells = 0;
   }
+  collisionHotCounts.clear();
+  collisionHotKeys.length = 0;
 
   for (let it = 0; it < iterations; it++) {
     for (let ci = 0; ci < cellsToProcess; ci++) {
@@ -2310,6 +2477,10 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
               const nxv = dx * inv;
               const nyv = dy * inv;
               const overlap = (minD - d);
+              if (it === 0) {
+                if (d < p.minNNThisFrame) p.minNNThisFrame = d;
+                if (d < q.minNNThisFrame) q.minNNThisFrame = d;
+              }
               let push = overlap * pushK;
               push *= corr;
               if (push > maxMovePx) push = maxMovePx;
@@ -2321,6 +2492,15 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
                 audit.postPairsOverlap++;
                 audit.postSumOverlap += post;
                 if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
+              }
+              if (overlap > 0 && it === 0) {
+                p.collidedThisFrame = true;
+                q.collidedThisFrame = true;
+              }
+              if (overlap > 0 && it === 0) {
+                const count = (collisionHotCounts.get(key) || 0) + 1;
+                collisionHotCounts.set(key, count);
+                if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
               }
 
               p.pos.x += nxv * push;
@@ -2364,6 +2544,10 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
               const nxv = dx * inv;
               const nyv = dy * inv;
               const overlap = (minD - d);
+              if (it === 0) {
+                if (d < p.minNNThisFrame) p.minNNThisFrame = d;
+                if (d < q.minNNThisFrame) q.minNNThisFrame = d;
+              }
               let push = overlap * pushK;
               push *= corr;
               if (push > maxMovePx) push = maxMovePx;
@@ -2375,6 +2559,15 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
                 audit.postPairsOverlap++;
                 audit.postSumOverlap += post;
                 if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
+              }
+              if (overlap > 0 && it === 0) {
+                p.collidedThisFrame = true;
+                q.collidedThisFrame = true;
+              }
+              if (overlap > 0 && it === 0) {
+                const count = (collisionHotCounts.get(key) || 0) + 1;
+                collisionHotCounts.set(key, count);
+                if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
               }
 
               p.pos.x += nxv * push;
@@ -2389,6 +2582,110 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
               p.vel.y -= nyv * impulse;
               q.vel.x += nxv * impulse;
               q.vel.y += nyv * impulse;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const hotCount = collisionHotKeys.length | 0;
+  if (audit) audit.hotCells = hotCount;
+  if (hotCount > 0) {
+    const pushKExtra = min(0.5, pushBase * (1.0 + HOT_CELL_PUSH_BOOST) * freq);
+    const maxMoveExtra = HOT_CELL_MAX_MOVE;
+    for (let itx = 0; itx < HOT_CELL_ITERS; itx++) {
+      for (let hi = 0; hi < collisionHotKeys.length; hi++) {
+        const key = collisionHotKeys[hi];
+        const cell = grid.get(key);
+        if (!cell) continue;
+        const cx = (key >> 16) & 0xffff;
+        const cy = key & 0xffff;
+        for (let oi = 0; oi < COLLISION_CELL_OFF_X.length; oi++) {
+          const nx = (cx + COLLISION_CELL_OFF_X[oi]) & 0xffff;
+          const ny = (cy + COLLISION_CELL_OFF_Y[oi]) & 0xffff;
+          const nkey = (nx << 16) | ny;
+          const other = grid.get(nkey);
+          if (!other) continue;
+          if (other === cell) {
+            for (let a = 0; a < cell.length; a++) {
+              const i = cell[a];
+              if (i < 0 || i >= n) continue;
+              const p = particleList[i];
+              if (!p) continue;
+              const r1 = rad[i];
+              for (let b = a + 1; b < cell.length; b++) {
+                const k = cell[b];
+                if (k < 0 || k >= n) continue;
+                const q = particleList[k];
+                if (!q) continue;
+                const dx = p.pos.x - q.pos.x;
+                const dy = p.pos.y - q.pos.y;
+                const d2 = dx * dx + dy * dy;
+                if (d2 <= 1e-6) continue;
+                const r2 = rad[k];
+                const minD = r1 + r2;
+                if (d2 >= (minD * minD)) continue;
+                const d = sqrt(d2);
+                const inv = 1.0 / d;
+                const nxv = dx * inv;
+                const nyv = dy * inv;
+                const overlap = (minD - d);
+                let push = overlap * pushKExtra;
+                push *= corr;
+                if (push > maxMoveExtra) push = maxMoveExtra;
+                p.pos.x += nxv * push;
+                p.pos.y += nyv * push;
+                q.pos.x -= nxv * push;
+                q.pos.y -= nyv * push;
+                const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
+                const dampFactor = 0.15;
+                const impulse = rv * dampFactor * corr;
+                p.vel.x -= nxv * impulse;
+                p.vel.y -= nyv * impulse;
+                q.vel.x += nxv * impulse;
+                q.vel.y += nyv * impulse;
+              }
+            }
+          } else {
+            for (let a = 0; a < cell.length; a++) {
+              const i = cell[a];
+              if (i < 0 || i >= n) continue;
+              const p = particleList[i];
+              if (!p) continue;
+              const r1 = rad[i];
+              for (let b = 0; b < other.length; b++) {
+                const k = other[b];
+                if (k < 0 || k >= n) continue;
+                const q = particleList[k];
+                if (!q) continue;
+                const dx = p.pos.x - q.pos.x;
+                const dy = p.pos.y - q.pos.y;
+                const d2 = dx * dx + dy * dy;
+                if (d2 <= 1e-6) continue;
+                const r2 = rad[k];
+                const minD = r1 + r2;
+                if (d2 >= (minD * minD)) continue;
+                const d = sqrt(d2);
+                const inv = 1.0 / d;
+                const nxv = dx * inv;
+                const nyv = dy * inv;
+                const overlap = (minD - d);
+                let push = overlap * pushKExtra;
+                push *= corr;
+                if (push > maxMoveExtra) push = maxMoveExtra;
+                p.pos.x += nxv * push;
+                p.pos.y += nyv * push;
+                q.pos.x -= nxv * push;
+                q.pos.y -= nyv * push;
+                const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
+                const dampFactor = 0.15;
+                const impulse = rv * dampFactor * corr;
+                p.vel.x -= nxv * impulse;
+                p.vel.y -= nyv * impulse;
+                q.vel.x += nxv * impulse;
+                q.vel.y += nyv * impulse;
+              }
             }
           }
         }
@@ -2570,7 +2867,7 @@ function applyVolumetricMix(p, T) {
   p.vel.add(n.mult(wob * k * T.radius));
 }
 
-function applyCohesion(p, index, grid, cellSize) {
+function applyCohesion(p, index, grid, cellSize, forceScale) {
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const radius = prof.cohesionRadius || 0;
   if (radius <= 0) return;
@@ -2646,12 +2943,14 @@ function applyCohesion(p, index, grid, cellSize) {
   const scale = min(maxF, strength) / fm;
   fx *= scale;
   fy *= scale;
-  p.vel.x += fx;
-  p.vel.y += fy;
+  const s = (forceScale === undefined) ? 1.0 : forceScale;
+  p.vel.x += fx * s;
+  p.vel.y += fy * s;
 }
 
-function applyCalmOrbit(p, center, scale) {
+function applyCalmOrbit(p, center, scale, pullScale) {
   if (scale === undefined) scale = 1.0;
+  const pull = (pullScale === undefined) ? 1.0 : pullScale;
   // tangential swirl around center (scalar math: avoids p5.Vector allocations)
   const rx = p.pos.x - center.x;
   const ry = p.pos.y - center.y;
@@ -2666,7 +2965,7 @@ function applyCalmOrbit(p, center, scale) {
 
   // Base orbit + audio wobble
   const swirl = (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * scale;         // smooth orbit
-  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias * SPACE_DRIFTIN_MULT * scale; // inward spiral, rim-weighted
+  const driftIn = (0.40 + 0.04 * h_ions + 0.02 * mag) * edgeBias * SPACE_DRIFTIN_MULT * scale * pull; // inward spiral, rim-weighted
   const jitter = (0.06 + 0.45 * electrons) * SPACE_JITTER_MULT * scale;                 // micro-turbulence
   const soften = 1.0 - 0.65 * protons;                       // high protons = less distortion
 
@@ -2686,8 +2985,9 @@ function applyCalmOrbit(p, center, scale) {
   p.vel.y += jy * j;
 }
 
-function applyAgeSpiral(p, T, ageRank01, scale) {
+function applyAgeSpiral(p, T, ageRank01, scale, pullScale) {
   if (scale === undefined) scale = 1.0;
+  const pullScaleUse = (pullScale === undefined) ? 1.0 : pullScale;
   if (DEBUG_DISABLE_AGE_SPIRAL) return;
   if (!p || p.birthFrame === undefined) return;
   const age = (frameCount || 0) - p.birthFrame;
@@ -2712,7 +3012,7 @@ function applyAgeSpiral(p, T, ageRank01, scale) {
 
   // radial correction (gentle); ramps up as the chamber approaches full,
   // so the oldest particles can reach the center even if fill happens quickly.
-  const pull = AGE_PULL * (1.0 + 1.25 * useRank) * scale;
+  const pull = AGE_PULL * (1.0 + 1.25 * useRank) * scale * pullScaleUse;
   p.vel.x += nx * dr * pull;
   p.vel.y += ny * dr * pull;
 
@@ -2806,10 +3106,11 @@ function applyLayerBehavior(p, T) {
   }
 }
 
-function applyEddyField(p, T) {
+function applyEddyField(p, T, pullScale) {
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const s = prof.eddyMult * kindStrength(p.kind);
   if (s <= 0.0001) return;
+  const pullScaleUse = (pullScale === undefined) ? 1.0 : pullScale;
 
   // Choose one "eddy" deterministically per particle to keep it cheap.
   const k = floor(p.seed * 0.01) % 6;
@@ -2824,9 +3125,9 @@ function applyEddyField(p, T) {
   let dx = ex - p.pos.x;
   let dy = ey - p.pos.y;
   const d = max(40, sqrt(dx * dx + dy * dy));
-  const pull = (0.010 + 0.030 * s) * (40 / d);
-  dx *= pull;
-  dy *= pull;
+  const pullStrength = (0.010 + 0.030 * s) * (40 / d) * pullScaleUse;
+  dx *= pullStrength;
+  dy *= pullStrength;
 
   // swirl around eddy (like a small vortex)
   const sw = (0.65 + 0.8 * mag) * (0.06 + 0.10 * s);
@@ -3416,6 +3717,11 @@ function draw() {
         c[p.kind] = (c[p.kind] || 0) + 1;
       }
       kindCountsDisplay = c;
+      if (!spawnRejectNextAt || now >= spawnRejectNextAt) {
+        spawnRejectDisplay = spawnRejectCount;
+        spawnRejectCount = 0;
+        spawnRejectNextAt = now + 1000;
+      }
 
       // Snapshot collision audit for HUD (cheap: copy totals every 0.25s)
       collisionAuditLast = {
@@ -3434,6 +3740,7 @@ function draw() {
         overlapRatio: collisionState.overlapRatioLast,
         pushK: collisionAudit.pushK,
         corrAlpha: collisionAudit.corrAlpha,
+        hotCells: collisionAudit.hotCells,
       };
       collisionAudit.pairsOverlapLast = collisionAudit.pairsOverlap;
       collisionAuditNextAt = now + 250;
@@ -4041,18 +4348,29 @@ function emitFromHand(T, which, rate) {
 
     // Leak point: around the anchor disk, slightly biased outward (never from the center).
     const hr = HAND_HEAD_R[which];
-    // Leak point: around the anchor disk, slightly biased outward (never from the center).
-    let spawnX = head.x + dirx * (hr * (0.15 + random(0.35))) + nrmx * ((random() - 0.5) * hr * 1.6);
-    let spawnY = head.y + diry * (hr * (0.15 + random(0.35))) + nrmy * ((random() - 0.5) * hr * 1.6);
-    // keep inside the clock
-    const rx = spawnX - T.c.x;
-    const ry = spawnY - T.c.y;
-    const rlen = sqrt(rx * rx + ry * ry) + 1e-6;
-    if (rlen > T.radius - 2) {
-      const rr = (T.radius - 2) / rlen;
-      spawnX = T.c.x + rx * rr;
-      spawnY = T.c.y + ry * rr;
+    let spawnX = 0;
+    let spawnY = 0;
+    let accepted = false;
+    for (let attempt = 0; attempt < SPAWN_MAX_ATTEMPTS; attempt++) {
+      // Leak point: around the anchor disk, slightly biased outward (never from the center).
+      spawnX = head.x + dirx * (hr * (0.15 + random(0.35))) + nrmx * ((random() - 0.5) * hr * 1.6);
+      spawnY = head.y + diry * (hr * (0.15 + random(0.35))) + nrmy * ((random() - 0.5) * hr * 1.6);
+      // keep inside the clock
+      const rx = spawnX - T.c.x;
+      const ry = spawnY - T.c.y;
+      const rlen = sqrt(rx * rx + ry * ry) + 1e-6;
+      if (rlen > T.radius - 2) {
+        const rr = (T.radius - 2) / rlen;
+        spawnX = T.c.x + rx * rr;
+        spawnY = T.c.y + ry * rr;
+      }
+      if (!isSpawnTooClose(spawnX, spawnY)) {
+        accepted = true;
+        break;
+      }
+      spawnRejectCount++;
     }
+    if (!accepted) continue;
 
     // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
     let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
@@ -4093,6 +4411,18 @@ function emitFromHand(T, which, rate) {
     let size = 1.6;
 
     const p = spawnFromPool(kind, spawnX, spawnY, vx, vy, life, size, col);
+    if (p && spawnGridCache) {
+      const cx = floor(spawnX / SPAWN_CELL_SIZE);
+      const cy = floor(spawnY / SPAWN_CELL_SIZE);
+      const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
+      let cell = spawnGridCache.get(key);
+      if (!cell) {
+        cell = spawnCellPool.pop() || [];
+        spawnCellsInUse.push(cell);
+        spawnGridCache.set(key, cell);
+      }
+      cell.push(p);
+    }
     if (!p) break;
     p.strength = kindStrength(kind);
     if (kind === "h_ions") {
@@ -4373,18 +4703,41 @@ function updateParticles(T) {
       if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
     }
     if (collisionList.length) {
+      for (let i = 0; i < collisionList.length; i++) {
+        const p = collisionList[i];
+        if (!p) continue;
+        p.collidedThisFrame = false;
+        p.minNNThisFrame = 1e9;
+        if (!Number.isFinite(p.overlapFactorCurrent)) p.overlapFactorCurrent = 1.0;
+      }
       clampSpaceVelocities(collisionList);
       const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
-      collisionState.itersTarget = collisionState.overlapHigh
-        ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
-        : (lowBudgetCollisions ? 1 : baseIters);
+      const trouble =
+        (clumpDiag.enabled && (
+          clumpDiag.minNN > 0 && clumpDiag.minNN < TROUBLE_MIN_NN ||
+          clumpDiag.overlapPct > TROUBLE_OVERLAP_PCT ||
+          clumpDiag.hotspotCount > TROUBLE_HOTSPOT
+        )) ||
+        (collisionState.overlapRatioLast > 0.12);
+      collisionState.trouble = trouble;
+      collisionState.itersTarget = trouble
+        ? TROUBLE_ITERS
+        : (collisionState.overlapHigh
+          ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
+          : (lowBudgetCollisions ? 1 : baseIters));
       collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
       const iters = max(1, Math.round(collisionState.itersCurrent));
       collisionState.itersLast = iters;
-      collisionState.corrTarget = lowBudgetCollisions
-        ? COLLISION_CORR_ALPHA_LOW
-        : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
+      collisionState.corrTarget = trouble
+        ? TROUBLE_CORR_ALPHA
+        : (lowBudgetCollisions
+          ? COLLISION_CORR_ALPHA_LOW
+          : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE));
       collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
+      collisionState.maxMoveTarget = trouble ? TROUBLE_MAX_MOVE : MAX_COLLISION_MOVE;
+      collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
+      collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
+      collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
       let cellFrac = COLLISION_CELL_FRAC_BASE;
       if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
       if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
@@ -4398,12 +4751,28 @@ function updateParticles(T) {
         collisionsEvery,
         cellFrac,
         collisionState.corrCurrent,
-        MAX_COLLISION_MOVE
+        collisionState.maxMoveCurrent,
+        collisionState.pushKCurrent
       );
       collisionState.cellFracLast = cellFrac;
       collisionState.cellsProcessedLast = collisionAudit.cellsProcessed || 0;
       collisionState.cellsTotalLast = collisionAudit.cellsTotal || 0;
       updateCollisionStateFromAudit(collisionAudit);
+      if (trouble) {
+        resolveSpaceCollisions(
+          collisionList,
+          T.c,
+          T.radius,
+          iters,
+          null,
+          collisionsEvery,
+          cellFrac,
+          collisionState.corrCurrent,
+          collisionState.maxMoveCurrent,
+          collisionState.pushKCurrent
+        );
+      }
+      updateOverlapFactors(collisionList);
     }
     collisionsRanThisFrame = true;
     lastCollisionSolveMs = millis();

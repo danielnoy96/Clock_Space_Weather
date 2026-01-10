@@ -9,6 +9,7 @@ let vy = null; // Float32Array
 let kind = null; // Uint8Array
 let seed = null; // Float32Array
 let birth = null; // Uint32Array
+let overlap = null; // Float32Array
 
 // Deterministic direction LUT (matches main DIR_N=256).
 const DIR_N = 256;
@@ -39,6 +40,7 @@ function setArrays(nextN, buffers) {
   kind = buffers.kind ? new Uint8Array(buffers.kind) : null;
   seed = buffers.seed ? new Float32Array(buffers.seed) : null;
   birth = buffers.birth ? new Uint32Array(buffers.birth) : null;
+  overlap = buffers.overlap ? new Float32Array(buffers.overlap) : null;
 }
 
 function stepSim(params, activeN) {
@@ -116,6 +118,7 @@ function stepSim(params, activeN) {
     const inwardx0 = -rx0 * inv0;
     const inwardy0 = -ry0 * inv0;
 
+    const overlapFactor = overlap ? clamp(overlap[i], 0.0, 1.0) : 1.0;
     if (spiralEnable && (spiralSwirl !== 0.0 || spiralDrift !== 0.0) && radius > 0) {
       // Scalar version of applyCalmOrbit(): tangential swirl + inward drift (rim-weighted).
       let edgeFrac = d0 / radius;
@@ -125,8 +128,8 @@ function stepSim(params, activeN) {
 
       vxi += tangx0 * spiralSwirl;
       vyi += tangy0 * spiralSwirl;
-      vxi += inwardx0 * (spiralDrift * edgeBias);
-      vyi += inwardy0 * (spiralDrift * edgeBias);
+      vxi += inwardx0 * (spiralDrift * edgeBias * overlapFactor);
+      vyi += inwardy0 * (spiralDrift * edgeBias * overlapFactor);
     }
 
     // Age spiral: newest near rim, oldest toward center.
@@ -141,7 +144,7 @@ function stepSim(params, activeN) {
       const age01 = ageTime01 * (1.0 - useRank) + rank01 * useRank;
       const targetR = outer + (inner - outer) * Math.pow(age01, ageEase);
       const dr = targetR - d0;
-      const pull = agePull * (1.0 + 1.25 * useRank);
+      const pull = agePull * (1.0 + 1.25 * useRank) * overlapFactor;
       vxi += (rx0 * inv0) * dr * pull;
       vyi += (ry0 * inv0) * dr * pull;
       vxi += (-ry0 * inv0) * ageSwirl;
@@ -213,7 +216,7 @@ function stepSim(params, activeN) {
         const gm = Math.sqrt(gdx * gdx + gdy * gdy) || 1.0;
         const ax = -(gdx / gm);
         const ay = -(gdy / gm);
-        const base = 0.04 * (0.55 + fillFrac * 1.05); // matches main DENSITY_PRESSURE curve
+        const base = 0.04 * (0.55 + fillFrac * 1.05) * overlapFactor; // matches main DENSITY_PRESSURE curve
         vxi += ax * base;
         vyi += ay * base;
 
@@ -273,11 +276,20 @@ self.onmessage = (e) => {
       {
         type: "initDone",
         n,
-        buffers: { x: x.buffer, y: y.buffer, vx: vx.buffer, vy: vy.buffer, kind: kind?.buffer, seed: seed?.buffer, birth: birth?.buffer },
+        buffers: {
+          x: x.buffer,
+          y: y.buffer,
+          vx: vx.buffer,
+          vy: vy.buffer,
+          kind: kind?.buffer,
+          seed: seed?.buffer,
+          birth: birth?.buffer,
+          overlap: overlap?.buffer,
+        },
       },
-      [x.buffer, y.buffer, vx.buffer, vy.buffer, kind?.buffer, seed?.buffer, birth?.buffer].filter(Boolean)
+      [x.buffer, y.buffer, vx.buffer, vy.buffer, kind?.buffer, seed?.buffer, birth?.buffer, overlap?.buffer].filter(Boolean)
     );
-    x = y = vx = vy = kind = seed = birth = null;
+    x = y = vx = vy = kind = seed = birth = overlap = null;
     return;
   }
 
@@ -291,11 +303,20 @@ self.onmessage = (e) => {
         frameId: msg.frameId | 0,
         n,
         activeN: msg.activeN | 0,
-        buffers: { x: x.buffer, y: y.buffer, vx: vx.buffer, vy: vy.buffer, kind: kind?.buffer, seed: seed?.buffer, birth: birth?.buffer },
+        buffers: {
+          x: x.buffer,
+          y: y.buffer,
+          vx: vx.buffer,
+          vy: vy.buffer,
+          kind: kind?.buffer,
+          seed: seed?.buffer,
+          birth: birth?.buffer,
+          overlap: overlap?.buffer,
+        },
       },
-      [x.buffer, y.buffer, vx.buffer, vy.buffer, kind?.buffer, seed?.buffer, birth?.buffer].filter(Boolean)
+      [x.buffer, y.buffer, vx.buffer, vy.buffer, kind?.buffer, seed?.buffer, birth?.buffer, overlap?.buffer].filter(Boolean)
     );
-    x = y = vx = vy = kind = seed = birth = null;
+    x = y = vx = vy = kind = seed = birth = overlap = null;
     return;
   }
 };

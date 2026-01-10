@@ -14,6 +14,7 @@ export function drawLiteProfilerHUD(state, opts) {
     collisionsEvery,
     enableCollisions,
     lastCollisionSolveMs,
+    spawnRejectDisplay,
     collisionState,
     debugCollisionAudit,
     collisionAudit,
@@ -121,14 +122,20 @@ export function drawLiteProfilerHUD(state, opts) {
       const pairsOverlap = snap.pairsOverlap || 0;
       const maxOverlap = (typeof snap.maxOverlap === "number") ? snap.maxOverlap : 0;
       const postMax = (typeof snap.postMaxOverlap === "number") ? snap.postMaxOverlap : 0;
+      const hotCells = (typeof snap.hotCells === "number") ? snap.hotCells : 0;
       const ovRatio = (collisionState && typeof collisionState.overlapRatioLast === "number")
         ? collisionState.overlapRatioLast
         : (typeof snap.overlapRatio === "number" ? snap.overlapRatio : 0);
       const cellsDone = snap.cellsProcessed || 0;
       const cellsTotal = snap.cellsTotal || 0;
       const itCur = (collisionState && typeof collisionState.itersCurrent === "number") ? collisionState.itersCurrent : (snap.iters || 0);
+      const itTgt = (collisionState && typeof collisionState.itersTarget === "number") ? collisionState.itersTarget : itCur;
       const corrCur = (collisionState && typeof collisionState.corrCurrent === "number") ? collisionState.corrCurrent : (snap.corrAlpha || 0);
-      const pushK = (typeof snap.pushK === "number") ? snap.pushK : 0;
+      const corrTgt = (collisionState && typeof collisionState.corrTarget === "number") ? collisionState.corrTarget : corrCur;
+      const mvCur = (collisionState && typeof collisionState.maxMoveCurrent === "number") ? collisionState.maxMoveCurrent : (snap.maxMove || 0);
+      const mvTgt = (collisionState && typeof collisionState.maxMoveTarget === "number") ? collisionState.maxMoveTarget : mvCur;
+      const pushCur = (collisionState && typeof collisionState.pushKCurrent === "number") ? collisionState.pushKCurrent : (snap.pushK || 0);
+      const pushTgt = (collisionState && typeof collisionState.pushKTarget === "number") ? collisionState.pushKTarget : pushCur;
       const colAgeMs = (typeof lastCollisionSolveMs === "number")
         ? max(0, millis() - lastCollisionSolveMs)
         : 0;
@@ -138,11 +145,15 @@ export function drawLiteProfilerHUD(state, opts) {
         maxOverlap,
         1,
         2
-      )} | post ${nf(postMax, 1, 2)} | ovR ${nf(ovRatio * 100, 1, 1)}% | itCur ${nf(itCur, 1, 2)} | corr ${nf(
-        corrCur,
+      )} | post ${nf(postMax, 1, 2)} | ovR ${nf(ovRatio * 100, 1, 1)}% | hot ${hotCells} | rej/s ${spawnRejectDisplay || 0} | it ${nf(itCur, 1, 2)}/${nf(
+        itTgt,
+        1,
+        0
+      )} | corr ${nf(corrCur, 1, 2)}/${nf(corrTgt, 1, 2)} | mv ${nf(mvCur, 1, 2)}/${nf(
+        mvTgt,
         1,
         2
-      )} | pushK ${nf(pushK, 1, 3)} | cells ${cellsDone}/${cellsTotal}`;
+      )} | push ${nf(pushCur, 1, 3)}/${nf(pushTgt, 1, 3)} | cells ${cellsDone}/${cellsTotal}`;
     })(),
     x,
     y + 72
