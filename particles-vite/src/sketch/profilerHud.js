@@ -13,6 +13,7 @@ export function drawLiteProfilerHUD(state, opts) {
     collisionsRanThisFrame,
     collisionsEvery,
     enableCollisions,
+    lastCollisionSolveMs,
     collisionState,
     debugCollisionAudit,
     collisionAudit,
@@ -119,18 +120,29 @@ export function drawLiteProfilerHUD(state, opts) {
       const itersUsed = (collisionState && typeof collisionState.itersLast === "number") ? collisionState.itersLast : (snap.iters || 0);
       const pairsOverlap = snap.pairsOverlap || 0;
       const maxOverlap = (typeof snap.maxOverlap === "number") ? snap.maxOverlap : 0;
+      const postMax = (typeof snap.postMaxOverlap === "number") ? snap.postMaxOverlap : 0;
       const ovRatio = (collisionState && typeof collisionState.overlapRatioLast === "number")
         ? collisionState.overlapRatioLast
         : (typeof snap.overlapRatio === "number" ? snap.overlapRatio : 0);
       const cellsDone = snap.cellsProcessed || 0;
       const cellsTotal = snap.cellsTotal || 0;
+      const itCur = (collisionState && typeof collisionState.itersCurrent === "number") ? collisionState.itersCurrent : (snap.iters || 0);
+      const corrCur = (collisionState && typeof collisionState.corrCurrent === "number") ? collisionState.corrCurrent : (snap.corrAlpha || 0);
+      const pushK = (typeof snap.pushK === "number") ? snap.pushK : 0;
+      const colAgeMs = (typeof lastCollisionSolveMs === "number")
+        ? max(0, millis() - lastCollisionSolveMs)
+        : 0;
       return `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor} | face ${
         faceUpdatedThisFrame ? "yes" : "no"
-      } | col ${collisionsRanThisFrame ? "yes" : "no"} | colOn ${enableCollisions ? "yes" : "no"} | colEvery ${ce} | iters ${itersUsed} | ov ${pairsOverlap}/${nf(
+      } | colAge ${nf(colAgeMs, 1, 0)}ms | colOn ${enableCollisions ? "yes" : "no"} | colEvery ${ce} | iters ${itersUsed} | ov ${pairsOverlap}/${nf(
         maxOverlap,
         1,
         2
-      )} | ovR ${nf(ovRatio * 100, 1, 1)}% | cells ${cellsDone}/${cellsTotal}`;
+      )} | post ${nf(postMax, 1, 2)} | ovR ${nf(ovRatio * 100, 1, 1)}% | itCur ${nf(itCur, 1, 2)} | corr ${nf(
+        corrCur,
+        1,
+        2
+      )} | pushK ${nf(pushK, 1, 3)} | cells ${cellsDone}/${cellsTotal}`;
     })(),
     x,
     y + 72

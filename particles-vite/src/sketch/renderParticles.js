@@ -166,8 +166,9 @@ export function drawParticles(state, opts) {
       const alphaQ = (bucket + 0.5) / bucketN;
 
       const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
-      const px = p.pos.x * PG_SCALE;
-      const py = p.pos.y * PG_SCALE;
+      const useInterp = (p.renderStamp === state.renderStamp && Number.isFinite(p.renderX) && Number.isFinite(p.renderY));
+      const px = (useInterp ? p.renderX : p.pos.x) * PG_SCALE;
+      const py = (useInterp ? p.renderY : p.pos.y) * PG_SCALE;
 
       const base = p.col || COL.protons;
       state.glPos[idx * 2 + 0] = px;
@@ -266,7 +267,10 @@ export function drawParticles(state, opts) {
           const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
           const aLife = constrain(p.life / p.maxLife, 0, 1);
           const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
-          pg.ellipse(p.pos.x * PG_SCALE, p.pos.y * PG_SCALE, s * PG_SCALE, s * PG_SCALE);
+          const useInterp = (p.renderStamp === state.renderStamp && Number.isFinite(p.renderX) && Number.isFinite(p.renderY));
+          const rx = useInterp ? p.renderX : p.pos.x;
+          const ry = useInterp ? p.renderY : p.pos.y;
+          pg.ellipse(rx * PG_SCALE, ry * PG_SCALE, s * PG_SCALE, s * PG_SCALE);
         }
       }
     }
@@ -335,4 +339,3 @@ export function drawParticles(state, opts) {
 
   return state;
 }
-

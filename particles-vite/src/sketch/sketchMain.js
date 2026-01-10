@@ -68,6 +68,8 @@ let frameStartTime = 0;
 let collisionsEvery = 1;
 let faceUpdatedThisFrame = false;
 let collisionsRanThisFrame = false;
+let collisionsRanSinceLastDraw = false;
+let lastCollisionSolveMs = 0;
 const COLLISION_OVERLAP_RATIO_HI = 0.12;
 const COLLISION_OVERLAP_RATIO_LO = 0.03;
 const COLLISION_OVERLAP_MAX_HI = 0.9;
@@ -77,6 +79,11 @@ const COLLISION_TARGET_FRAME_MS = 20;
 const COLLISION_EVERY_MAX = 3;
 const COLLISION_ITERS_EXTRA = 2;
 const COLLISION_ITERS_MAX = 6;
+const COLLISION_ITERS_LERP = 0.15;
+const COLLISION_CORR_ALPHA_BASE = 0.26;
+const COLLISION_CORR_ALPHA_LOW = 0.20;
+const COLLISION_CORR_ALPHA_HIGH = 0.32;
+const MAX_COLLISION_MOVE = 1.0;
 const COLLISION_CELL_FRAC_BASE = 0.55;
 const COLLISION_CELL_FRAC_LOW = 0.25;
 const COLLISION_CELL_FRAC_HIGH = 0.8;
@@ -90,6 +97,10 @@ let collisionState = {
   overlapHigh: false,
   lowOverlapStreak: 0,
   itersLast: 0,
+  itersTarget: 1,
+  itersCurrent: 1,
+  corrTarget: COLLISION_CORR_ALPHA_BASE,
+  corrCurrent: COLLISION_CORR_ALPHA_BASE,
   collisionsEveryLast: 1,
   pairsOverlapLast: 0,
   maxOverlapLast: 0,
@@ -243,6 +254,7 @@ function drawLiteProfilerHUD() {
       collisionsRanThisFrame,
       collisionsEvery,
       enableCollisions,
+      lastCollisionSolveMs,
       debugCollisionAudit,
       collisionAudit,
       collisionAuditLast,
@@ -458,6 +470,14 @@ let simFrameId = 1;
 let simLoggedDt = false;
 let stepScheduled = false;
 let dtSmooth = 1;
+let simRenderPrevX = null;
+let simRenderPrevY = null;
+let simRenderPrevT = 0;
+let simRenderNextX = null;
+let simRenderNextY = null;
+let simRenderNextT = 0;
+let simRenderN = 0;
+let renderStamp = 0;
 
 function wlog(...args) {
   if (WORKER_DEBUG_LOG) console.log(...args);
@@ -751,6 +771,13 @@ if (USE_WORKER) {
         simSeed = new Float32Array(b.seed);
         simBirth = new Uint32Array(b.birth);
         // NOTE: simGens is not transferred; it must remain intact for generation checks.
+        simRenderPrevX = simRenderNextX;
+        simRenderPrevY = simRenderNextY;
+        simRenderPrevT = simRenderNextT;
+        simRenderNextX = simX;
+        simRenderNextY = simY;
+        simRenderNextT = profLiteNow();
+        simRenderN = Math.min(inflight.activeN | 0, simRefs.length | 0);
 
         // 1) Apply returned state BEFORE forces (including vx/vy).
         const nApply = Math.min(inflight.activeN | 0, simRefs.length | 0);
@@ -771,16 +798,9 @@ if (USE_WORKER) {
           profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
         }
         {
-          // Cap collision decimation; allow 3 only when overlap stays low.
-          const baseEvery = (particles.length > 10000) ? 2 : 1;
-          let desiredEvery = baseEvery;
-          if (collisionState.overlapHigh) desiredEvery = 1;
-          else if (collisionState.lowOverlapStreak >= COLLISION_OVERLAP_LOW_STREAK) {
-            desiredEvery = Math.min(COLLISION_EVERY_MAX, baseEvery + 1);
-          }
-          collisionsEvery = desiredEvery;
+          collisionsEvery = 1;
           collisionState.collisionsEveryLast = collisionsEvery;
-          const shouldCollide = enableCollisions && ((frameCount % collisionsEvery) === 0);
+          const shouldCollide = enableCollisions;
           if (shouldCollide) {
             const overBudget = (typeof deltaTime !== "undefined") && (deltaTime > COLLISION_TARGET_FRAME_MS);
             const lowBudgetCollisions = timeLeft() <= 8 || overBudget;
@@ -797,10 +817,16 @@ if (USE_WORKER) {
               const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
               clampSpaceVelocities(collisionList);
               const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
-              const iters = collisionState.overlapHigh
+              collisionState.itersTarget = collisionState.overlapHigh
                 ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
                 : (lowBudgetCollisions ? 1 : baseIters);
+              collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
+              const iters = max(1, Math.round(collisionState.itersCurrent));
               collisionState.itersLast = iters;
+              collisionState.corrTarget = lowBudgetCollisions
+                ? COLLISION_CORR_ALPHA_LOW
+                : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
+              collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
               let cellFrac = COLLISION_CELL_FRAC_BASE;
               if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
               if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
@@ -812,7 +838,9 @@ if (USE_WORKER) {
                 iters,
                 collisionAudit,
                 collisionsEvery,
-                cellFrac
+                cellFrac,
+                collisionState.corrCurrent,
+                MAX_COLLISION_MOVE
               );
               collisionState.cellFracLast = cellFrac;
               collisionState.cellsProcessedLast = collisionAudit.cellsProcessed || 0;
@@ -820,6 +848,8 @@ if (USE_WORKER) {
               updateCollisionStateFromAudit(collisionAudit);
             }
             collisionsRanThisFrame = true;
+            collisionsRanSinceLastDraw = true;
+            lastCollisionSolveMs = millis();
             if (PROF_LITE) profLite.colMs = profLiteEma(profLite.colMs, profLiteNow() - tCol0);
           } else {
             collisionState.itersLast = 0;
@@ -2165,10 +2195,12 @@ function applyAlignment(p, index, grid, cellSize) {
   p.vel.y += (ay - p.vel.y) * steer;
 }
 
-function resolveSpaceCollisions(particleList, center, radius, iterations, audit, frequencyScale, cellFrac) {
+function resolveSpaceCollisions(particleList, center, radius, iterations, audit, frequencyScale, cellFrac, corrAlpha, maxMove) {
   if (!particleList.length || iterations <= 0) return;
   const freq = max(1, frequencyScale | 0);
   const pushK = min(0.5, COLLISION_PUSH * freq);
+  const corr = (typeof corrAlpha === "number") ? corrAlpha : 1.0;
+  const maxMovePx = (typeof maxMove === "number") ? maxMove : 1e9;
 
   // Estimate cell size from average radius to keep neighbor queries small.
   let avg = 0;
@@ -2220,6 +2252,9 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
     audit.listN = n;
     audit.cellSize = cellSize;
     audit.iters = iterations | 0;
+    audit.pushK = pushK;
+    audit.corrAlpha = corr;
+    audit.maxMove = maxMovePx;
     audit.gridRebuilt = !!needRebuild;
     audit.cellsTotal = totalCells;
     audit.cellsProcessed = cellsToProcess;
@@ -2264,18 +2299,20 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
               const dx = p.pos.x - q.pos.x;
               const dy = p.pos.y - q.pos.y;
               const d2 = dx * dx + dy * dy;
-              if (d2 <= 1e-6) continue;
-              const r2 = rad[k];
-              const minD = r1 + r2;
-              if (d2 >= (minD * minD)) continue;
-              if (audit && it === 0) audit.pairsChecked++;
+             if (d2 <= 1e-6) continue;
+             const r2 = rad[k];
+             const minD = r1 + r2;
+             if (audit && it === 0) audit.pairsChecked++;
+             if (d2 >= (minD * minD)) continue;
 
               const d = sqrt(d2);
               const inv = 1.0 / d;
               const nxv = dx * inv;
               const nyv = dy * inv;
               const overlap = (minD - d);
-              const push = overlap * pushK;
+              let push = overlap * pushK;
+              push *= corr;
+              if (push > maxMovePx) push = maxMovePx;
               if (audit && it === 0) {
                 audit.pairsOverlap++;
                 audit.sumOverlap += overlap;
@@ -2293,7 +2330,7 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
 
               const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
               const dampFactor = 0.15 + DENSITY_DAMPING * 0.5;
-              const impulse = rv * dampFactor;
+              const impulse = rv * dampFactor * corr;
               p.vel.x -= nxv * impulse;
               p.vel.y -= nyv * impulse;
               q.vel.x += nxv * impulse;
@@ -2319,15 +2356,17 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
               if (d2 <= 1e-6) continue;
               const r2 = rad[k];
               const minD = r1 + r2;
-              if (d2 >= (minD * minD)) continue;
               if (audit && it === 0) audit.pairsChecked++;
+              if (d2 >= (minD * minD)) continue;
 
               const d = sqrt(d2);
               const inv = 1.0 / d;
               const nxv = dx * inv;
               const nyv = dy * inv;
               const overlap = (minD - d);
-              const push = overlap * pushK;
+              let push = overlap * pushK;
+              push *= corr;
+              if (push > maxMovePx) push = maxMovePx;
               if (audit && it === 0) {
                 audit.pairsOverlap++;
                 audit.sumOverlap += overlap;
@@ -2345,7 +2384,7 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
 
               const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
               const dampFactor = 0.15 + DENSITY_DAMPING * 0.5;
-              const impulse = rv * dampFactor;
+              const impulse = rv * dampFactor * corr;
               p.vel.x -= nxv * impulse;
               p.vel.y -= nyv * impulse;
               q.vel.x += nxv * impulse;
@@ -2409,14 +2448,16 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
                 const nxv = dx * inv;
                 const nyv = dy * inv;
                 const overlap = (minD - d);
-                const push = overlap * pushK;
+                let push = overlap * pushK;
+                push *= corr;
+                if (push > maxMovePx) push = maxMovePx;
                 p.pos.x += nxv * push;
                 p.pos.y += nyv * push;
                 q.pos.x -= nxv * push;
                 q.pos.y -= nyv * push;
                 const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
                 const dampFactor = 0.15;
-                const impulse = rv * dampFactor;
+                const impulse = rv * dampFactor * corr;
                 p.vel.x -= nxv * impulse;
                 p.vel.y -= nyv * impulse;
                 q.vel.x += nxv * impulse;
@@ -2447,14 +2488,16 @@ function resolveSpaceCollisions(particleList, center, radius, iterations, audit,
                 const nxv = dx * inv;
                 const nyv = dy * inv;
                 const overlap = (minD - d);
-                const push = overlap * pushK;
+                let push = overlap * pushK;
+                push *= corr;
+                if (push > maxMovePx) push = maxMovePx;
                 p.pos.x += nxv * push;
                 p.pos.y += nyv * push;
                 q.pos.x -= nxv * push;
                 q.pos.y -= nyv * push;
                 const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
                 const dampFactor = 0.15;
-                const impulse = rv * dampFactor;
+                const impulse = rv * dampFactor * corr;
                 p.vel.x -= nxv * impulse;
                 p.vel.y -= nyv * impulse;
                 q.vel.x += nxv * impulse;
@@ -3329,8 +3372,37 @@ function draw() {
   if (USE_WORKER) tryInitWorkerIfReady();
   frameStartTime = profLiteNow();
   faceUpdatedThisFrame = false;
-  collisionsRanThisFrame = false;
+  collisionsRanThisFrame = collisionsRanSinceLastDraw;
+  collisionsRanSinceLastDraw = false;
   if (PROF_LITE) profLite.lastFrameStart = frameStartTime;
+  renderStamp = (renderStamp + 1) >>> 0;
+  if (USE_WORKER && simRenderNextX && simRenderNextY && simRefs.length) {
+    const now = profLiteNow();
+    const tPrev = simRenderPrevT || simRenderNextT;
+    const tNext = simRenderNextT || tPrev;
+    let alpha = (tNext > tPrev) ? ((now - tPrev) / (tNext - tPrev)) : 1.0;
+    if (!isFinite(alpha)) alpha = 1.0;
+    alpha = constrain(alpha, 0, 1);
+    const usePrev = !!simRenderPrevX && !!simRenderPrevY;
+    const nRender = Math.min(simRenderN | 0, simRefs.length | 0);
+    for (let i = 0; i < nRender; i++) {
+      const p = simRefs[i];
+      if (!p || !p.active) continue;
+      if ((p.generation | 0) !== (simGens[i] | 0)) continue;
+      const nx = simRenderNextX[i];
+      const ny = simRenderNextY[i];
+      if (usePrev) {
+        const px = simRenderPrevX[i];
+        const py = simRenderPrevY[i];
+        p.renderX = px + (nx - px) * alpha;
+        p.renderY = py + (ny - py) * alpha;
+      } else {
+        p.renderX = nx;
+        p.renderY = ny;
+      }
+      p.renderStamp = renderStamp;
+    }
+  }
 
   // Low-rate kind counters for HUD/debug (keeps overhead low).
   {
@@ -3360,6 +3432,8 @@ function draw() {
         cellsTotal: collisionAudit.cellsTotal,
         cellFrac: collisionAudit.cellFrac,
         overlapRatio: collisionState.overlapRatioLast,
+        pushK: collisionAudit.pushK,
+        corrAlpha: collisionAudit.corrAlpha,
       };
       collisionAudit.pairsOverlapLast = collisionAudit.pairsOverlap;
       collisionAuditNextAt = now + 250;
@@ -4284,15 +4358,9 @@ function updateParticles(T) {
 
   // Collisions only for "mass" layers (protons, optionally h_ions).
   // PERF: reuse collision list array (avoid per-frame allocations).
-  const baseEvery = (particles.length > 10000) ? 2 : 1;
-  let desiredEvery = baseEvery;
-  if (collisionState.overlapHigh) desiredEvery = 1;
-  else if (collisionState.lowOverlapStreak >= COLLISION_OVERLAP_LOW_STREAK) {
-    desiredEvery = Math.min(COLLISION_EVERY_MAX, baseEvery + 1);
-  }
-  collisionsEvery = desiredEvery;
+  collisionsEvery = 1;
   collisionState.collisionsEveryLast = collisionsEvery;
-  const shouldCollide = enableCollisions && ((frameCount % collisionsEvery) === 0);
+  const shouldCollide = enableCollisions;
   const tCol0 = PROF_LITE ? profLiteNow() : 0;
   if (shouldCollide) {
     const overBudget = (typeof deltaTime !== "undefined") && (deltaTime > COLLISION_TARGET_FRAME_MS);
@@ -4307,10 +4375,16 @@ function updateParticles(T) {
     if (collisionList.length) {
       clampSpaceVelocities(collisionList);
       const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
-      const iters = collisionState.overlapHigh
+      collisionState.itersTarget = collisionState.overlapHigh
         ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
         : (lowBudgetCollisions ? 1 : baseIters);
+      collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
+      const iters = max(1, Math.round(collisionState.itersCurrent));
       collisionState.itersLast = iters;
+      collisionState.corrTarget = lowBudgetCollisions
+        ? COLLISION_CORR_ALPHA_LOW
+        : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
+      collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
       let cellFrac = COLLISION_CELL_FRAC_BASE;
       if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
       if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
@@ -4322,7 +4396,9 @@ function updateParticles(T) {
         iters,
         collisionAudit,
         collisionsEvery,
-        cellFrac
+        cellFrac,
+        collisionState.corrCurrent,
+        MAX_COLLISION_MOVE
       );
       collisionState.cellFracLast = cellFrac;
       collisionState.cellsProcessedLast = collisionAudit.cellsProcessed || 0;
@@ -4330,6 +4406,7 @@ function updateParticles(T) {
       updateCollisionStateFromAudit(collisionAudit);
     }
     collisionsRanThisFrame = true;
+    lastCollisionSolveMs = millis();
   } else {
     collisionState.itersLast = 0;
   }
@@ -4423,6 +4500,7 @@ function drawParticles() {
       usedStamp,
       usedStampXray,
       usedFrameId,
+      renderStamp,
     },
     {
       particles,
