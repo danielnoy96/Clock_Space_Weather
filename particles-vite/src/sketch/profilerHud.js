@@ -12,6 +12,11 @@ export function drawLiteProfilerHUD(state, opts) {
     faceUpdatedThisFrame,
     collisionsRanThisFrame,
     collisionsEvery,
+    enableCollisions,
+    collisionState,
+    debugCollisionAudit,
+    collisionAudit,
+    collisionAuditLast,
     debugClumpDiag,
     clumpDiag,
   } = opts;
@@ -62,7 +67,8 @@ export function drawLiteProfilerHUD(state, opts) {
   push();
   noStroke();
   fill(0, 170);
-  rect(x - 8, y - 8, 640, 100, 10);
+  const extraLines = (debugClumpDiag ? 1 : 0) + (debugCollisionAudit ? 1 : 0);
+  rect(x - 8, y - 8, 640, 100 + extraLines * 18, 10);
   fill(255, 230);
   textAlign(LEFT, TOP);
   textSize(12);
@@ -89,11 +95,11 @@ export function drawLiteProfilerHUD(state, opts) {
     y + 18
   );
   text(
-    `face ${nf(msFace, 1, 2)}ms | fields ${nf(msFields, 1, 2)}ms | forces ${nf(msForces, 1, 2)}ms | house ${nf(
-      msHouse,
+    `stage upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | render ${nf(drw, 1, 2)}ms | face ${nf(
+      msFace,
       1,
       2
-    )}ms`,
+    )}ms | total ${nf(tot, 1, 2)}ms`,
     x,
     y + 36
   );
@@ -107,12 +113,50 @@ export function drawLiteProfilerHUD(state, opts) {
     y + 54
   );
   text(
-    `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor} | face ${
-      faceUpdatedThisFrame ? "yes" : "no"
-    } | col ${collisionsRanThisFrame ? "yes" : "no"} | colEvery ${collisionsEvery}`,
+    (() => {
+      const snap = collisionAuditLast || collisionAudit || {};
+      const ce = (collisionState && collisionState.collisionsEveryLast) ? collisionState.collisionsEveryLast : collisionsEvery;
+      const itersUsed = (collisionState && typeof collisionState.itersLast === "number") ? collisionState.itersLast : (snap.iters || 0);
+      const pairsOverlap = snap.pairsOverlap || 0;
+      const maxOverlap = (typeof snap.maxOverlap === "number") ? snap.maxOverlap : 0;
+      const ovRatio = (collisionState && typeof collisionState.overlapRatioLast === "number")
+        ? collisionState.overlapRatioLast
+        : (typeof snap.overlapRatio === "number" ? snap.overlapRatio : 0);
+      const cellsDone = snap.cellsProcessed || 0;
+      const cellsTotal = snap.cellsTotal || 0;
+      return `face chunk ${faceChunkRows} rows | every ${faceUpdateEvery}f | cursor ${faceRowCursor} | face ${
+        faceUpdatedThisFrame ? "yes" : "no"
+      } | col ${collisionsRanThisFrame ? "yes" : "no"} | colOn ${enableCollisions ? "yes" : "no"} | colEvery ${ce} | iters ${itersUsed} | ov ${pairsOverlap}/${nf(
+        maxOverlap,
+        1,
+        2
+      )} | ovR ${nf(ovRatio * 100, 1, 1)}% | cells ${cellsDone}/${cellsTotal}`;
+    })(),
     x,
     y + 72
   );
+  let lineY = y + 90;
+  if (debugCollisionAudit && collisionAudit) {
+    const avgOv = (collisionAudit.pairsOverlap > 0) ? (collisionAudit.sumOverlap / collisionAudit.pairsOverlap) : 0;
+    const postAvgOv = (collisionAudit.postPairsOverlap > 0) ? (collisionAudit.postSumOverlap / collisionAudit.postPairsOverlap) : 0;
+    const snap = collisionAuditLast || collisionAudit;
+    text(
+      `colAudit: n=${snap.listN} it=${snap.iters} ce=${snap.collisionsEvery || collisionsEvery} cell=${nf(snap.cellSize || collisionAudit.cellSize, 1, 1)} rebuild=${collisionAudit.gridRebuilt ? "yes" : "no"} | ov max ${nf(
+        collisionAudit.maxOverlap,
+        1,
+        2
+      )}/${nf(collisionAudit.postMaxOverlap, 1, 2)} avg ${nf(avgOv, 1, 2)}/${nf(postAvgOv, 1, 2)}`,
+      x,
+      lineY
+    );
+    lineY += 18;
+    text(
+      `pairs: checked ${snap.pairsChecked || 0} | overlap ${snap.pairsOverlap || 0} (last pass ${collisionAudit.pairsOverlapLast || 0})`,
+      x,
+      lineY
+    );
+    lineY += 18;
+  }
   if (debugClumpDiag) {
     text(
       `clump: hot ${clumpDiag.hotspotCount} | minNN ${nf(clumpDiag.minNN, 1, 1)} | overlap ${nf(
@@ -121,7 +165,7 @@ export function drawLiteProfilerHUD(state, opts) {
         1
       )}% | diag ${nf(clumpDiag.diagMs, 1, 2)}ms`,
       x,
-      y + 90
+      lineY
     );
   }
   pop();
@@ -171,4 +215,3 @@ export function drawProfilerHUD(opts) {
   }
   pop();
 }
-

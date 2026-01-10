@@ -9,7 +9,6 @@ export function drawHUD(opts) {
     h_ions,
     electrons,
     protons,
-    SOLO_KIND,
     particlesActive,
     CAPACITY,
     debugPerfHUD,
@@ -24,6 +23,8 @@ export function drawHUD(opts) {
     particles,
     pools,
     spawnBudget,
+    VIEW_SOLO_KIND,
+    kindCountsDisplay,
   } = opts;
 
   const x = 14, y = 48;
@@ -51,16 +52,11 @@ export function drawHUD(opts) {
     x,
     y + 38
   );
-  if (SOLO_KIND) {
-    fill(255, 200);
-    text(`SOLO: ${SOLO_KIND} (press 0 for all)`, x, y + 54);
-    fill(255, 150);
-  }
   text(
     `Particles: ${particlesActive} | fill ${nf(min(100, (particlesActive / CAPACITY) * 100), 1, 1)}%` +
       (debugPerfHUD ? ` | FPS ${nf(frameRate(), 2, 1)} (sm ${nf(fpsSmoothed, 2, 1)})` : ""),
     x,
-    (SOLO_KIND ? (y + 70) : (y + 54))
+    y + 54
   );
   text(
     `Change: x ${nf(changeEmph.xray, 1, 2)} m ${nf(changeEmph.mag, 1, 2)} h ${nf(changeEmph.h_ions, 1, 2)} e ${nf(
@@ -69,15 +65,28 @@ export function drawHUD(opts) {
       2
     )} p ${nf(changeEmph.protons, 1, 2)}`,
     x,
-    (SOLO_KIND ? (y + 86) : (y + 70))
+    y + 70
   );
   text(
     `Toggles: dens ${enableDensity ? "on" : "off"} | col ${enableCollisions ? "on" : "off"} | age ${
       enableAgeSpiral ? "on" : "off"
     } | coh ${enableCohesion ? "on" : "off"} | xray ${enableXrayBlobForce ? "on" : "off"}`,
     x,
-    (SOLO_KIND ? (y + 102) : (y + 86))
+    y + 86
   );
+
+  {
+    const rowY = y + 102;
+    const kc = kindCountsDisplay || {};
+    fill(255, 140);
+    text(
+      `VIEW: ${VIEW_SOLO_KIND || "all"} | counts p ${kc.protons || 0} h ${kc.h_ions || 0} m ${
+        kc.mag || 0
+      } e ${kc.electrons || 0} x ${kc.xray || 0}`,
+      x,
+      rowY
+    );
+  }
 
   if (debugPoolHUD) {
     const c = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
@@ -86,7 +95,7 @@ export function drawHUD(opts) {
       if (!p) continue;
       c[p.kind] = (c[p.kind] || 0) + 1;
     }
-    const line0Y = (SOLO_KIND ? (y + 118) : (y + 102));
+    const line0Y = y + 120;
     fill(255, 200);
     text(
       `POOL (press P): active x ${c.xray} m ${c.mag} h ${c.h_ions} e ${c.electrons} p ${c.protons}`,
@@ -129,4 +138,3 @@ export function drawStartOverlay() {
   text("Then upload an MP3 (top-left)", cx, cy + 16);
   pop();
 }
-

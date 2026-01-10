@@ -220,11 +220,13 @@ function stepSim(params, activeN) {
         // Local viscosity: dense cells slow down and flow together more smoothly.
         const visc = clamp((c - 2) * 0.03, 0.0, 1.0) * 0.30;
         if (visc > 0) {
+          // Match main-thread behavior: one multiply plus a soft lerp-to-zero (no double multiply).
           vxi *= (1.0 - visc);
           vyi *= (1.0 - visc);
           const smooth = 0.60;
-          vxi *= (1.0 - visc * smooth);
-          vyi *= (1.0 - visc * smooth);
+          const t = clamp(visc * smooth, 0.0, 1.0);
+          vxi += (0.0 - vxi) * t;
+          vyi += (0.0 - vyi) * t;
         }
       }
     }
