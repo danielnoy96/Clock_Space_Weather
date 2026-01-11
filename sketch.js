@@ -266,7 +266,7 @@ const COLLISION_KINDS = { protons: true, h_ions: true };
 const COLLISION_ITERS_MASS = 3;
 
 // PERF: collision solver caches to avoid per-call allocations.
-const COLLISION_GRID_EVERY = 2;
+const COLLISION_GRID_EVERY = 1;
 let radCache = null; // Float32Array
 let collisionGridCache = null; // Map
 let collisionGridFrame = -1;

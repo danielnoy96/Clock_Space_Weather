@@ -908,10 +908,9 @@ if (USE_WORKER) {
         {
           collisionsEvery = 1;
           collisionState.collisionsEveryLast = collisionsEvery;
-          const shouldCollide = enableCollisions;
+          enableCollisions = true;
+          const shouldCollide = true;
           if (shouldCollide) {
-            const overBudget = (typeof deltaTime !== "undefined") && (deltaTime > COLLISION_TARGET_FRAME_MS);
-            const lowBudgetCollisions = timeLeft() <= 8 || overBudget;
             const tCol0 = PROF_LITE ? profLiteNow() : 0;
             const collisionList = collisionListCache;
             collisionList.length = 0;
@@ -944,24 +943,19 @@ if (USE_WORKER) {
               ? TROUBLE_ITERS
               : (collisionState.overlapHigh
                 ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
-                : (lowBudgetCollisions ? 1 : baseIters));
+                : baseIters);
             collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
             const iters = max(1, Math.round(collisionState.itersCurrent));
             collisionState.itersLast = iters;
             collisionState.corrTarget = trouble
               ? TROUBLE_CORR_ALPHA
-              : (lowBudgetCollisions
-                ? COLLISION_CORR_ALPHA_LOW
-                : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE));
+              : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
             collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
             collisionState.maxMoveTarget = trouble ? TROUBLE_MAX_MOVE : MAX_COLLISION_MOVE;
             collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
             collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
             collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-            let cellFrac = COLLISION_CELL_FRAC_BASE;
-            if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
-            if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
-            cellFrac = min(1, max(COLLISION_CELL_FRAC_MIN, cellFrac));
+            const cellFrac = 1;
               resolveSpaceCollisions(
                 collisionList,
                 T.c,
@@ -1265,7 +1259,7 @@ const COLLISION_KINDS = { protons: true, h_ions: true };
 const COLLISION_ITERS_MASS = 3;
 
 // PERF: collision solver caches to avoid per-call allocations.
-const COLLISION_GRID_EVERY = 2;
+const COLLISION_GRID_EVERY = 1;
 let radCache = null; // Float32Array
 let collisionGridCache = null; // Map
 let collisionGridFrame = -1;
@@ -4290,8 +4284,7 @@ function keyPressed() {
     if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableDensity", enableDensity); infoRec.note("toggle.enableDensity", enableDensity); }
   }
   if ((key === "x" || key === "X") && typeof keyIsDown === "function" && keyIsDown(SHIFT)) {
-    enableCollisions = !enableCollisions;
-    console.log("collisions", enableCollisions);
+    enableCollisions = true;
     if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableCollisions", enableCollisions); infoRec.note("toggle.enableCollisions", enableCollisions); }
   }
   if (key === "a" || key === "A") {
@@ -5011,11 +5004,10 @@ function updateParticles(T) {
   // PERF: reuse collision list array (avoid per-frame allocations).
   collisionsEvery = 1;
   collisionState.collisionsEveryLast = collisionsEvery;
-  const shouldCollide = enableCollisions;
+  enableCollisions = true;
+  const shouldCollide = true;
   const tCol0 = PROF_LITE ? profLiteNow() : 0;
   if (shouldCollide) {
-    const overBudget = (typeof deltaTime !== "undefined") && (deltaTime > COLLISION_TARGET_FRAME_MS);
-    const lowBudgetCollisions = timeLeft() <= 8 || overBudget;
     const collisionList = collisionListCache;
     collisionList.length = 0;
     collisionState.itersLast = 0;
@@ -5041,28 +5033,23 @@ function updateParticles(T) {
         )) ||
         (collisionState.overlapRatioLast > 0.12);
       collisionState.trouble = trouble;
-      collisionState.itersTarget = trouble
-        ? TROUBLE_ITERS
-        : (collisionState.overlapHigh
-          ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
-          : (lowBudgetCollisions ? 1 : baseIters));
+    collisionState.itersTarget = trouble
+      ? TROUBLE_ITERS
+      : (collisionState.overlapHigh
+        ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
+        : baseIters);
       collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
       const iters = max(1, Math.round(collisionState.itersCurrent));
       collisionState.itersLast = iters;
-      collisionState.corrTarget = trouble
-        ? TROUBLE_CORR_ALPHA
-        : (lowBudgetCollisions
-          ? COLLISION_CORR_ALPHA_LOW
-          : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE));
+    collisionState.corrTarget = trouble
+      ? TROUBLE_CORR_ALPHA
+      : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
       collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
       collisionState.maxMoveTarget = trouble ? TROUBLE_MAX_MOVE : MAX_COLLISION_MOVE;
       collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
       collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
       collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-      let cellFrac = COLLISION_CELL_FRAC_BASE;
-      if (lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_LOW;
-      if (collisionState.overlapHigh && !lowBudgetCollisions) cellFrac = COLLISION_CELL_FRAC_HIGH;
-      cellFrac = min(1, max(COLLISION_CELL_FRAC_MIN, cellFrac));
+    const cellFrac = 1;
       resolveSpaceCollisions(
         collisionList,
         T.c,
