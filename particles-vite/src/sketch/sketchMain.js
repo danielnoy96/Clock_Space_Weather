@@ -186,7 +186,11 @@ let fpsDisplay = 0;
 let fpsDisplayNext = 0;
 let ftHistory = [];
 let ftWindow2s = [];
+let ftWindow10s = [];
 let ftDisplay = { current: 0, worst: 0, p95: 0 };
+let fps10 = 0;
+let uiBottomY = 0;
+let uiBottomNextAt = 0;
 
 function profLiteNow() {
   return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
@@ -258,15 +262,38 @@ function updateOverlapFactors(list) {
   }
 }
 
+function measureUIBottomY() {
+  try {
+    const app = document.getElementById("app");
+    if (!app || !app.getBoundingClientRect) return;
+    const appRect = app.getBoundingClientRect();
+    let maxBottom = 0;
+    const elts = [fileInput?.elt, infoRecBtn?.elt, infoRecStopBtn?.elt].filter(Boolean);
+    for (const el of elts) {
+      if (!el.getBoundingClientRect) continue;
+      const r = el.getBoundingClientRect();
+      maxBottom = Math.max(maxBottom, r.bottom - appRect.top);
+    }
+    uiBottomY = maxBottom;
+  } catch (e) {}
+}
+
 function drawLiteProfilerHUD() {
+  // Keep the lite profiler box below DOM controls (file input/buttons) so it can't be overlaid.
+  const now = millis();
+  if (!uiBottomNextAt || now >= uiBottomNextAt) {
+    uiBottomNextAt = now + 500;
+    measureUIBottomY();
+  }
   const next = drawLiteProfilerHUDCore(
-    { fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftDisplay },
+    { fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftWindow10s, ftDisplay, fps10 },
     {
       PROF_LITE,
       profLite,
       particlesActive,
       USE_LOWRES_RENDER,
       PG_SCALE: pgScale,
+      uiBottomY,
       clockStaticRedrawCount,
       faceChunkRows,
       faceUpdateEvery,
@@ -285,7 +312,7 @@ function drawLiteProfilerHUD() {
       clumpDiag,
     }
   );
-  ({ fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftDisplay } = next);
+  ({ fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftWindow10s, ftDisplay, fps10 } = next);
 }
 
 function ensureClumpBuffers(sampleN, headCells) {
@@ -1970,10 +1997,18 @@ function setup() {
 
   // File picker
   fileInput = createAudioFileInput(handleFile);
+  try {
+    fileInput.parent("app");
+    if (fileInput.elt && fileInput.elt.style) fileInput.elt.style.zIndex = "10";
+  } catch (e) {}
 
   // Background info recorder controls (download a TXT report on stop)
   infoRecBtn = createButton("REC: OFF (L)");
   infoRecBtn.position(14, 44);
+  try {
+    infoRecBtn.parent("app");
+    if (infoRecBtn.elt && infoRecBtn.elt.style) infoRecBtn.elt.style.zIndex = "10";
+  } catch (e) {}
   infoRecBtn.mousePressed(() => {
     if (infoRec.isRecording()) infoRecStopAndDownload();
     else infoRecStart();
@@ -1981,8 +2016,13 @@ function setup() {
 
   infoRecStopBtn = createButton("STOP + Download");
   infoRecStopBtn.position(140, 44);
+  try {
+    infoRecStopBtn.parent("app");
+    if (infoRecStopBtn.elt && infoRecStopBtn.elt.style) infoRecStopBtn.elt.style.zIndex = "10";
+  } catch (e) {}
   infoRecStopBtn.mousePressed(() => infoRecStopAndDownload());
   updateInfoRecButtons();
+  measureUIBottomY();
 
   textFont("system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial");
 
@@ -2012,6 +2052,7 @@ function windowResized() {
   }
   ensureFaceField();
   ensureClockStatic();
+  measureUIBottomY();
 }
 
 function ensureParticleGraphics() {
