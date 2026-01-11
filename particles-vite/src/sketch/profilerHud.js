@@ -5,6 +5,7 @@ export function drawLiteProfilerHUD(state, opts) {
     particlesActive,
     USE_LOWRES_RENDER,
     PG_SCALE,
+    uiBottomY,
     clockStaticRedrawCount,
     faceChunkRows,
     faceUpdateEvery,
@@ -25,13 +26,16 @@ export function drawLiteProfilerHUD(state, opts) {
 
   if (!PROF_LITE) return state;
   const x = 14;
-  const y = 70; // below file input / status
+  const y = Math.max(70, (uiBottomY || 0) + 12); // keep below DOM controls (file input + buttons)
   const now = millis();
   const ft = (typeof deltaTime !== "undefined") ? deltaTime : 0;
+  if (!state.ftWindow10s) state.ftWindow10s = [];
   state.ftHistory.push(ft);
   if (state.ftHistory.length > 120) state.ftHistory.shift();
   state.ftWindow2s.push({ t: now, ft });
   while (state.ftWindow2s.length && (now - state.ftWindow2s[0].t) > 2000) state.ftWindow2s.shift();
+  state.ftWindow10s.push({ t: now, ft });
+  while (state.ftWindow10s.length && (now - state.ftWindow10s[0].t) > 10000) state.ftWindow10s.shift();
   if (!state.fpsDisplayNext || now >= state.fpsDisplayNext) {
     state.fpsDisplay = frameRate();
     state.fpsDisplayNext = now + 250; // update 4x/sec to keep it readable
@@ -48,8 +52,15 @@ export function drawLiteProfilerHUD(state, opts) {
     state.ftDisplay.current = ft;
     state.ftDisplay.worst = worst;
     state.ftDisplay.p95 = p95;
+
+    // Moving-average FPS over the last 10 seconds (computed from frametimes).
+    let sum = 0;
+    for (let i = 0; i < state.ftWindow10s.length; i++) sum += state.ftWindow10s[i].ft;
+    const avgFt = sum / Math.max(1, state.ftWindow10s.length);
+    state.fps10 = (avgFt > 0) ? (1000 / avgFt) : 0;
   }
   const fps = state.fpsDisplay;
+  const fps10 = state.fps10 || 0;
   const n = particlesActive | 0;
   const col = profLite.colMs;
   const drw = profLite.particlesDrawMs;
@@ -75,7 +86,11 @@ export function drawLiteProfilerHUD(state, opts) {
   textAlign(LEFT, TOP);
   textSize(12);
   text(
-    `FPS ${nf(fps, 2, 1)} | ft ${nf(state.ftDisplay.current, 1, 1)}ms | worst ${nf(state.ftDisplay.worst, 1, 1)}ms | p95 ${nf(
+    `FPS ${nf(fps, 2, 1)} | FPS10 ${nf(fps10, 2, 1)} | ft ${nf(state.ftDisplay.current, 1, 1)}ms | worst ${nf(
+      state.ftDisplay.worst,
+      1,
+      1
+    )}ms | p95 ${nf(
       state.ftDisplay.p95,
       1,
       1
