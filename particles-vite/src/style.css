@@ -5,3 +5,23 @@ html, body {
 canvas {
   display: block;
 }
+
+#app {
+  position: relative;
+  width: 1200px;
+  height: 1200px;
+}
+
+#app > canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+#app > canvas.pixi {
+  z-index: 0;
+}
+
+#app > canvas.p5-overlay {
+  z-index: 1;
+}

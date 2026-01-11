@@ -33,6 +33,7 @@ import {
   spawnFromPool as spawnFromPoolCore,
 } from "./particlePool.js";
 import { applyForcesStage } from "./forcesStage.js";
+import { initPixiRenderer, renderPixiFrame, resizePixiRenderer } from "./pixiRenderer.js";
 
 const USE_WORKER = true;
 const WORKER_DEBUG_LOG = false;
@@ -44,6 +45,8 @@ const WORKER_SPIRAL = true;
 const USE_LOWRES_RENDER = true;
 // GPU particles (point sprites) on a WEBGL layer.
 const USE_WEBGL_PARTICLES = true;
+// Render main visuals with PixiJS (p5 canvas becomes a transparent HUD overlay).
+const USE_PIXI_RENDERER = true;
 const PG_SCALE_BASE = 0.5;
 const PG_SCALE_MIN = 0.42;
 const PG_SCALE_STEP = 0.03;
@@ -51,6 +54,8 @@ let pgScale = PG_SCALE_BASE;
 let renderScaleDownStreak = 0;
 let renderScaleUpStreak = 0;
 let pg = null;
+let pixi = null;
+let pixiInitPromise = null;
 
 const DRAW_ALPHA_BUCKETS = 8;
 const DRAW_KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
@@ -1934,19 +1939,41 @@ let spawnCellPool = [];
 let spawnCellsInUse = [];
 
 function setup() {
-  createCanvas(1200, 1200);
+  const mainCanvas = createCanvas(1200, 1200);
+  try {
+    mainCanvas.parent("app");
+    mainCanvas.elt.classList.add("p5-overlay");
+  } catch (e) {}
   angleMode(RADIANS);
   pixelDensity(1);
 
   // Render mode info (log once on startup).
   console.log("[render]", { USE_LOWRES_RENDER, USE_WEBGL_PARTICLES, pgScale });
 
-  if (USE_WEBGL_PARTICLES) {
-    ensureParticleGL();
-  } else if (USE_LOWRES_RENDER) {
-    ensureParticleGraphics();
+  if (!USE_PIXI_RENDERER) {
+    if (USE_WEBGL_PARTICLES) {
+      ensureParticleGL();
+    } else if (USE_LOWRES_RENDER) {
+      ensureParticleGraphics();
+    }
   }
   ensureClockStatic();
+
+  if (USE_PIXI_RENDERER && !pixiInitPromise) {
+    try {
+      const parent = document.getElementById("app") || document.body;
+      pixiInitPromise = initPixiRenderer({ parent, width, height })
+        .then((s) => {
+          pixi = s;
+        })
+        .catch((e) => {
+          console.error("[pixi] init failed", e);
+          pixi = null;
+        });
+    } catch (e) {
+      console.error("[pixi] init failed", e);
+    }
+  }
 
   // PERF: Fill direction LUT once (no random2D allocations in hot loops).
   DIR_X = new Float32Array(DIR_N);
@@ -1970,10 +1997,18 @@ function setup() {
 
   // File picker
   fileInput = createAudioFileInput(handleFile);
+  try {
+    fileInput.parent("app");
+    if (fileInput.elt && fileInput.elt.style) fileInput.elt.style.zIndex = "10";
+  } catch (e) {}
 
   // Background info recorder controls (download a TXT report on stop)
   infoRecBtn = createButton("REC: OFF (L)");
   infoRecBtn.position(14, 44);
+  try {
+    infoRecBtn.parent("app");
+    if (infoRecBtn.elt && infoRecBtn.elt.style) infoRecBtn.elt.style.zIndex = "10";
+  } catch (e) {}
   infoRecBtn.mousePressed(() => {
     if (infoRec.isRecording()) infoRecStopAndDownload();
     else infoRecStart();
@@ -1981,6 +2016,10 @@ function setup() {
 
   infoRecStopBtn = createButton("STOP + Download");
   infoRecStopBtn.position(140, 44);
+  try {
+    infoRecStopBtn.parent("app");
+    if (infoRecStopBtn.elt && infoRecStopBtn.elt.style) infoRecStopBtn.elt.style.zIndex = "10";
+  } catch (e) {}
   infoRecStopBtn.mousePressed(() => infoRecStopAndDownload());
   updateInfoRecButtons();
 
@@ -2005,10 +2044,14 @@ function setup() {
 
 function windowResized() {
   resizeCanvas(1200, 1200);
-  if (USE_WEBGL_PARTICLES) {
-    ensureParticleGL();
-  } else if (USE_LOWRES_RENDER) {
-    ensureParticleGraphics();
+  if (!USE_PIXI_RENDERER) {
+    if (USE_WEBGL_PARTICLES) {
+      ensureParticleGL();
+    } else if (USE_LOWRES_RENDER) {
+      ensureParticleGraphics();
+    }
+  } else if (pixi) {
+    resizePixiRenderer(pixi, width, height);
   }
   ensureFaceField();
   ensureClockStatic();
@@ -3812,6 +3855,7 @@ function guideInHand(p, T) {
 
 function draw() {
   profFrameStart();
+  const usePixiNow = USE_PIXI_RENDERER && !!pixi;
   // Worker init is deferred until particles exist (handles N==0 at startup).
   if (USE_WORKER) tryInitWorkerIfReady();
   frameStartTime = profLiteNow();
@@ -3820,6 +3864,7 @@ function draw() {
   collisionsRanSinceLastDraw = false;
   if (PROF_LITE) profLite.lastFrameStart = frameStartTime;
   renderStamp = (renderStamp + 1) >>> 0;
+  if (usePixiNow) clear(); // keep p5 canvas transparent as a HUD overlay
   if (USE_WORKER && simRenderNextX && simRenderNextY && simRefs.length) {
     const now = profLiteNow();
     const tPrev = simRenderPrevT || simRenderNextT;
@@ -4137,18 +4182,22 @@ function draw() {
 
   profStart("draw.face");
   const tClockOther0 = PROF_LITE ? profLiteNow() : 0;
-  drawFace(T);
+  if (!usePixiNow) drawFace(T);
   if (PROF_LITE) profLite.clockOtherMs = profLiteEma(profLite.clockOtherMs, profLiteNow() - tClockOther0);
   profEnd("draw.face");
 
   profStart("draw.hands");
   const tClockStatic0 = PROF_LITE ? profLiteNow() : 0;
-  if (clockStatic) image(clockStatic, 0, 0);
+  if (!usePixiNow) {
+    if (clockStatic) image(clockStatic, 0, 0);
+  }
   if (PROF_LITE) profLite.clockStaticMs = profLiteEma(profLite.clockStaticMs, profLiteNow() - tClockStatic0);
 
   const tClockDyn0 = PROF_LITE ? profLiteNow() : 0;
-  drawHandShapes(T);
-  drawClockHands(T);
+  if (!usePixiNow) {
+    drawHandShapes(T);
+    drawClockHands(T);
+  }
   if (PROF_LITE) profLite.clockDynamicMs = profLiteEma(profLite.clockDynamicMs, profLiteNow() - tClockDyn0);
 
   if (PROF_LITE) {
@@ -4159,7 +4208,48 @@ function draw() {
 
   profStart("draw.particles");
   const tDraw0 = PROF_LITE ? profLiteNow() : 0;
-  drawParticles();
+  if (usePixiNow) {
+    try {
+      renderPixiFrame(pixi, {
+        fieldGraphics: field,
+        clockStaticGraphics: clockStatic,
+        canvasW: width,
+        canvasH: height,
+        T,
+        COL,
+        h_ions,
+        xray,
+        HAND_HEAD_R,
+        HAND_W,
+        HAND_SIDE_SPIKE_MULT,
+        computeHandBasis,
+        handWidthAt,
+        handFillRatio,
+        mixEnergyColor,
+        particles,
+        SOLO_KIND,
+        PARTICLE_PROFILE,
+        kindStrength,
+        ALPHA_STRENGTH_MIX,
+        ALPHA_SCALE,
+        PARTICLE_SIZE_SCALE,
+        renderStamp,
+        millisFn: millis,
+        sinFn: sin,
+        PI,
+      });
+    } catch (e) {
+      console.error("[pixi] render failed, falling back to p5 renderer", e);
+      pixi = null;
+      drawFace(T);
+      if (clockStatic) image(clockStatic, 0, 0);
+      drawHandShapes(T);
+      drawClockHands(T);
+      drawParticles();
+    }
+  } else {
+    drawParticles();
+  }
   if (debugClumpDiag) {
     updateClumpDiagnostics();
     drawClumpDiagnosticsMarker();
