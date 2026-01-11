@@ -128,3 +128,22 @@ export const PARTICLE_PROFILE = {
   },
 };
 
+// Capacity tuning:
+// `CAPACITY` is the value that corresponds to "100% fill" in the HUD and the enforcement limit.
+// Set `CAPACITY_TARGET_FULL` to a number (e.g. 10000) to force a stable, configurable capacity
+// regardless of canvas size; set to `null` to use the auto-computed value.
+export const CAPACITY_TARGET_FULL = null;
+export const CAPACITY_MIN = 2000;
+
+// Optional dynamic capacity controller (derived from FPS10).
+// When enabled, `CAPACITY` will slowly move within [min,max] to keep FPS10 near `targetFps`.
+export const CAPACITY_DYNAMIC_ENABLED = true;
+export const CAPACITY_DYNAMIC_MIN = 12000;
+export const CAPACITY_DYNAMIC_MAX = 14000;
+export const CAPACITY_DYNAMIC_TARGET_FPS10 = 58;
+export const CAPACITY_DYNAMIC_DEADBAND_FPS = 1.0;
+export const CAPACITY_DYNAMIC_UPDATE_MS = 1000;
+export const CAPACITY_DYNAMIC_STEP_UP = 60;   // particles/sec (slow increase)
+export const CAPACITY_DYNAMIC_STEP_DOWN_MIN = 80;
+export const CAPACITY_DYNAMIC_STEP_DOWN_MAX = 220;
+export const CAPACITY_DYNAMIC_STEP_DOWN_K = 80; // extra step per FPS below target

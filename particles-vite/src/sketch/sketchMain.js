@@ -1,5 +1,21 @@
 // STEP 4A — Worker pipeline toggle (no behavior change yet).
-import { COL, LAYER_BEHAVIOR, PARTICLE_PROFILE } from "./config.js";
+import {
+  CAPACITY_DYNAMIC_DEADBAND_FPS,
+  CAPACITY_DYNAMIC_ENABLED,
+  CAPACITY_DYNAMIC_MAX,
+  CAPACITY_DYNAMIC_MIN,
+  CAPACITY_DYNAMIC_STEP_DOWN_K,
+  CAPACITY_DYNAMIC_STEP_DOWN_MAX,
+  CAPACITY_DYNAMIC_STEP_DOWN_MIN,
+  CAPACITY_DYNAMIC_STEP_UP,
+  CAPACITY_DYNAMIC_TARGET_FPS10,
+  CAPACITY_DYNAMIC_UPDATE_MS,
+  CAPACITY_MIN,
+  CAPACITY_TARGET_FULL,
+  COL,
+  LAYER_BEHAVIOR,
+  PARTICLE_PROFILE,
+} from "./config.js";
 import { createAudioFileInput, initAudioAnalyzers } from "./audio.js";
 import { clockStatic, clockStaticRedrawCount, computeHandData, ensureClockStatic } from "./clock.js";
 import {
@@ -196,6 +212,7 @@ let ftWindow10s = [];
 let fps10 = 0;
 let uiBottomY = 0;
 let uiBottomNextAt = 0;
+let capDynNextAt = 0;
 
 function profLiteNow() {
   return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
@@ -318,6 +335,33 @@ function drawLiteProfilerHUD() {
     }
   );
   ({ fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftWindow10s, ftDisplay, fps10 } = next);
+
+  // Dynamic max particles: adapt CAPACITY based on FPS10 (slowly, bounded).
+  if (CAPACITY_DYNAMIC_ENABLED) {
+    const now = millis();
+    if (!capDynNextAt || now >= capDynNextAt) {
+      capDynNextAt = now + (CAPACITY_DYNAMIC_UPDATE_MS | 0);
+      const f = fps10;
+      const target = +CAPACITY_DYNAMIC_TARGET_FPS10 || 0;
+      const dead = +CAPACITY_DYNAMIC_DEADBAND_FPS || 0;
+      if (isFinite(f) && f > 0 && target > 0) {
+        const minCap = max(CAPACITY_MIN, CAPACITY_DYNAMIC_MIN | 0);
+        const maxCap = max(minCap, CAPACITY_DYNAMIC_MAX | 0);
+        if (f < (target - dead)) {
+          const err = (target - dead) - f;
+          const step = constrain(
+            (CAPACITY_DYNAMIC_STEP_DOWN_MIN | 0) + Math.round(err * (+CAPACITY_DYNAMIC_STEP_DOWN_K || 0)),
+            CAPACITY_DYNAMIC_STEP_DOWN_MIN | 0,
+            CAPACITY_DYNAMIC_STEP_DOWN_MAX | 0
+          );
+          CAPACITY = max(minCap, (CAPACITY - step) | 0);
+        } else if (f > (target + dead)) {
+          CAPACITY = min(maxCap, (CAPACITY + (CAPACITY_DYNAMIC_STEP_UP | 0)) | 0);
+        }
+        SOFT_CAP = CAPACITY;
+      }
+    }
+  }
 }
 
 function ensureClumpBuffers(sampleN, headCells) {
@@ -2053,14 +2097,24 @@ function setup() {
 
   textFont("system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial");
 
-  {
-    const T = computeHandData(new Date());
-    const area = PI * T.radius * T.radius;
-    const cellArea = max(1, DRAW_GRID_SIZE * DRAW_GRID_SIZE);
-    const fillTarget = floor((area / cellArea) * 0.20); // 85% of grid occupancy
-    CAPACITY = max(2000, fillTarget);
-    SOFT_CAP = CAPACITY;
-  }
+	  {
+	    const T = computeHandData(new Date());
+	    const area = PI * T.radius * T.radius;
+	    const cellArea = max(1, DRAW_GRID_SIZE * DRAW_GRID_SIZE);
+	    const fillTarget = floor((area / cellArea) * 0.20); // 85% of grid occupancy
+	    const autoCapacity = max(CAPACITY_MIN, fillTarget);
+	    const fixedTarget = (typeof CAPACITY_TARGET_FULL === "number" && isFinite(CAPACITY_TARGET_FULL))
+	      ? (CAPACITY_TARGET_FULL | 0)
+	      : 0;
+	    if (CAPACITY_DYNAMIC_ENABLED) {
+	      const minCap = max(CAPACITY_MIN, CAPACITY_DYNAMIC_MIN | 0);
+	      const maxCap = max(minCap, CAPACITY_DYNAMIC_MAX | 0);
+	      CAPACITY = maxCap;
+	    } else {
+	      CAPACITY = (fixedTarget > 0) ? max(CAPACITY_MIN, fixedTarget) : autoCapacity;
+	    }
+	    SOFT_CAP = CAPACITY;
+	  }
 
   // PERF: prewarm particle pools (one-time load, smoother runtime).
   prewarmPools();
