@@ -10,6 +10,9 @@ let kind = null; // Uint8Array
 let seed = null; // Float32Array
 let birth = null; // Uint32Array
 let overlap = null; // Float32Array
+let size = null; // Float32Array
+
+import { PARTICLE_PROFILE } from "./sketch/config.js";
 
 // Deterministic direction LUT (matches main DIR_N=256).
 const DIR_N = 256;
@@ -41,6 +44,178 @@ function setArrays(nextN, buffers) {
   seed = buffers.seed ? new Float32Array(buffers.seed) : null;
   birth = buffers.birth ? new Uint32Array(buffers.birth) : null;
   overlap = buffers.overlap ? new Float32Array(buffers.overlap) : null;
+  size = buffers.size ? new Float32Array(buffers.size) : null;
+}
+
+const PROFILE_BY_KIND = [
+  PARTICLE_PROFILE.xray,
+  PARTICLE_PROFILE.electrons,
+  PARTICLE_PROFILE.protons,
+  PARTICLE_PROFILE.h_ions,
+  PARTICLE_PROFILE.mag,
+];
+
+const PARTICLE_SIZE_SCALE = 4;
+const COLLISION_RADIUS_SCALE = 2;
+
+function collisionRadius(i) {
+  const k = kind ? (kind[i] | 0) : 2;
+  const prof = PROFILE_BY_KIND[k] || PROFILE_BY_KIND[2];
+  const baseSize = size ? (+size[i] || 1.0) : 1.0;
+  const s = baseSize * (prof.sizeMult || 1.0) * PARTICLE_SIZE_SCALE;
+  const r = (s * 0.5) * COLLISION_RADIUS_SCALE;
+  return r > 1.2 ? r : 1.2;
+}
+
+const COLLISION_CELL_OFF_X = [0, 1, 0, 1, -1];
+const COLLISION_CELL_OFF_Y = [0, 0, 1, 1, 1];
+
+function resolveCollisions(params, activeN) {
+  if (!params.enableCollisions) return;
+  const iters = Math.max(0, (params.collisionIters | 0) || 0);
+  if (iters <= 0) return;
+  const pushK = clamp(+params.collisionPushK || 0.18, 0.01, 0.5);
+
+  const w = +params.w || 1.0;
+  const h = +params.h || 1.0;
+  const cx0 = +params.cx || 0.0;
+  const cy0 = +params.cy || 0.0;
+  const radius0 = +params.radius || 0.0;
+  const r2 = radius0 * radius0;
+
+  const m = Math.max(0, Math.min(n | 0, activeN | 0));
+  if (m <= 1) return;
+
+  // Estimate cell size from average collision radius.
+  let avg = 0.0;
+  for (let i = 0; i < m; i++) avg += collisionRadius(i);
+  avg /= m;
+  const cellSize = Math.max(24, avg * 3.2);
+  const invCell = 1.0 / (cellSize || 1.0);
+
+  // Build grid -> indices.
+  const grid = new Map();
+  for (let i = 0; i < m; i++) {
+    const gx = ((x[i] * invCell) | 0) & 0xffff;
+    const gy = ((y[i] * invCell) | 0) & 0xffff;
+    const key = (gx << 16) | gy;
+    let cell = grid.get(key);
+    if (!cell) {
+      cell = [];
+      grid.set(key, cell);
+    }
+    cell.push(i);
+  }
+
+  const keys = Array.from(grid.keys());
+  if (!keys.length) return;
+
+  for (let it = 0; it < iters; it++) {
+    for (let ki = 0; ki < keys.length; ki++) {
+      const key = keys[ki];
+      const cell = grid.get(key);
+      if (!cell) continue;
+      const cx = (key >> 16) & 0xffff;
+      const cy = key & 0xffff;
+
+      for (let oi = 0; oi < COLLISION_CELL_OFF_X.length; oi++) {
+        const nx = (cx + COLLISION_CELL_OFF_X[oi]) & 0xffff;
+        const ny = (cy + COLLISION_CELL_OFF_Y[oi]) & 0xffff;
+        const nkey = (nx << 16) | ny;
+        const other = grid.get(nkey);
+        if (!other) continue;
+
+        if (other === cell) {
+          for (let a = 0; a < cell.length; a++) {
+            const i = cell[a] | 0;
+            const r1 = collisionRadius(i);
+            for (let b = a + 1; b < cell.length; b++) {
+              const j = cell[b] | 0;
+              const r2c = collisionRadius(j);
+              const minD = r1 + r2c;
+
+              const dx = x[i] - x[j];
+              const dy = y[i] - y[j];
+              const d2 = dx * dx + dy * dy;
+              if (d2 <= 1e-6 || d2 >= (minD * minD)) continue;
+
+              const d = Math.sqrt(d2);
+              const inv = 1.0 / d;
+              const nxv = dx * inv;
+              const nyv = dy * inv;
+              const overlap = (minD - d);
+              const push = overlap * pushK;
+
+              x[i] += nxv * push;
+              y[i] += nyv * push;
+              x[j] -= nxv * push;
+              y[j] -= nyv * push;
+
+              // Soft velocity damping along normal.
+              const rv = (vx[i] - vx[j]) * nxv + (vy[i] - vy[j]) * nyv;
+              const impulse = rv * 0.15;
+              vx[i] -= nxv * impulse;
+              vy[i] -= nyv * impulse;
+              vx[j] += nxv * impulse;
+              vy[j] += nyv * impulse;
+            }
+          }
+        } else {
+          for (let a = 0; a < cell.length; a++) {
+            const i = cell[a] | 0;
+            const r1 = collisionRadius(i);
+            for (let b = 0; b < other.length; b++) {
+              const j = other[b] | 0;
+              const r2c = collisionRadius(j);
+              const minD = r1 + r2c;
+
+              const dx = x[i] - x[j];
+              const dy = y[i] - y[j];
+              const d2 = dx * dx + dy * dy;
+              if (d2 <= 1e-6 || d2 >= (minD * minD)) continue;
+
+              const d = Math.sqrt(d2);
+              const inv = 1.0 / d;
+              const nxv = dx * inv;
+              const nyv = dy * inv;
+              const overlap = (minD - d);
+              const push = overlap * pushK;
+
+              x[i] += nxv * push;
+              y[i] += nyv * push;
+              x[j] -= nxv * push;
+              y[j] -= nyv * push;
+
+              const rv = (vx[i] - vx[j]) * nxv + (vy[i] - vy[j]) * nyv;
+              const impulse = rv * 0.15;
+              vx[i] -= nxv * impulse;
+              vy[i] -= nyv * impulse;
+              vx[j] += nxv * impulse;
+              vy[j] += nyv * impulse;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Re-confine after pushes.
+  if (radius0 > 0) {
+    for (let i = 0; i < m; i++) {
+      const dx = x[i] - cx0;
+      const dy = y[i] - cy0;
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= r2) continue;
+      const r = Math.sqrt(d2) || 1.0;
+      const nxv = dx / r;
+      const nyv = dy / r;
+      x[i] = cx0 + nxv * radius0;
+      y[i] = cy0 + nyv * radius0;
+      const vn = vx[i] * nxv + vy[i] * nyv;
+      vx[i] -= 1.8 * vn * nxv;
+      vy[i] -= 1.8 * vn * nyv;
+    }
+  }
 }
 
 function stepSim(params, activeN) {
@@ -263,6 +438,8 @@ function stepSim(params, activeN) {
     vx[i] = vxi;
     vy[i] = vyi;
   }
+
+  resolveCollisions(params || {}, m);
 }
 
 self.onmessage = (e) => {
@@ -312,11 +489,12 @@ self.onmessage = (e) => {
           seed: seed?.buffer,
           birth: birth?.buffer,
           overlap: overlap?.buffer,
+          size: size?.buffer,
         },
       },
-      [x.buffer, y.buffer, vx.buffer, vy.buffer, kind?.buffer, seed?.buffer, birth?.buffer, overlap?.buffer].filter(Boolean)
+      [x.buffer, y.buffer, vx.buffer, vy.buffer, kind?.buffer, seed?.buffer, birth?.buffer, overlap?.buffer, size?.buffer].filter(Boolean)
     );
-    x = y = vx = vy = kind = seed = birth = overlap = null;
+    x = y = vx = vy = kind = seed = birth = overlap = size = null;
     return;
   }
 };

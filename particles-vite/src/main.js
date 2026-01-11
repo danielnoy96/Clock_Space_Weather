@@ -1,2 +1,2 @@
 import "./style.css";
-import "./sketch/sketchMain.js";
+import "./pixi/pixiMain.js";
