@@ -33,6 +33,7 @@ import {
   spawnFromPool as spawnFromPoolCore,
 } from "./particlePool.js";
 import { applyForcesStage } from "./forcesStage.js";
+import { initPixi, syncParticles } from "./pixiRenderer.js";
 
 const USE_WORKER = true;
 const WORKER_DEBUG_LOG = false;
@@ -1925,6 +1926,7 @@ let statusMsg = "Click canvas to enable audio, then upload an MP3 (top-left).";
 let errorMsg = "";
 let kindCountsDisplay = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 };
 let kindCountsNextAt = 0;
+let syncParticlesLogNextAt = 0;
 let spawnRejectCount = 0;
 let spawnRejectDisplay = 0;
 let spawnRejectNextAt = 0;
@@ -2001,6 +2003,8 @@ function setup() {
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
   }
+
+  initPixi();
 }
 
 function windowResized() {
@@ -4159,7 +4163,22 @@ function draw() {
 
   profStart("draw.particles");
   const tDraw0 = PROF_LITE ? profLiteNow() : 0;
-  drawParticles();
+  // drawParticles();
+  {
+    const now = millis();
+    if (!syncParticlesLogNextAt || now >= syncParticlesLogNextAt) {
+      syncParticlesLogNextAt = now + 1000;
+      const list = particles;
+      const len = (list && typeof list.length === "number") ? list.length : 0;
+      console.log("syncParticles len", len);
+      if (len > 0) {
+        const first = list[0];
+        console.log("first particle", first);
+        console.log("keys", Object.keys(first));
+      }
+    }
+  }
+  syncParticles(particles);
   if (debugClumpDiag) {
     updateClumpDiagnostics();
     drawClumpDiagnosticsMarker();
