@@ -95,6 +95,9 @@ const HOT_CELL_OVERLAP_THRESHOLD = 6;
 const HOT_CELL_ITERS = 2;
 const HOT_CELL_PUSH_BOOST = 0.15;
 const HOT_CELL_MAX_MOVE = 1.8;
+const MIN_SEP_DIST = 2.6;
+const SEP_K = 0.35;
+const MAX_SEP_MOVE = 0.6;
 const TROUBLE_MIN_NN = 0.8;
 const TROUBLE_OVERLAP_PCT = 35;
 const TROUBLE_HOTSPOT = 150;
@@ -176,6 +179,7 @@ let profLite = {
   houseEmitMs: 0,
   houseCapMs: 0,
   houseCleanMs: 0,
+  sepMs: 0,
   lastFrameStart: 0,
   lastLogT: 0,
 };
@@ -274,6 +278,9 @@ function drawLiteProfilerHUD() {
       enableCollisions,
       lastCollisionSolveMs,
       spawnRejectDisplay,
+      spawnAcceptDisplay,
+      spawnNearestDisplay,
+      sepHitsDisplay,
       debugCollisionAudit,
       collisionAudit,
       collisionAuditLast,
@@ -824,9 +831,11 @@ if (USE_WORKER) {
           profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
         }
         {
-          collisionsEvery = 1;
+          const sep = runSeparationNudge(SPAWN_CELL_SIZE);
+          sepHits += sep.hits;
+          collisionsEvery = 2;
           collisionState.collisionsEveryLast = collisionsEvery;
-          const shouldCollide = enableCollisions;
+          const shouldCollide = enableCollisions && ((frameCount % collisionsEvery) === 0);
           if (shouldCollide) {
             const overBudget = (typeof deltaTime !== "undefined") && (deltaTime > COLLISION_TARGET_FRAME_MS);
             const lowBudgetCollisions = timeLeft() <= 8 || overBudget;
@@ -849,7 +858,7 @@ if (USE_WORKER) {
               }
               const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
               clampSpaceVelocities(collisionList);
-            const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
+              const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS, 1);
             const trouble =
               (clumpDiag.enabled && (
                 clumpDiag.minNN > 0 && clumpDiag.minNN < TROUBLE_MIN_NN ||
@@ -1143,6 +1152,10 @@ let collisionCellCursor = 0;
 let collisionCellKeysScratch = [];
 let collisionHotCounts = new Map();
 let collisionHotKeys = [];
+let sepGridCache = null;
+let sepCellsInUse = [];
+let sepCellPool = [];
+let sepGridFrame = -1;
 const COLLISION_CELL_OFF_X = [0, 1, 0, 1, -1];
 const COLLISION_CELL_OFF_Y = [0, 0, 1, 1, 1];
 
@@ -1797,7 +1810,15 @@ let kindCountsDisplay = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0 }
 let kindCountsNextAt = 0;
 let spawnRejectCount = 0;
 let spawnRejectDisplay = 0;
+let spawnAcceptCount = 0;
+let spawnAcceptDisplay = 0;
+let spawnNearestSum = 0;
+let spawnNearestCount = 0;
+let spawnNearestDisplay = 0;
 let spawnRejectNextAt = 0;
+let sepHits = 0;
+let sepHitsDisplay = 0;
+let sepHitsNextAt = 0;
 let spawnGridCache = null;
 let spawnGridFrame = -1;
 let spawnCellPool = [];
@@ -2081,16 +2102,19 @@ function rebuildSpawnGrid(list, cellSize, grid, cellsInUse, pool) {
 
 function ensureSpawnGrid() {
   if (spawnGridFrame === frameCount && spawnGridCache) return;
-  spawnGridCache = rebuildSpawnGrid(particles, SPAWN_CELL_SIZE, spawnGridCache, spawnCellsInUse, spawnCellPool);
+  spawnGridCache = rebuildNeighborGridInto(particles, SPAWN_CELL_SIZE, spawnGridCache, spawnCellsInUse, spawnCellPool);
   spawnGridFrame = frameCount;
 }
 
-function isSpawnTooClose(x, y) {
+function findSpawnNearest(x, y) {
   ensureSpawnGrid();
-  if (!spawnGridCache) return false;
+  if (!spawnGridCache) return 1e9;
   const minD2 = MIN_SPAWN_DIST * MIN_SPAWN_DIST;
   const cx = floor(x / SPAWN_CELL_SIZE);
   const cy = floor(y / SPAWN_CELL_SIZE);
+  let bestD2 = 1e9;
+  let tooClose = false;
+  outer:
   for (let oy = -1; oy <= 1; oy++) {
     const cyo = (cy + oy) & 0xffff;
     for (let ox = -1; ox <= 1; ox++) {
@@ -2098,15 +2122,91 @@ function isSpawnTooClose(x, y) {
       const cell = spawnGridCache.get(key);
       if (!cell) continue;
       for (let i = 0; i < cell.length; i++) {
-        const p = cell[i];
-        if (!p) continue;
+        const idx = cell[i];
+        const p = particles[idx];
+        if (!p || !p.active || (p.dead && p.dead())) continue;
         const dx = p.pos.x - x;
         const dy = p.pos.y - y;
-        if ((dx * dx + dy * dy) < minD2) return true;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < minD2) {
+          tooClose = true;
+          bestD2 = d2;
+          break outer;
+        }
+        if (d2 < bestD2) bestD2 = d2;
       }
     }
   }
-  return false;
+  if (tooClose) return -1;
+  return bestD2 < 1e9 ? sqrt(bestD2) : 1e9;
+}
+
+function ensureSepGrid(cellSize) {
+  if (sepGridFrame === frameCount && sepGridCache) return;
+  sepGridCache = rebuildNeighborGridInto(particles, cellSize, sepGridCache, sepCellsInUse, sepCellPool);
+  sepGridFrame = frameCount;
+}
+
+function runSeparationNudge(cellSize) {
+  ensureSepGrid(cellSize);
+  if (!sepGridCache) return { hits: 0 };
+  const minD = MIN_SEP_DIST;
+  const minD2 = minD * minD;
+  let hits = 0;
+  const t0 = PROF_LITE ? profLiteNow() : 0;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (!p || !p.active || p.dead()) continue;
+    const cx = floor(p.pos.x / cellSize);
+    const cy = floor(p.pos.y / cellSize);
+    let bestD2 = minD2;
+    let bestDx = 0;
+    let bestDy = 0;
+    let found = false;
+    outer:
+    for (let oy = -1; oy <= 1; oy++) {
+      const cyo = (cy + oy) & 0xffff;
+      for (let ox = -1; ox <= 1; ox++) {
+        const key = (((cx + ox) & 0xffff) << 16) | cyo;
+        const cell = sepGridCache.get(key);
+        if (!cell) continue;
+        for (let j = 0; j < cell.length; j++) {
+          const idx = cell[j];
+          if (idx === i) continue;
+          const q = particles[idx];
+          if (!q || !q.active || q.dead()) continue;
+          const dx = p.pos.x - q.pos.x;
+          const dy = p.pos.y - q.pos.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < bestD2) {
+            bestD2 = d2;
+            bestDx = dx;
+            bestDy = dy;
+            found = true;
+            break outer;
+          }
+        }
+      }
+    }
+    if (!found || bestD2 >= minD2) continue;
+    const d = sqrt(bestD2) + 1e-6;
+    const inv = 1.0 / d;
+    const dirx = bestDx * inv;
+    const diry = bestDy * inv;
+    const move = min(MAX_SEP_MOVE, (minD - d) * SEP_K);
+    p.pos.x += dirx * move;
+    p.pos.y += diry * move;
+    const vn = p.vel.x * dirx + p.vel.y * diry;
+    if (vn < 0) {
+      p.vel.x -= dirx * vn * 0.2;
+      p.vel.y -= diry * vn * 0.2;
+    }
+    hits++;
+  }
+  if (PROF_LITE) {
+    profLite.sepMs = profLiteEma(profLite.sepMs, profLiteNow() - t0);
+  }
+  return { hits };
 }
 
 function getAlignmentGrid(list, cellSize) {
@@ -3719,7 +3819,14 @@ function draw() {
       kindCountsDisplay = c;
       if (!spawnRejectNextAt || now >= spawnRejectNextAt) {
         spawnRejectDisplay = spawnRejectCount;
+        spawnAcceptDisplay = spawnAcceptCount;
+        spawnNearestDisplay = spawnNearestCount > 0 ? (spawnNearestSum / spawnNearestCount) : 0;
+        sepHitsDisplay = sepHits;
         spawnRejectCount = 0;
+        spawnAcceptCount = 0;
+        spawnNearestSum = 0;
+        spawnNearestCount = 0;
+        sepHits = 0;
         spawnRejectNextAt = now + 1000;
       }
 
@@ -4351,6 +4458,7 @@ function emitFromHand(T, which, rate) {
     let spawnX = 0;
     let spawnY = 0;
     let accepted = false;
+    let nearest = 1e9;
     for (let attempt = 0; attempt < SPAWN_MAX_ATTEMPTS; attempt++) {
       // Leak point: around the anchor disk, slightly biased outward (never from the center).
       spawnX = head.x + dirx * (hr * (0.15 + random(0.35))) + nrmx * ((random() - 0.5) * hr * 1.6);
@@ -4364,13 +4472,16 @@ function emitFromHand(T, which, rate) {
         spawnX = T.c.x + rx * rr;
         spawnY = T.c.y + ry * rr;
       }
-      if (!isSpawnTooClose(spawnX, spawnY)) {
+      nearest = findSpawnNearest(spawnX, spawnY);
+      if (nearest >= 0) {
         accepted = true;
         break;
       }
-      spawnRejectCount++;
     }
-    if (!accepted) continue;
+    if (!accepted) {
+      spawnRejectCount++;
+      continue;
+    }
 
     // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
     let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
@@ -4411,18 +4522,6 @@ function emitFromHand(T, which, rate) {
     let size = 1.6;
 
     const p = spawnFromPool(kind, spawnX, spawnY, vx, vy, life, size, col);
-    if (p && spawnGridCache) {
-      const cx = floor(spawnX / SPAWN_CELL_SIZE);
-      const cy = floor(spawnY / SPAWN_CELL_SIZE);
-      const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
-      let cell = spawnGridCache.get(key);
-      if (!cell) {
-        cell = spawnCellPool.pop() || [];
-        spawnCellsInUse.push(cell);
-        spawnGridCache.set(key, cell);
-      }
-      cell.push(p);
-    }
     if (!p) break;
     p.strength = kindStrength(kind);
     if (kind === "h_ions") {
@@ -4441,7 +4540,25 @@ function emitFromHand(T, which, rate) {
         p.layerTargetFrac = constrain(prof.layerRadiusFrac + (random() - 0.5) * 0.14, 0.18, 0.90);
       }
     }
+    const idx = particles.length;
     particles.push(p);
+    if (spawnGridCache) {
+      const cx = floor(spawnX / SPAWN_CELL_SIZE);
+      const cy = floor(spawnY / SPAWN_CELL_SIZE);
+      const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
+      let cell = spawnGridCache.get(key);
+      if (!cell) {
+        cell = spawnCellPool.pop() || [];
+        spawnCellsInUse.push(cell);
+        spawnGridCache.set(key, cell);
+      }
+      cell.push(idx);
+    }
+    spawnAcceptCount++;
+    if (nearest < 1e9) {
+      spawnNearestSum += nearest;
+      spawnNearestCount++;
+    }
   }
 
   // still inject background field along the hand path (so the face fills)
@@ -4686,11 +4803,16 @@ function updateParticles(T) {
     profLite.houseCleanMs = profLiteEma(profLite.houseCleanMs, profLiteNow() - tHouse0);
   }
 
+  {
+    const sep = runSeparationNudge(SPAWN_CELL_SIZE);
+    sepHits += sep.hits;
+  }
+
   // Collisions only for "mass" layers (protons, optionally h_ions).
   // PERF: reuse collision list array (avoid per-frame allocations).
-  collisionsEvery = 1;
+  collisionsEvery = 2;
   collisionState.collisionsEveryLast = collisionsEvery;
-  const shouldCollide = enableCollisions;
+  const shouldCollide = enableCollisions && ((frameCount % collisionsEvery) === 0);
   const tCol0 = PROF_LITE ? profLiteNow() : 0;
   if (shouldCollide) {
     const overBudget = (typeof deltaTime !== "undefined") && (deltaTime > COLLISION_TARGET_FRAME_MS);
@@ -4711,7 +4833,7 @@ function updateParticles(T) {
         if (!Number.isFinite(p.overlapFactorCurrent)) p.overlapFactorCurrent = 1.0;
       }
       clampSpaceVelocities(collisionList);
-      const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
+      const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS, 1);
       const trouble =
         (clumpDiag.enabled && (
           clumpDiag.minNN > 0 && clumpDiag.minNN < TROUBLE_MIN_NN ||

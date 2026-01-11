@@ -15,6 +15,9 @@ export function drawLiteProfilerHUD(state, opts) {
     enableCollisions,
     lastCollisionSolveMs,
     spawnRejectDisplay,
+    spawnAcceptDisplay,
+    spawnNearestDisplay,
+    sepHitsDisplay,
     collisionState,
     debugCollisionAudit,
     collisionAudit,
@@ -70,7 +73,7 @@ export function drawLiteProfilerHUD(state, opts) {
   noStroke();
   fill(0, 170);
   const extraLines = (debugClumpDiag ? 1 : 0) + (debugCollisionAudit ? 1 : 0);
-  rect(x - 8, y - 8, 640, 100 + extraLines * 18, 10);
+  rect(x - 8, y - 8, 640, 118 + extraLines * 18, 10);
   fill(255, 230);
   textAlign(LEFT, TOP);
   textSize(12);
@@ -97,11 +100,11 @@ export function drawLiteProfilerHUD(state, opts) {
     y + 18
   );
   text(
-    `stage upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | render ${nf(drw, 1, 2)}ms | face ${nf(
-      msFace,
+    `stage upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | sep ${nf(profLite.sepMs || 0, 1, 2)}ms (${sepHitsDisplay || 0}/s) | render ${nf(
+      drw,
       1,
       2
-    )}ms | total ${nf(tot, 1, 2)}ms`,
+    )}ms | face ${nf(msFace, 1, 2)}ms | total ${nf(tot, 1, 2)}ms`,
     x,
     y + 36
   );
@@ -158,7 +161,16 @@ export function drawLiteProfilerHUD(state, opts) {
     x,
     y + 72
   );
-  let lineY = y + 90;
+  text(
+    `spawn ok/s ${spawnAcceptDisplay || 0} | spawn rej/s ${spawnRejectDisplay || 0} | spawn d ${nf(
+      spawnNearestDisplay || 0,
+      1,
+      2
+    )}`,
+    x,
+    y + 90
+  );
+  let lineY = y + 108;
   if (debugCollisionAudit && collisionAudit) {
     const avgOv = (collisionAudit.pairsOverlap > 0) ? (collisionAudit.sumOverlap / collisionAudit.pairsOverlap) : 0;
     const postAvgOv = (collisionAudit.postPairsOverlap > 0) ? (collisionAudit.postSumOverlap / collisionAudit.postPairsOverlap) : 0;
