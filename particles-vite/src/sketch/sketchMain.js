@@ -33,11 +33,13 @@ import {
   spawnFromPool as spawnFromPoolCore,
 } from "./particlePool.js";
 import { applyForcesStage } from "./forcesStage.js";
+import { createGpuParticleSimulator } from "./gpuSim.js";
 
 const USE_WORKER = true;
 const WORKER_DEBUG_LOG = false;
 // STEP 6B: move only the core spiral force (applyCalmOrbit) to the worker.
 const WORKER_SPIRAL = true;
+const USE_GPU_SIM = (new URLSearchParams(globalThis.location?.search || "")).get("sim") === "gpu";
 
 // Rendering optimization (KEEP circles, KEEP all particles, no LOD):
 // Draw particles into a low-res p5.Graphics buffer, then scale up to canvas.
@@ -493,6 +495,10 @@ let simFrameId = 1;
 let simLoggedDt = false;
 let stepScheduled = false;
 let dtSmooth = 1;
+
+let gpuSim = null;
+let gpuSimCap = 0;
+const gpuParams = new Float32Array(32);
 let simRenderPrevX = null;
 let simRenderPrevY = null;
 let simRenderPrevT = 0;
@@ -595,6 +601,7 @@ function fillSimArraysFromParticles(cap) {
 }
 
 function initWorkerCapacity(cap) {
+  if (USE_GPU_SIM) return;
   if (!USE_WORKER || !simWorker) return;
   if (simWorkerBusy) return;
 
@@ -638,6 +645,7 @@ function initWorkerCapacity(cap) {
 }
 
 function tryInitWorkerIfReady() {
+  if (USE_GPU_SIM) return;
   if (!USE_WORKER || !simWorker) return;
   if (simWorkerBusy) return;
 
@@ -655,6 +663,7 @@ function tryInitWorkerIfReady() {
 }
 
 function scheduleNextStep() {
+  if (USE_GPU_SIM) return;
   if (!USE_WORKER || !simWorker) {
     if (infoRec.isRecording()) infoRec.incCounter("worker.schedule.skip.noWorker");
     return;
@@ -679,6 +688,7 @@ function scheduleNextStep() {
 }
 
 function postStep() {
+  if (USE_GPU_SIM) return;
   if (!USE_WORKER || !simWorker) {
     if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.noWorker");
     return;
@@ -716,44 +726,7 @@ function postStep() {
     wlog("dt", dt);
     simLoggedDt = true;
   }
-  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
-  const params = {
-    dt,
-    drag: (0.985 + protons * 0.01),
-    cx: T.c.x,
-    cy: T.c.y,
-    radius: T.radius,
-    w: width,
-    h: height,
-    // STEP 6B: spiral/orbit force (ported from applyCalmOrbit, without per-kind modifiers).
-    spiralEnable: !!WORKER_SPIRAL,
-    spiralSwirl: (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * 0.40,
-    spiralDrift: (0.40 + 0.04 * h_ions + 0.02 * mag) * SPACE_DRIFTIN_MULT * 0.22,
-
-    // STEP 6C: move remaining per-particle forces to worker (audio-driven parameters + time model inputs).
-    nowS: ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) * 0.001,
-    frame: (frameCount || 0) >>> 0,
-    overallAmp: +overallAmp || 0.0,
-    xray: +xray || 0.0,
-    mag: +mag || 0.0,
-    h_ions: +h_ions || 0.0,
-    electrons: +electrons || 0.0,
-    protons: +protons || 0.0,
-    fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
-    enableDensity: !!enableDensity,
-    enableAgeSpiral: !!enableAgeSpiral,
-    enableCohesion: !!enableCohesion,
-    enableXrayBlobForce: !!enableXrayBlobForce,
-    // Age spiral constants
-    ageWindow: AGE_WINDOW_FRAMES,
-    ageOuterFrac: AGE_OUTER_FRAC,
-    ageInnerBase: AGE_INNER_FRAC_BASE,
-    ageInnerFull: AGE_INNER_FRAC_FULL,
-    ageInnerEase: AGE_INNER_FILL_EASE,
-    agePull: AGE_PULL,
-    ageSwirl: AGE_SWIRL,
-    ageEase: AGE_EASE,
-  };
+  const params = buildSimStepParams({ dt });
 
   if (infoRec.isRecording()) {
     infoRec.setFlag("worker.enableDensity", enableDensity);
@@ -805,7 +778,280 @@ function postStep() {
   simX = simY = simVX = simVY = simKind = simSeed = simBirth = simOverlap = null;
 }
 
-if (USE_WORKER) {
+function buildSimStepParams({ dt }) {
+  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+  return {
+    dt,
+    drag: (0.985 + protons * 0.01),
+    cx: T.c.x,
+    cy: T.c.y,
+    radius: T.radius,
+    w: width,
+    h: height,
+    // STEP 6B: spiral/orbit force (ported from applyCalmOrbit, without per-kind modifiers).
+    spiralEnable: !!WORKER_SPIRAL,
+    spiralSwirl: (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * 0.40,
+    spiralDrift: (0.40 + 0.04 * h_ions + 0.02 * mag) * SPACE_DRIFTIN_MULT * 0.22,
+    // STEP 6C: per-particle forces (audio-driven parameters + time model inputs).
+    nowS: ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) * 0.001,
+    frame: (frameCount || 0) >>> 0,
+    overallAmp: +overallAmp || 0.0,
+    xray: +xray || 0.0,
+    mag: +mag || 0.0,
+    h_ions: +h_ions || 0.0,
+    electrons: +electrons || 0.0,
+    protons: +protons || 0.0,
+    fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
+    enableDensity: !!enableDensity,
+    enableAgeSpiral: !!enableAgeSpiral,
+    enableCohesion: !!enableCohesion,
+    enableXrayBlobForce: !!enableXrayBlobForce,
+    // Age spiral constants
+    ageWindow: AGE_WINDOW_FRAMES,
+    ageOuterFrac: AGE_OUTER_FRAC,
+    ageInnerBase: AGE_INNER_FRAC_BASE,
+    ageInnerFull: AGE_INNER_FRAC_FULL,
+    ageInnerEase: AGE_INNER_FILL_EASE,
+    agePull: AGE_PULL,
+    ageSwirl: AGE_SWIRL,
+    ageEase: AGE_EASE,
+  };
+}
+
+function handleSimStepResult(activeN, { scheduleNext }) {
+  simRenderPrevX = simRenderNextX;
+  simRenderPrevY = simRenderNextY;
+  simRenderPrevT = simRenderNextT;
+  simRenderNextX = simX;
+  simRenderNextY = simY;
+  simRenderNextT = profLiteNow();
+  simRenderN = Math.min(activeN | 0, simRefs.length | 0);
+
+  // 1) Apply returned state BEFORE forces (including vx/vy).
+  const nApply = Math.min(activeN | 0, simRefs.length | 0);
+  for (let i = 0; i < nApply; i++) {
+    const p = simRefs[i];
+    if (!p || !p.active) continue;
+    if ((p.generation | 0) !== (simGens[i] | 0)) continue; // particle got recycled
+    p.pos.x = simX[i];
+    p.pos.y = simY[i];
+    p.vel.x = simVX[i];
+    p.vel.y = simVY[i];
+  }
+
+  // Forces already applied in worker/GPU step; main thread only does collisions + housekeeping.
+  if (PROF_LITE) {
+    profLite.forcesMs = profLiteEma(profLite.forcesMs, 0);
+    profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
+  }
+  {
+    collisionsEvery = 1;
+    collisionState.collisionsEveryLast = collisionsEvery;
+    enableCollisions = true;
+    const shouldCollide = true;
+    if (shouldCollide) {
+      const tCol0 = PROF_LITE ? profLiteNow() : 0;
+      const collisionList = collisionListCache;
+      collisionList.length = 0;
+      collisionState.itersLast = 0;
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        if (!p || p.dead()) continue;
+        if (COLLISION_KINDS[p.kind]) collisionList.push(p);
+      }
+      if (collisionList.length) {
+        for (let i = 0; i < collisionList.length; i++) {
+          const p = collisionList[i];
+          if (!p) continue;
+          p.collidedThisFrame = false;
+          p.minNNThisFrame = 1e9;
+          if (!Number.isFinite(p.overlapFactorCurrent)) p.overlapFactorCurrent = 1.0;
+        }
+        const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+        clampSpaceVelocities(collisionList);
+        const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
+        const trouble =
+          (clumpDiag.enabled && (
+            clumpDiag.minNN > 0 && clumpDiag.minNN < TROUBLE_MIN_NN ||
+            clumpDiag.overlapPct > TROUBLE_OVERLAP_PCT ||
+            clumpDiag.hotspotCount > TROUBLE_HOTSPOT
+          )) ||
+          (collisionState.overlapRatioLast > 0.12);
+        collisionState.trouble = trouble;
+        collisionState.itersTarget = trouble
+          ? TROUBLE_ITERS
+          : (collisionState.overlapHigh
+            ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
+            : baseIters);
+        collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
+        const iters = max(1, Math.round(collisionState.itersCurrent));
+        collisionState.itersLast = iters;
+        collisionState.corrTarget = trouble
+          ? TROUBLE_CORR_ALPHA
+          : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
+        collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
+        collisionState.maxMoveTarget = trouble ? TROUBLE_MAX_MOVE : MAX_COLLISION_MOVE;
+        collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
+        collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
+        collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
+        const cellFrac = 1;
+        resolveSpaceCollisions(
+          collisionList,
+          T.c,
+          T.radius,
+          iters,
+          collisionAudit,
+          collisionsEvery,
+          cellFrac,
+          collisionState.corrCurrent,
+          collisionState.maxMoveCurrent,
+          collisionState.pushKCurrent
+        );
+        collisionState.cellFracLast = cellFrac;
+        collisionState.cellsProcessedLast = collisionAudit.cellsProcessed || 0;
+        collisionState.cellsTotalLast = collisionAudit.cellsTotal || 0;
+        updateCollisionStateFromAudit(collisionAudit);
+        if (trouble) {
+          resolveSpaceCollisions(
+            collisionList,
+            T.c,
+            T.radius,
+            iters,
+            null,
+            collisionsEvery,
+            cellFrac,
+            collisionState.corrCurrent,
+            collisionState.maxMoveCurrent,
+            collisionState.pushKCurrent
+          );
+        }
+        updateOverlapFactors(collisionList);
+      }
+      collisionsRanThisFrame = true;
+      collisionsRanSinceLastDraw = true;
+      lastCollisionSolveMs = millis();
+      if (PROF_LITE) profLite.colMs = profLiteEma(profLite.colMs, profLiteNow() - tCol0);
+    } else {
+      collisionState.itersLast = 0;
+      if (PROF_LITE) {
+        profLite.colMs = profLiteEma(profLite.colMs, 0);
+      }
+    }
+  }
+
+  // Cleanup: return dead particles to pool and periodically compact holes (preserves order).
+  let activeCount = 0;
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    if (!p) continue;
+    if (p.dead()) {
+      returnToPool(p);
+      particles[i] = null;
+      continue;
+    }
+    activeCount++;
+  }
+  particlesActive = activeCount;
+  chamberFillFrac = constrain(activeCount / CAPACITY, 0, 1);
+  if ((frameCount % COMPACT_EVERY) === 0) {
+    let w = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p) continue;
+      particles[w++] = p;
+    }
+    particles.length = w;
+  }
+
+  if (scheduleNext) scheduleNextStep();
+}
+
+function tryInitGpuIfReady() {
+  if (!USE_GPU_SIM) return;
+  const n = countActiveParticles();
+  if (n <= 0) return;
+  if (!workerInited) workerInited = true;
+  if (!capacity) capacity = chooseCapacity(n);
+  if (n > capacity) capacity = chooseCapacity(n);
+  ensureSimArrays(capacity);
+  if (!gpuSim || gpuSimCap !== capacity) {
+    try {
+      if (gpuSim && gpuSim.destroy) gpuSim.destroy();
+    } catch {}
+    gpuSim = createGpuParticleSimulator({ capacity });
+    gpuSimCap = capacity;
+  }
+}
+
+function gpuStep() {
+  if (!USE_GPU_SIM) return;
+  if (!gpuSim) return;
+
+  const { required, filled } = fillSimArraysFromParticles(capacity);
+  activeN = required;
+  if (required <= 0 || filled <= 0) return;
+  if (required > capacity) {
+    capacity = chooseCapacity(required);
+    tryInitGpuIfReady();
+    return;
+  }
+
+  const dt = getSmoothedDt();
+  if (!simLoggedDt) {
+    wlog("dt", dt);
+    simLoggedDt = true;
+  }
+
+  const p = buildSimStepParams({ dt });
+  gpuParams[0] = p.dt;
+  gpuParams[1] = p.drag;
+  gpuParams[2] = p.cx;
+  gpuParams[3] = p.cy;
+  gpuParams[4] = p.radius;
+  gpuParams[5] = p.w;
+  gpuParams[6] = p.h;
+  gpuParams[7] = p.spiralEnable ? 1.0 : 0.0;
+  gpuParams[8] = p.spiralSwirl;
+  gpuParams[9] = p.spiralDrift;
+  gpuParams[10] = p.nowS;
+  gpuParams[11] = p.frame;
+  gpuParams[12] = p.overallAmp;
+  gpuParams[13] = p.xray;
+  gpuParams[14] = p.mag;
+  gpuParams[15] = p.h_ions;
+  gpuParams[16] = p.electrons;
+  gpuParams[17] = p.protons;
+  gpuParams[18] = p.fillFrac;
+  gpuParams[19] = p.enableAgeSpiral ? 1.0 : 0.0;
+  gpuParams[20] = p.ageWindow;
+  gpuParams[21] = p.ageOuterFrac;
+  gpuParams[22] = p.ageInnerBase;
+  gpuParams[23] = p.ageInnerFull;
+  gpuParams[24] = p.ageInnerEase;
+  gpuParams[25] = p.agePull;
+  gpuParams[26] = p.ageSwirl;
+  gpuParams[27] = p.ageEase;
+  gpuParams[28] = p.enableCohesion ? 1.0 : 0.0;
+  gpuParams[29] = p.enableXrayBlobForce ? 1.0 : 0.0;
+  gpuParams[30] = p.enableDensity ? 1.0 : 0.0;
+
+  gpuSim.step({
+    x: simX,
+    y: simY,
+    vx: simVX,
+    vy: simVY,
+    kind: simKind,
+    seed: simSeed,
+    birth: simBirth,
+    overlap: simOverlap,
+    activeN: filled,
+    params: gpuParams,
+  });
+
+  handleSimStepResult(filled, { scheduleNext: false });
+}
+
+if (USE_WORKER && !USE_GPU_SIM) {
   try {
     simWorker = new Worker(new URL("../sim.worker.js", import.meta.url), { type: "module" });
     wlog("worker created");
@@ -878,154 +1124,8 @@ if (USE_WORKER) {
       simSeed = new Float32Array(b.seed);
       simBirth = new Uint32Array(b.birth);
         simOverlap = b.overlap ? new Float32Array(b.overlap) : null;
-        // NOTE: simGens is not transferred; it must remain intact for generation checks.
-        simRenderPrevX = simRenderNextX;
-        simRenderPrevY = simRenderNextY;
-        simRenderPrevT = simRenderNextT;
-        simRenderNextX = simX;
-        simRenderNextY = simY;
-        simRenderNextT = profLiteNow();
-        simRenderN = Math.min(inflight.activeN | 0, simRefs.length | 0);
 
-        // 1) Apply returned state BEFORE forces (including vx/vy).
-        const nApply = Math.min(inflight.activeN | 0, simRefs.length | 0);
-        for (let i = 0; i < nApply; i++) {
-          const p = simRefs[i];
-          if (!p || !p.active) continue;
-          if ((p.generation | 0) !== (simGens[i] | 0)) continue; // particle got recycled
-          p.pos.x = simX[i];
-          p.pos.y = simY[i];
-          p.vel.x = simVX[i];
-          p.vel.y = simVY[i];
-        }
-
-        // STEP 6C: forces are now applied in the worker. Main thread only does collisions + housekeeping.
-        // Collisions (mass layers only) remain on main for now.
-        if (PROF_LITE) {
-          profLite.forcesMs = profLiteEma(profLite.forcesMs, 0);
-          profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
-        }
-        {
-          collisionsEvery = 1;
-          collisionState.collisionsEveryLast = collisionsEvery;
-          enableCollisions = true;
-          const shouldCollide = true;
-          if (shouldCollide) {
-            const tCol0 = PROF_LITE ? profLiteNow() : 0;
-            const collisionList = collisionListCache;
-            collisionList.length = 0;
-            collisionState.itersLast = 0;
-            for (let i = 0; i < particles.length; i++) {
-              const p = particles[i];
-              if (!p || p.dead()) continue;
-              if (COLLISION_KINDS[p.kind]) collisionList.push(p);
-            }
-            if (collisionList.length) {
-              for (let i = 0; i < collisionList.length; i++) {
-                const p = collisionList[i];
-                if (!p) continue;
-                p.collidedThisFrame = false;
-                p.minNNThisFrame = 1e9;
-                if (!Number.isFinite(p.overlapFactorCurrent)) p.overlapFactorCurrent = 1.0;
-              }
-              const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
-              clampSpaceVelocities(collisionList);
-            const baseIters = min(COLLISION_ITERS, COLLISION_ITERS_MASS);
-            const trouble =
-              (clumpDiag.enabled && (
-                clumpDiag.minNN > 0 && clumpDiag.minNN < TROUBLE_MIN_NN ||
-                clumpDiag.overlapPct > TROUBLE_OVERLAP_PCT ||
-                clumpDiag.hotspotCount > TROUBLE_HOTSPOT
-              )) ||
-              (collisionState.overlapRatioLast > 0.12);
-            collisionState.trouble = trouble;
-            collisionState.itersTarget = trouble
-              ? TROUBLE_ITERS
-              : (collisionState.overlapHigh
-                ? min(COLLISION_ITERS_MAX, baseIters + COLLISION_ITERS_EXTRA)
-                : baseIters);
-            collisionState.itersCurrent = lerp(collisionState.itersCurrent, collisionState.itersTarget, COLLISION_ITERS_LERP);
-            const iters = max(1, Math.round(collisionState.itersCurrent));
-            collisionState.itersLast = iters;
-            collisionState.corrTarget = trouble
-              ? TROUBLE_CORR_ALPHA
-              : (collisionState.overlapHigh ? COLLISION_CORR_ALPHA_HIGH : COLLISION_CORR_ALPHA_BASE);
-            collisionState.corrCurrent = lerp(collisionState.corrCurrent, collisionState.corrTarget, COLLISION_ITERS_LERP);
-            collisionState.maxMoveTarget = trouble ? TROUBLE_MAX_MOVE : MAX_COLLISION_MOVE;
-            collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
-            collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
-            collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-            const cellFrac = 1;
-              resolveSpaceCollisions(
-                collisionList,
-                T.c,
-                T.radius,
-                iters,
-                collisionAudit,
-                collisionsEvery,
-                cellFrac,
-                collisionState.corrCurrent,
-                collisionState.maxMoveCurrent,
-                collisionState.pushKCurrent
-              );
-              collisionState.cellFracLast = cellFrac;
-              collisionState.cellsProcessedLast = collisionAudit.cellsProcessed || 0;
-              collisionState.cellsTotalLast = collisionAudit.cellsTotal || 0;
-              updateCollisionStateFromAudit(collisionAudit);
-              if (trouble) {
-                resolveSpaceCollisions(
-                  collisionList,
-                  T.c,
-                  T.radius,
-                  iters,
-                  null,
-                  collisionsEvery,
-                  cellFrac,
-                  collisionState.corrCurrent,
-                  collisionState.maxMoveCurrent,
-                  collisionState.pushKCurrent
-                );
-              }
-              updateOverlapFactors(collisionList);
-            }
-            collisionsRanThisFrame = true;
-            collisionsRanSinceLastDraw = true;
-            lastCollisionSolveMs = millis();
-            if (PROF_LITE) profLite.colMs = profLiteEma(profLite.colMs, profLiteNow() - tCol0);
-          } else {
-            collisionState.itersLast = 0;
-            if (PROF_LITE) {
-            profLite.colMs = profLiteEma(profLite.colMs, 0);
-            }
-          }
-        }
-
-        // Cleanup: return dead particles to pool and periodically compact holes (preserves order).
-        let activeCount = 0;
-        for (let i = 0; i < particles.length; i++) {
-          const p = particles[i];
-          if (!p) continue;
-          if (p.dead()) {
-            returnToPool(p);
-            particles[i] = null;
-            continue;
-          }
-          activeCount++;
-        }
-        particlesActive = activeCount;
-        chamberFillFrac = constrain(activeCount / CAPACITY, 0, 1);
-        if ((frameCount % COMPACT_EVERY) === 0) {
-          let w = 0;
-          for (let i = 0; i < particles.length; i++) {
-            const p = particles[i];
-            if (!p) continue;
-            particles[w++] = p;
-          }
-          particles.length = w;
-        }
-
-        // 3) Continue stepping (one step max per animation frame).
-        scheduleNextStep();
+        handleSimStepResult(inflight.activeN | 0, { scheduleNext: true });
       }
     };
   } catch (e) {
@@ -1048,6 +1148,7 @@ let simWorkerBusySince = 0;
 function infoRecMeta(extra = {}) {
   return {
     USE_WORKER,
+    USE_GPU_SIM,
     WORKER_SPIRAL,
     USE_LOWRES_RENDER,
     USE_WEBGL_PARTICLES,
@@ -3813,14 +3914,15 @@ function guideInHand(p, T) {
 function draw() {
   profFrameStart();
   // Worker init is deferred until particles exist (handles N==0 at startup).
-  if (USE_WORKER) tryInitWorkerIfReady();
+  if (USE_GPU_SIM) tryInitGpuIfReady();
+  else if (USE_WORKER) tryInitWorkerIfReady();
   frameStartTime = profLiteNow();
   faceUpdatedThisFrame = false;
   collisionsRanThisFrame = collisionsRanSinceLastDraw;
   collisionsRanSinceLastDraw = false;
   if (PROF_LITE) profLite.lastFrameStart = frameStartTime;
   renderStamp = (renderStamp + 1) >>> 0;
-  if (USE_WORKER && simRenderNextX && simRenderNextY && simRefs.length) {
+  if ((USE_WORKER || USE_GPU_SIM) && simRenderNextX && simRenderNextY && simRefs.length) {
     const now = profLiteNow();
     const tPrev = simRenderPrevT || simRenderNextT;
     const tNext = simRenderNextT || tPrev;
@@ -4203,6 +4305,8 @@ function draw() {
       }
     }
   }
+
+  if (USE_GPU_SIM) gpuStep();
 
   profFrameEnd({
     particlesActive,
