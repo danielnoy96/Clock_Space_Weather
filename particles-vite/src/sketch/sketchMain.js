@@ -25,6 +25,7 @@ import {
   profNow as profNowCore,
   profStart as profStartCore,
 } from "./runtimeProfiler.js";
+import { createInfoRecorder } from "./infoRecorder.js";
 import {
   enforceCapacity as enforceCapacityCore,
   prewarmPools as prewarmPoolsCore,
@@ -54,6 +55,8 @@ let pg = null;
 const DRAW_ALPHA_BUCKETS = 8;
 const DRAW_KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
 let drawBuckets = null;
+let lastDrawCount = 0;
+let lastDrawMode = "";
 let pgl = null;
 let particleShader = null;
 let particleGL = null;
@@ -604,9 +607,15 @@ function initWorkerCapacity(cap) {
   workerInited = true;
   simWorkerReady = false;
   simWorkerBusy = true;
+  simWorkerBusySince = profLiteNow();
   simInFlight = null;
   stepScheduled = false;
 
+  if (infoRec.isRecording()) {
+    infoRec.incCounter("worker.init.post");
+    infoRec.note("worker.init.post", { cap, required });
+  }
+  simInitSentAt = profLiteNow();
   simWorker.postMessage(
     {
       type: "init",
@@ -646,9 +655,22 @@ function tryInitWorkerIfReady() {
 }
 
 function scheduleNextStep() {
-  if (!USE_WORKER || !simWorker) return;
-  if (!simWorkerReady || simWorkerBusy) return;
-  if (stepScheduled) return;
+  if (!USE_WORKER || !simWorker) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.schedule.skip.noWorker");
+    return;
+  }
+  if (!simWorkerReady) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.schedule.skip.notReady");
+    return;
+  }
+  if (simWorkerBusy) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.schedule.skip.busy");
+    return;
+  }
+  if (stepScheduled) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.schedule.skip.alreadyScheduled");
+    return;
+  }
   stepScheduled = true;
   requestAnimationFrame(() => {
     stepScheduled = false;
@@ -657,10 +679,21 @@ function scheduleNextStep() {
 }
 
 function postStep() {
-  if (!USE_WORKER || !simWorker) return;
-  if (!simWorkerReady || simWorkerBusy) return;
+  if (!USE_WORKER || !simWorker) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.noWorker");
+    return;
+  }
+  if (!simWorkerReady) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.notReady");
+    return;
+  }
+  if (simWorkerBusy) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.busy");
+    return;
+  }
   if (!simX || !simY || !simVX || !simVY || !simKind || !simSeed || !simBirth || !simOverlap || !simGens) {
     wwarn("postStep: buffers not attached (waiting for worker)");
+    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.noBuffers");
     return;
   }
 
@@ -668,7 +701,10 @@ function postStep() {
   activeN = required;
   wlog("N", activeN);
 
-  if (required <= 0 || filled <= 0) return;
+  if (required <= 0 || filled <= 0) {
+    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.empty");
+    return;
+  }
 
   if (required > capacity) {
     initWorkerCapacity(chooseCapacity(required));
@@ -719,11 +755,32 @@ function postStep() {
     ageEase: AGE_EASE,
   };
 
+  if (infoRec.isRecording()) {
+    infoRec.setFlag("worker.enableDensity", enableDensity);
+    infoRec.setFlag("worker.enableAgeSpiral", enableAgeSpiral);
+    infoRec.setFlag("worker.enableCohesion", enableCohesion);
+    infoRec.setFlag("worker.enableXrayBlobForce", enableXrayBlobForce);
+    infoRec.series("worker.drag", params.drag);
+    infoRec.series("worker.spiralSwirl", params.spiralSwirl);
+    infoRec.series("worker.spiralDrift", params.spiralDrift);
+    infoRec.series("worker.fillFrac", params.fillFrac);
+    infoRec.series("worker.overallAmp", params.overallAmp);
+    infoRec.series("worker.xray", params.xray);
+    infoRec.series("worker.mag", params.mag);
+    infoRec.series("worker.h_ions", params.h_ions);
+    infoRec.series("worker.electrons", params.electrons);
+    infoRec.series("worker.protons", params.protons);
+    infoRec.series("worker.agePull", params.agePull);
+    infoRec.series("worker.ageSwirl", params.ageSwirl);
+  }
+
   simWorkerBusy = true;
+  simWorkerBusySince = profLiteNow();
   const frameId = (simFrameId++ | 0);
-  simInFlight = { frameId, activeN: filled };
+  simInFlight = { frameId, activeN: filled, sentAt: profLiteNow() };
 
   wlog("post step");
+  if (infoRec.isRecording()) infoRec.incCounter("worker.step.post");
   simWorker.postMessage(
     {
       type: "step",
@@ -758,6 +815,7 @@ if (USE_WORKER) {
       wlog("worker msg", e.data?.type);
       const msg = e.data;
       if (!msg || !msg.type) return;
+      if (infoRec.isRecording()) infoRec.incCounter(`worker.msg.${msg.type}`);
       if (msg.type === "initDone") {
         const b = msg.buffers;
         simWorkerCap = msg.n | 0;
@@ -774,6 +832,17 @@ if (USE_WORKER) {
         simWorkerBusy = false;
         simWorkerReady = true;
         workerInited = true;
+        if (simInitSentAt) {
+          const rt = profLiteNow() - simInitSentAt;
+          if (infoRec.isRecording()) infoRec.series("worker.initRoundTripMs", rt);
+          simInitSentAt = 0;
+        }
+        if (simWorkerBusySince) {
+          const busyMs = profLiteNow() - simWorkerBusySince;
+          if (infoRec.isRecording()) infoRec.series("worker.busyMs", busyMs);
+          simWorkerBusySince = 0;
+        }
+        if (infoRec.isRecording()) infoRec.note("worker.initDone", { cap: simWorkerCap });
         console.log("initDone", simWorkerCap);
         // Start stepping at most once per animation frame.
         scheduleNextStep();
@@ -781,10 +850,23 @@ if (USE_WORKER) {
       }
       if (msg.type === "state") {
         wlog("got state");
+        if (infoRec.isRecording()) infoRec.incCounter("worker.state.recv");
         const b = msg.buffers;
         const inflight = simInFlight;
         simInFlight = null;
         simWorkerBusy = false;
+        if (simWorkerBusySince) {
+          const busyMs = profLiteNow() - simWorkerBusySince;
+          if (infoRec.isRecording()) infoRec.series("worker.busyMs", busyMs);
+          simWorkerBusySince = 0;
+        }
+        if (inflight && inflight.sentAt) {
+          const rt = profLiteNow() - inflight.sentAt;
+          if (infoRec.isRecording()) {
+            infoRec.series("worker.stepRoundTripMs", rt);
+            infoRec.series("worker.inFlightN", inflight.activeN | 0);
+          }
+        }
         if (!inflight) return;
 
         // Re-wrap buffers (ownership returns to main thread).
@@ -959,6 +1041,59 @@ if (USE_WORKER) {
 }
 // NOTE: worker is capacity-based (re-init only when particle count exceeds capacity).
 
+// Background info recorder: start/stop and download a TXT report of what ran while recording.
+const infoRec = createInfoRecorder({ maxEvents: 50_000 });
+let infoRecBtn = null;
+let infoRecStopBtn = null;
+const INFOREC_SAMPLE_EVERY = 6;
+const INFOREC_FORCES_SAMPLE_STRIDE = 12;
+
+let simInitSentAt = 0;
+let simWorkerBusySince = 0;
+
+function infoRecMeta(extra = {}) {
+  return {
+    USE_WORKER,
+    WORKER_SPIRAL,
+    USE_LOWRES_RENDER,
+    USE_WEBGL_PARTICLES,
+    CAPACITY,
+    particlesActive,
+    started,
+    ...extra,
+  };
+}
+
+function updateInfoRecButtons() {
+  if (infoRecBtn) {
+    const rec = infoRec.isRecording();
+    infoRecBtn.html(rec ? "REC: ON (L)" : "REC: OFF (L)");
+    infoRecBtn.style("background", rec ? "#b00020" : "#222");
+    infoRecBtn.style("color", "#fff");
+    infoRecBtn.style("border", "1px solid #000");
+    infoRecBtn.style("padding", "6px 10px");
+  }
+  if (infoRecStopBtn) {
+    const rec = infoRec.isRecording();
+    if (rec) infoRecStopBtn.removeAttribute("disabled");
+    else infoRecStopBtn.attribute("disabled", "");
+    infoRecStopBtn.style("background", "#444");
+    infoRecStopBtn.style("color", "#fff");
+    infoRecStopBtn.style("border", "1px solid #000");
+    infoRecStopBtn.style("padding", "6px 10px");
+  }
+}
+
+function infoRecStart() {
+  infoRec.start(infoRecMeta());
+  updateInfoRecButtons();
+}
+
+function infoRecStopAndDownload() {
+  infoRec.stopAndDownload("background-report.txt", infoRecMeta({ note: "stop+download" }));
+  updateInfoRecButtons();
+}
+
 // PERF: Runtime profiler (timing + optional heap usage in Chrome) with downloadable JSON report.
 let PROF_ENABLED = false;
 let PROF_RECORDING = false;
@@ -977,13 +1112,14 @@ function profHeapMB() {
 }
 
 function profStart(name) {
-  if (!PROF_ENABLED) return;
+  if (!PROF_ENABLED && !infoRec.isRecording()) return;
   profStartCore(profMarks, name);
 }
 
 function profEnd(name) {
-  if (!PROF_ENABLED) return;
-  profEndCore(profMarks, profAgg, name);
+  if (!PROF_ENABLED && !infoRec.isRecording()) return;
+  const dt = profEndCore(profMarks, profAgg, name);
+  if (infoRec.isRecording() && dt != null) infoRec.mark(name, dt);
 }
 
 function profFrameStart() {
@@ -1840,6 +1976,19 @@ function setup() {
 
   // File picker
   fileInput = createAudioFileInput(handleFile);
+
+  // Background info recorder controls (download a TXT report on stop)
+  infoRecBtn = createButton("REC: OFF (L)");
+  infoRecBtn.position(14, 44);
+  infoRecBtn.mousePressed(() => {
+    if (infoRec.isRecording()) infoRecStopAndDownload();
+    else infoRecStart();
+  });
+
+  infoRecStopBtn = createButton("STOP + Download");
+  infoRecStopBtn.position(140, 44);
+  infoRecStopBtn.mousePressed(() => infoRecStopAndDownload());
+  updateInfoRecButtons();
 
   textFont("system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial");
 
@@ -3772,6 +3921,142 @@ function draw() {
     fallbackFeatures();
   }
   profEnd("audio");
+
+  // Debug sampling for the info recorder (kept light; recorded every few frames).
+  if (infoRec.isRecording() && ((frameCount % INFOREC_SAMPLE_EVERY) === 0)) {
+    const heapMB = profHeapMB();
+    infoRec.series("frame.deltaTimeMs", (typeof deltaTime !== "undefined") ? deltaTime : 0);
+    infoRec.series("frame.fps", frameRate());
+    if (heapMB != null) infoRec.series("mem.heapMB", heapMB);
+
+    infoRec.series("sim.particlesActive", particlesActive);
+    infoRec.series("sim.capacity", CAPACITY);
+    infoRec.series("sim.fillFrac", chamberFillFrac);
+    infoRec.series("sim.spawnBudget", spawnBudget);
+    infoRec.series("sim.spawnThrottleScale", spawnThrottleScale);
+    infoRec.series("sim.spawnThrottleFrames", spawnThrottleFrames);
+    infoRec.series("sim.overBudgetStreak", overBudgetStreak);
+
+    infoRec.series("render.pgScale", pgScale);
+    infoRec.series("render.scaleDownStreak", renderScaleDownStreak);
+    infoRec.series("render.scaleUpStreak", renderScaleUpStreak);
+    infoRec.series("render.lastDrawCount", lastDrawCount);
+    infoRec.series("render.glCapacity", glCapacity);
+    infoRec.setFlag("render.mode.webgl", lastDrawMode === "webgl");
+    infoRec.setFlag("render.mode.lowres", lastDrawMode === "lowres");
+    infoRec.setFlag("render.mode.grid", lastDrawMode === "grid");
+    infoRec.setFlag("render.USE_LOWRES_RENDER", USE_LOWRES_RENDER);
+    infoRec.setFlag("render.USE_WEBGL_PARTICLES", USE_WEBGL_PARTICLES);
+    infoRec.series("render.PG_SCALE_BASE", PG_SCALE_BASE);
+    infoRec.series("render.PG_SCALE_MIN", PG_SCALE_MIN);
+    infoRec.series("render.PG_SCALE_STEP", PG_SCALE_STEP);
+    infoRec.series("render.DRAW_GRID_SIZE", DRAW_GRID_SIZE);
+    infoRec.series("render.DRAW_ALPHA_BUCKETS", DRAW_ALPHA_BUCKETS);
+
+    infoRec.setFlag("state.started", started);
+    infoRec.setFlag("state.analysisOK", analysisOK);
+    infoRec.setFlag("worker.workerInited", workerInited);
+    infoRec.setFlag("worker.simWorkerReady", simWorkerReady);
+    infoRec.setFlag("worker.simWorkerBusy", simWorkerBusy);
+    infoRec.setFlag("worker.stepScheduled", stepScheduled);
+    infoRec.series("worker.capacity", capacity);
+    infoRec.series("worker.simWorkerCap", simWorkerCap);
+    infoRec.series("worker.activeN", activeN);
+    infoRec.series("worker.simRenderN", simRenderN);
+    if (simWorkerBusy) infoRec.incCounter("worker.frame.busy");
+
+    infoRec.setFlag("toggle.enableDensity", enableDensity);
+    infoRec.setFlag("toggle.enableCollisions", enableCollisions);
+    infoRec.setFlag("toggle.enableAgeSpiral", enableAgeSpiral);
+    infoRec.setFlag("toggle.enableCohesion", enableCohesion);
+    infoRec.setFlag("toggle.enableXrayBlobForce", enableXrayBlobForce);
+    infoRec.setFlag("toggle.disableFrameForces", disableFrameForces);
+    infoRec.setFlag("view.solo.none", VIEW_SOLO_KIND == null);
+    infoRec.setFlag("view.solo.xray", VIEW_SOLO_KIND === "xray");
+    infoRec.setFlag("view.solo.electrons", VIEW_SOLO_KIND === "electrons");
+    infoRec.setFlag("view.solo.protons", VIEW_SOLO_KIND === "protons");
+    infoRec.setFlag("view.solo.h_ions", VIEW_SOLO_KIND === "h_ions");
+    infoRec.setFlag("view.solo.mag", VIEW_SOLO_KIND === "mag");
+
+    infoRec.series("face.updateEvery", faceUpdateEvery);
+    infoRec.series("face.rowCursor", faceRowCursor);
+    infoRec.series("face.chunkRows", faceChunkRows);
+    infoRec.setFlag("face.updatedThisFrame", faceUpdatedThisFrame);
+
+    infoRec.series("constants.DENSITY_PRESSURE", DENSITY_PRESSURE);
+    infoRec.series("constants.SPACE_SWIRL_MULT", SPACE_SWIRL_MULT);
+    infoRec.series("constants.SPACE_DRIFTIN_MULT", SPACE_DRIFTIN_MULT);
+    infoRec.series("constants.SPACE_JITTER_MULT", SPACE_JITTER_MULT);
+    infoRec.series("constants.AGE_WINDOW_FRAMES", AGE_WINDOW_FRAMES);
+    infoRec.series("constants.AGE_OUTER_FRAC", AGE_OUTER_FRAC);
+    infoRec.series("constants.AGE_INNER_FRAC_BASE", AGE_INNER_FRAC_BASE);
+    infoRec.series("constants.AGE_INNER_FRAC_FULL", AGE_INNER_FRAC_FULL);
+    infoRec.series("constants.AGE_INNER_FILL_EASE", AGE_INNER_FILL_EASE);
+    infoRec.series("constants.AGE_PULL", AGE_PULL);
+    infoRec.series("constants.AGE_SWIRL", AGE_SWIRL);
+    infoRec.series("constants.AGE_EASE", AGE_EASE);
+    infoRec.series("constants.COLLISION_PUSH", COLLISION_PUSH);
+    infoRec.series("constants.COLLISION_ITERS", COLLISION_ITERS);
+    infoRec.series("constants.COLLISION_GRID_EVERY", COLLISION_GRID_EVERY);
+    infoRec.series("constants.COLLISION_TARGET_FRAME_MS", COLLISION_TARGET_FRAME_MS);
+    infoRec.series("constants.FRAME_BUDGET_MS", FRAME_BUDGET_MS);
+    infoRec.series("constants.SOFT_BUDGET_MS", SOFT_BUDGET_MS);
+    infoRec.series("constants.SPAWN_BUDGET_MAX", SPAWN_BUDGET_MAX);
+    infoRec.series("constants.SPAWN_THROTTLE_TRIGGER", SPAWN_THROTTLE_TRIGGER);
+    infoRec.series("constants.SPAWN_THROTTLE_HOLD", SPAWN_THROTTLE_HOLD);
+
+    infoRec.series("audio.overallAmp", overallAmp);
+    infoRec.series("audio.xray", xray);
+    infoRec.series("audio.mag", mag);
+    infoRec.series("audio.h_ions", h_ions);
+    infoRec.series("audio.electrons", electrons);
+    infoRec.series("audio.protons", protons);
+    infoRec.series("audio.change.xray", changeEmph?.xray ?? 0);
+    infoRec.series("audio.change.mag", changeEmph?.mag ?? 0);
+    infoRec.series("audio.change.h_ions", changeEmph?.h_ions ?? 0);
+    infoRec.series("audio.change.electrons", changeEmph?.electrons ?? 0);
+    infoRec.series("audio.change.protons", changeEmph?.protons ?? 0);
+
+    infoRec.series("counts.xray", kindCountsDisplay?.xray ?? 0);
+    infoRec.series("counts.mag", kindCountsDisplay?.mag ?? 0);
+    infoRec.series("counts.h_ions", kindCountsDisplay?.h_ions ?? 0);
+    infoRec.series("counts.electrons", kindCountsDisplay?.electrons ?? 0);
+    infoRec.series("counts.protons", kindCountsDisplay?.protons ?? 0);
+
+    infoRec.series("pool.xray", pools?.xray?.length ?? 0);
+    infoRec.series("pool.mag", pools?.mag?.length ?? 0);
+    infoRec.series("pool.h_ions", pools?.h_ions?.length ?? 0);
+    infoRec.series("pool.electrons", pools?.electrons?.length ?? 0);
+    infoRec.series("pool.protons", pools?.protons?.length ?? 0);
+
+    infoRec.series("col.collisionsEvery", collisionsEvery);
+    infoRec.series("col.itersLast", collisionState?.itersLast ?? 0);
+    infoRec.series("col.itersTarget", collisionState?.itersTarget ?? 0);
+    infoRec.series("col.itersCurrent", collisionState?.itersCurrent ?? 0);
+    infoRec.series("col.overlapRatioLast", collisionState?.overlapRatioLast ?? 0);
+    infoRec.series("col.maxOverlapLast", collisionState?.maxOverlapLast ?? 0);
+    infoRec.series("col.pairsOverlapLast", collisionState?.pairsOverlapLast ?? 0);
+    infoRec.setFlag("col.overlapHigh", !!collisionState?.overlapHigh);
+    infoRec.setFlag("col.trouble", !!collisionState?.trouble);
+    infoRec.series("col.cellFracLast", collisionState?.cellFracLast ?? 0);
+    infoRec.series("col.cellsProcessedLast", collisionState?.cellsProcessedLast ?? 0);
+    infoRec.series("col.cellsTotalLast", collisionState?.cellsTotalLast ?? 0);
+    infoRec.series("col.corrCurrent", collisionState?.corrCurrent ?? 0);
+    infoRec.series("col.maxMoveCurrent", collisionState?.maxMoveCurrent ?? 0);
+    infoRec.series("col.pushKCurrent", collisionState?.pushKCurrent ?? 0);
+
+    infoRec.series("colAudit.pairsChecked", collisionAuditLast?.pairsChecked ?? 0);
+    infoRec.series("colAudit.pairsOverlap", collisionAuditLast?.pairsOverlap ?? 0);
+    infoRec.series("colAudit.maxOverlap", collisionAuditLast?.maxOverlap ?? 0);
+    infoRec.series("colAudit.postMaxOverlap", collisionAuditLast?.postMaxOverlap ?? 0);
+    infoRec.series("colAudit.listN", collisionAuditLast?.listN ?? 0);
+    infoRec.series("colAudit.cellsProcessed", collisionAuditLast?.cellsProcessed ?? 0);
+    infoRec.series("colAudit.cellsTotal", collisionAuditLast?.cellsTotal ?? 0);
+    infoRec.series("colAudit.cellFrac", collisionAuditLast?.cellFrac ?? 0);
+    infoRec.series("colAudit.pushK", collisionAuditLast?.pushK ?? 0);
+    infoRec.series("colAudit.corrAlpha", collisionAuditLast?.corrAlpha ?? 0);
+    infoRec.series("colAudit.hotCells", collisionAuditLast?.hotCells ?? 0);
+  }
   updateLayerMemory();
   updatePerfThrottles();
   {
@@ -3943,6 +4228,7 @@ function mousePressed() {
     userStartAudio();
     started = true;
     statusMsg = "Audio unlocked. Upload an MP3 (top-left) or re-upload to start.";
+    if (infoRec.isRecording()) infoRec.note("user.started", { started });
     if (soundFile && soundFile.isLoaded()) startPlayback();
   }
 }
@@ -3998,25 +4284,51 @@ function keyPressed() {
     VIEW_SOLO_KIND = null;
     console.log("VIEW_SOLO_KIND", VIEW_SOLO_KIND);
   }
-  if (key === "z" || key === "Z") { enableDensity = !enableDensity; console.log("density", enableDensity); }
+  if (key === "z" || key === "Z") {
+    enableDensity = !enableDensity;
+    console.log("density", enableDensity);
+    if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableDensity", enableDensity); infoRec.note("toggle.enableDensity", enableDensity); }
+  }
   if ((key === "x" || key === "X") && typeof keyIsDown === "function" && keyIsDown(SHIFT)) {
     enableCollisions = !enableCollisions;
     console.log("collisions", enableCollisions);
+    if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableCollisions", enableCollisions); infoRec.note("toggle.enableCollisions", enableCollisions); }
   }
-  if (key === "a" || key === "A") { enableAgeSpiral = !enableAgeSpiral; console.log("ageSpiral", enableAgeSpiral); }
-  if (key === "s" || key === "S") { enableCohesion = !enableCohesion; console.log("cohesion", enableCohesion); }
-  if (key === "t" || key === "T") { enableXrayBlobForce = !enableXrayBlobForce; console.log("xrayBlob", enableXrayBlobForce); }
+  if (key === "a" || key === "A") {
+    enableAgeSpiral = !enableAgeSpiral;
+    console.log("ageSpiral", enableAgeSpiral);
+    if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableAgeSpiral", enableAgeSpiral); infoRec.note("toggle.enableAgeSpiral", enableAgeSpiral); }
+  }
+  if (key === "s" || key === "S") {
+    enableCohesion = !enableCohesion;
+    console.log("cohesion", enableCohesion);
+    if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableCohesion", enableCohesion); infoRec.note("toggle.enableCohesion", enableCohesion); }
+  }
+  if (key === "t" || key === "T") {
+    enableXrayBlobForce = !enableXrayBlobForce;
+    console.log("xrayBlob", enableXrayBlobForce);
+    if (infoRec.isRecording()) { infoRec.setFlag("toggle.enableXrayBlobForce", enableXrayBlobForce); infoRec.note("toggle.enableXrayBlobForce", enableXrayBlobForce); }
+  }
+
+  // Background info recorder (TXT report): press L to start/stop+download.
+  if (key === "l" || key === "L") {
+    if (infoRec.isRecording()) infoRecStopAndDownload();
+    else infoRecStart();
+  }
 }
 
 // ---------- File upload ----------
 function handleFile(file) {
   errorMsg = "";
+  if (infoRec.isRecording()) infoRec.note("audio.file.selected", { name: file?.name, type: file?.type, subtype: file?.subtype });
   if (!file || file.type !== "audio") {
     statusMsg = "Please upload an audio file (mp3/wav/etc).";
+    if (infoRec.isRecording()) infoRec.incCounter("audio.file.rejected");
     return;
   }
 
   userStartAudio(); // helps in some browsers
+  if (infoRec.isRecording()) infoRec.incCounter("audio.load.start");
   statusMsg = "Loading audio…";
 
   loadSound(
@@ -4034,12 +4346,20 @@ function handleFile(file) {
 
       analysisOK = true;
       statusMsg = started ? "Loaded. Playing…" : "Loaded. Click canvas to start.";
+      if (infoRec.isRecording()) {
+        infoRec.incCounter("audio.load.ok");
+        infoRec.note("audio.load.ok", { duration: (typeof snd?.duration === "function") ? snd.duration() : null });
+      }
       if (started) startPlayback();
     },
     (err) => {
       analysisOK = false;
       errorMsg = "Load failed: " + String(err);
       statusMsg = "Audio failed to load.";
+      if (infoRec.isRecording()) {
+        infoRec.incCounter("audio.load.fail");
+        infoRec.note("audio.load.fail", { err: String(err) });
+      }
     }
   );
 }
@@ -4048,6 +4368,7 @@ function startPlayback() {
   if (!soundFile) return;
   if (!soundFile.isPlaying()) {
     soundFile.loop();
+    if (infoRec.isRecording()) infoRec.incCounter("audio.play.loop");
   }
 }
 
@@ -4831,6 +5152,8 @@ function applyForcesMainThread(
     enableDensity,
     enableCohesion,
     enableXrayBlobForce,
+    infoRec: infoRec.isRecording() ? infoRec : null,
+    infoRecSampleStride: INFOREC_FORCES_SAMPLE_STRIDE,
     DENSE_DISABLE_COHESION,
     HEAVY_FIELD_STRIDE,
     ALIGNMENT_STRIDE,
@@ -4864,6 +5187,8 @@ function drawParticles() {
       glAlpha,
       glCapacity,
       drawBuckets,
+      lastDrawCount,
+      lastDrawMode,
       usedCols,
       usedRows,
       usedStamp,
@@ -4901,6 +5226,8 @@ function drawParticles() {
     glAlpha,
     glCapacity,
     drawBuckets,
+    lastDrawCount,
+    lastDrawMode,
     usedCols,
     usedRows,
     usedStamp,

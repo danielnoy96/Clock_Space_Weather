@@ -139,6 +139,8 @@ export function drawParticles(state, opts) {
     }
     if (count <= 0) {
       image(pgl, 0, 0, width, height);
+      state.lastDrawMode = "webgl";
+      state.lastDrawCount = 0;
       return state;
     }
 
@@ -207,6 +209,8 @@ export function drawParticles(state, opts) {
     gl.drawArrays(gl.POINTS, 0, idx);
 
     image(pgl, 0, 0, width, height);
+    state.lastDrawMode = "webgl";
+    state.lastDrawCount = idx | 0;
     return state;
   }
 
@@ -227,10 +231,12 @@ export function drawParticles(state, opts) {
     const alphaStep = 255 / (DRAW_ALPHA_BUCKETS - 1);
     const kindCount = DRAW_KIND_ORDER.length;
 
+    let count = 0;
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
       if (!p) continue;
       if (SOLO_KIND && p.kind !== SOLO_KIND) continue;
+      if (p.active && !p.dead()) count++;
 
       const aLife = constrain(p.life / p.maxLife, 0, 1);
       const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
@@ -277,6 +283,8 @@ export function drawParticles(state, opts) {
 
     pg.pop();
     image(pg, 0, 0, width, height);
+    state.lastDrawMode = "lowres";
+    state.lastDrawCount = count | 0;
     return state;
   }
 
@@ -337,5 +345,7 @@ export function drawParticles(state, opts) {
   for (const kind of kinds) drawByKind(kind);
   pop();
 
+  state.lastDrawMode = "grid";
+  state.lastDrawCount = 0;
   return state;
 }

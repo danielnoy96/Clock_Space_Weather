@@ -35,6 +35,7 @@ export function profEnd(profMarks, profAgg, name) {
     if (dHeap < a.heapMin) a.heapMin = dHeap;
   }
   profMarks[name] = null;
+  return dt;
 }
 
 export function profFrameStart() {
