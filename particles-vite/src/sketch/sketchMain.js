@@ -1389,7 +1389,7 @@ const SMOOTH_SLOW = 0.18;
 // ---------- Colors ----------
 // Palette is centralized in `./config.js`.
 
-const PARTICLE_SIZE_SCALE = 4;
+const PARTICLE_SIZE_SCALE = 4.5;  
 // Global scaling factor for particle counts (set to 0.1 for 10% of previous counts)
 const PARTICLE_SCALE = 0.10;
 

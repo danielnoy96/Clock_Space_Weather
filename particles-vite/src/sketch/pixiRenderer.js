@@ -25,8 +25,8 @@ const KIND_INDEX = Object.freeze({
 });
 
 // PERF tuning knobs (safe defaults; opt-in for experimentation).
-const PIXI_RENDERER_PREFERENCE = "webgl"; // "webgl" | "webgpu"
-const USE_GPU_FLICKER_SHADER = false;
+const PIXI_RENDERER_PREFERENCE = "webgl"; // "webgl" | "webgpu" - WebGL stable, WebGPU has color issues
+const USE_GPU_FLICKER_SHADER = true;  // Move flicker calculation to GPU
 // Capping DPR reduces fill-rate cost (often a big FPS win on high-DPI displays).
 const PIXI_MAX_RESOLUTION = 1.0;
 
@@ -323,6 +323,15 @@ export async function initPixiRenderer({ parent, width, height }) {
   };
 
   await app.init(initOpts);
+
+  // Log which renderer is actually being used
+  const rendererType = app.renderer?.type || 'unknown';
+  console.log(`[PixiJS] Renderer initialized: ${rendererType}`, {
+    preference: PIXI_RENDERER_PREFERENCE,
+    resolution,
+    antialias: false
+  });
+
   if (app.ticker && typeof app.ticker.stop === "function") app.ticker.stop();
 
   const view = app.canvas;
