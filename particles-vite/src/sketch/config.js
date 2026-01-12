@@ -28,7 +28,13 @@ export const LAYER_BEHAVIOR = {
     alignmentStrengthHigh: 0.15,  // velocity alignment at high coherence (moderate, was 0.45)
     noiseAmpLow: 0.18,            // directional noise at low coherence (gentle waves, was 0.65)
     noiseAmpHigh: 0.02,           // directional noise at high coherence - very straight
+    restLength: 28,               // preferred spacing between chained particles
     separationRadius: 45,         // radius for lateral separation from non-chain neighbors
+    emitFromHandsChain: true,     // emit mag as pre-connected chains from hands
+    historyOuterFrac: 0.92,       // newest radius (time axis)
+    historyInnerFrac: 0.18,       // ~4 minutes ago radius
+    historyStrength: 0.007,       // radial pull strength toward the time axis
+    historyBlend: 0.75,           // 0=current coherence, 1=spawn-time coherence (history)
     drawChainLines: true,         // visual debug: draw lines between chain-linked particles
   },
 };

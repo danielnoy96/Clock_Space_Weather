@@ -41,6 +41,7 @@ export function applyForcesStage(ctx) {
     applyDensityCoupling,
     applyAlignment,
     applyCohesion,
+    applyMagneticHistoryForce,
     applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
@@ -160,6 +161,7 @@ export function applyForcesStage(ctx) {
 
     // Apply magnetic filament force (only for mag particles)
     if (p.kind === "mag" && applyMagneticFilamentForce) {
+      if (applyMagneticHistoryForce) applyMagneticHistoryForce(p, T);
       applyMagneticFilamentForce(p, magneticCoherence || 0.5);
       if (sampleThisFrame) infoRec.incCounter("force.applyMagneticFilament");
     }

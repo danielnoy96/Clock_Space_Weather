@@ -1017,7 +1017,10 @@ if (USE_WORKER) {
             for (let i = 0; i < particles.length; i++) {
               const p = particles[i];
               if (!p || p.dead()) continue;
-              if (COLLISION_KINDS[p.kind]) collisionList.push(p);
+              if (!COLLISION_KINDS[p.kind]) continue;
+              // X-ray blob particles should never collide (they are position-locked and/or zero-radius).
+              if (p.kind === "xray" && p.blobId) continue;
+              collisionList.push(p);
             }
             if (collisionList.length) {
               for (let i = 0; i < collisionList.length; i++) {
@@ -1054,7 +1057,12 @@ if (USE_WORKER) {
             collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
             collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
             collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-            const cellFrac = 1;
+            // When many kinds collide, spread work across frames by scanning only a fraction of grid cells.
+            // (The solver already rotates a cursor across cells each frame.)
+            const nCol = collisionList.length | 0;
+            const cellFrac = trouble
+              ? 1
+              : (nCol >= 9000 ? 0.28 : nCol >= 6500 ? 0.40 : nCol >= 4000 ? 0.60 : 1);
               resolveSpaceCollisions(
                 collisionList,
                 T.c,
@@ -1350,6 +1358,8 @@ let lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
 
 // H-ions "chains": elongated streams that stick like a chain
 let lastHIonByHand = { hour: null, minute: null, second: null };
+// Magnetic "chains": emit mag already connected per hand.
+let lastMagByHand = { hour: null, minute: null, second: null };
 
 // Reusable occupancy buffer for grid drawing (avoid per-frame allocations)
 let usedCols = 0, usedRows = 0;
@@ -1357,7 +1367,9 @@ let usedStamp = null; // Uint32Array
 let usedStampXray = null; // Uint32Array (xray-only occupancy so xray stays visible)
 let usedFrameId = 1;
 
-const COLLISION_KINDS = { protons: true, h_ions: true };
+// Kinds that participate in the space collision solver (grid-based packing).
+// This defines the shared "medium" for those particles more strongly than density viscosity.
+const COLLISION_KINDS = { protons: true, h_ions: true, mag: true, electrons: true, xray: true };
 const COLLISION_ITERS_MASS = 3;
 
 // PERF: collision solver caches to avoid per-call allocations.
@@ -1501,8 +1513,11 @@ function updateControlLayer() {
   state.protons = lerp(state.protons, raw.protons, 0.08);
 
   // Magnetic: ultra stable, very slow structure (with deadband)
-  const magDelta = raw.mag - state.mag;
-  if (abs(magDelta) > 0.01) state.mag = lerp(state.mag, raw.mag, 0.025);
+  // Some inputs can swing negative; treat sign as phase and use magnitude for "how much mag".
+  const rawMag = constrain(abs(raw.mag), 0, 1);
+  const magDelta = rawMag - state.mag;
+  if (abs(magDelta) > 0.01) state.mag = lerp(state.mag, rawMag, 0.025);
+  state.mag = constrain(state.mag, 0, 1);
 
   // H-ions: medium smoothing + rate limit (flow)
   const hStep = constrain(raw.h_ions - state.h_ions, -0.04, 0.04);
@@ -2367,7 +2382,7 @@ function buildMagneticChains(list, k = 3) {
 
     // Find the most forward and most backward neighbors along the tangent
     let maxForwardDot = -1;
-    let maxBackwardDot = -1;
+    let maxBackwardDot = 1;
     let forwardNeighbor = null;
     let backwardNeighbor = null;
 
@@ -3371,11 +3386,11 @@ function applyCohesion(p, index, grid, cellSize, forceScale) {
 function applyMagneticFilamentForce(p, magneticCoherence) {
   if (p.kind !== "mag") return;
 
-  // Coherence controls organization vs chaos
-  const coherence = constrain(magneticCoherence, 0, 1);
-
-  // Get magnetic behavior config
   const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const historyBlend = (typeof magBehavior.historyBlend === "number") ? magBehavior.historyBlend : 0.0;
+  const cohNow = constrain(magneticCoherence, 0, 1);
+  const cohBirth = constrain((typeof p.magCohBirth === "number") ? p.magCohBirth : cohNow, 0, 1);
+  const coherence = constrain(lerp(cohNow, cohBirth, historyBlend), 0, 1);
 
   // Spring constants for longitudinal (forward/back) chaining (using config values)
   const springStrength = lerp(
@@ -3388,6 +3403,7 @@ function applyMagneticFilamentForce(p, magneticCoherence) {
     magBehavior.springMaxForceHigh || 0.45,
     coherence
   );
+  const restLength = magBehavior.restLength || 28;
 
   // Lateral separation strength (keep threads thin, not blobby)
   const lateralSeparation = lerp(
@@ -3423,9 +3439,11 @@ function applyMagneticFilamentForce(p, magneticCoherence) {
     const dy = q.pos.y - p.pos.y;
     const d = sqrt(dx * dx + dy * dy) + 1e-6;
 
-    // Spring force along the chain (attractive)
-    springForceX += (dx / d) * springStrength;
-    springForceY += (dy / d) * springStrength;
+    // Spring force along the chain (prefers a rest length)
+    const delta = (d - restLength);
+    const f = constrain(delta * springStrength, -springMaxForce, springMaxForce);
+    springForceX += (dx / d) * f;
+    springForceY += (dy / d) * f;
 
     // Collect velocity for alignment
     alignVelX += q.vel.x;
@@ -3439,21 +3457,15 @@ function applyMagneticFilamentForce(p, magneticCoherence) {
     const dy = q.pos.y - p.pos.y;
     const d = sqrt(dx * dx + dy * dy) + 1e-6;
 
-    // Spring force along the chain (attractive)
-    springForceX += (dx / d) * springStrength;
-    springForceY += (dy / d) * springStrength;
+    const delta = (d - restLength);
+    const f = constrain(delta * springStrength, -springMaxForce, springMaxForce);
+    springForceX += (dx / d) * f;
+    springForceY += (dy / d) * f;
 
     // Collect velocity for alignment
     alignVelX += q.vel.x;
     alignVelY += q.vel.y;
     chainCount++;
-  }
-
-  // Clamp spring force
-  const springMag = sqrt(springForceX * springForceX + springForceY * springForceY) + 1e-6;
-  if (springMag > springMaxForce) {
-    springForceX *= springMaxForce / springMag;
-    springForceY *= springMaxForce / springMag;
   }
 
   // Apply spring force
@@ -3525,6 +3537,39 @@ function applyMagneticFilamentForce(p, magneticCoherence) {
     p.vel.x += sepX;
     p.vel.y += sepY;
   }
+
+  // High coherence: align velocity along filament tangent (reduce sideways drift).
+  const tx = p.magTangent.x;
+  const ty = p.magTangent.y;
+  const px = -ty, py = tx;
+  const vperp = p.vel.x * px + p.vel.y * py;
+  const perpDamp = lerp(0.10, 0.55, coherence);
+  p.vel.x -= px * vperp * perpDamp;
+  p.vel.y -= py * vperp * perpDamp;
+}
+
+function applyMagneticHistoryForce(p, T) {
+  if (!p || p.kind !== "mag" || !T) return;
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const outerFrac = (typeof magBehavior.historyOuterFrac === "number") ? magBehavior.historyOuterFrac : 0.92;
+  const innerFrac = (typeof magBehavior.historyInnerFrac === "number") ? magBehavior.historyInnerFrac : 0.18;
+  const strength = (typeof magBehavior.historyStrength === "number") ? magBehavior.historyStrength : 0.007;
+
+  const age = (frameCount || 0) - (p.birthFrame || 0);
+  const age01 = constrain(age / max(1, AGE_WINDOW_FRAMES), 0, 1);
+  const targetR = lerp(T.radius * outerFrac, T.radius * innerFrac, age01);
+
+  const rx = p.pos.x - T.c.x;
+  const ry = p.pos.y - T.c.y;
+  const r = max(30, sqrt(rx * rx + ry * ry));
+  const inv = 1.0 / r;
+  const nx = rx * inv;
+  const ny = ry * inv;
+  const dr = constrain(targetR - r, -120, 120);
+  const coh = constrain((typeof p.magCohBirth === "number") ? p.magCohBirth : constrain(abs(mag), 0, 1), 0, 1);
+  const k = strength * (0.35 + 0.65 * coh);
+  p.vel.x += nx * dr * k;
+  p.vel.y += ny * dr * k;
 }
 
 function applyCalmOrbit(p, center, scale, pullScale) {
@@ -3582,7 +3627,7 @@ function applyAgeSpiral(p, T, ageRank01, scale, pullScale) {
   }
   // Reduce age spiral for magnetic and electrons to preserve their unique motion
   if (p.kind === "mag") {
-    scale = (scale || 1.0) * 0.05; // 5% for magnetic - almost none, filament structure is the priority
+    scale = 0; // mag uses its own 4-minute radial history axis (applyMagneticHistoryForce)
   }
   if (p.kind === "electrons") {
     scale = (scale || 1.0) * 0.35; // 35% for electrons
@@ -4920,6 +4965,7 @@ function resetVisualSystems() {
   xraySegmentIdCounter = 1;
   lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
   lastHIonByHand = { hour: null, minute: null, second: null };
+  lastMagByHand = { hour: null, minute: null, second: null };
 
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
@@ -5223,7 +5269,7 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
 	  const protonsEff = constrain(protons + pBase, 0, 1) * pMul;
 	  const hIonsEff = constrain(h_ions + hBase, 0, 1) * hMul;
 	  const electronsEff = constrain(electrons + eBase, 0, 1) * eMul;
-	  const magEff = constrain(mag + mBase, 0, 1) * mMul;
+	  const magEff = constrain(abs(mag) + mBase, 0, 1) * mMul;
 	  const wm = w.m * magEff;
 	  const wh = w.h * hIonsEff;
 	  const we = w.e * electronsEff;
@@ -5238,7 +5284,7 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
 
   // Spread controlled by protons (stiffness)
   const stiffness = 0.35 + protons * 0.65;
-  const spread = (1.0 + electrons * 2.2 + mag * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
+  const spread = (1.0 + electrons * 2.2 + abs(mag) * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
 
 	  // Support fractional emission rates (needed for slow time / long lifetimes).
 	  // Without this, rates < 1 would floor to 0 and appear "frozen".
@@ -5350,7 +5396,7 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
       vy *= 0.85;
     }
 	    if (kind === "mag") {
-	      const ang = (random() - 0.5) * 0.25 * mag;
+	      const ang = (random() - 0.5) * 0.25 * abs(mag);
 	      const ca = cos(ang), sa = sin(ang);
 	      const nvx = vx * ca - vy * sa;
 	      const nvy = vx * sa + vy * ca;
@@ -5385,6 +5431,33 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
       p.link = lastHIonByHand[which];
       p.linkGen = (p.link ? p.link.generation : 0);
       lastHIonByHand[which] = p;
+    }
+    if (kind === "mag") {
+      const magBehavior = LAYER_BEHAVIOR.mag || {};
+      if (magBehavior.emitFromHandsChain) {
+        const coherence = constrain(abs(mag), 0, 1);
+        const rest = magBehavior.restLength || 28;
+        const maxLink = lerp(rest * 2.2, rest * 6.5, coherence);
+        const breakChance = pow(1.0 - coherence, 1.3) * 0.55;
+
+        let prev = lastMagByHand[which];
+        if (prev && (!prev.active || prev.dead() || prev.kind !== "mag")) prev = null;
+        if (prev && noise(p.seed * 0.21, millis() * 0.00012) < breakChance) prev = null;
+        if (prev) {
+          const dxl = prev.pos.x - p.pos.x;
+          const dyl = prev.pos.y - p.pos.y;
+          const d = sqrt(dxl * dxl + dyl * dyl);
+          if (d <= maxLink) {
+            // New particle becomes the chain head at the hand; chain extends via magNext.
+            p.magNext = prev;
+            prev.magPrev = p;
+          }
+        }
+        p.magTangent.x = dirx;
+        p.magTangent.y = diry;
+        p.magCohBirth = coherence;
+        lastMagByHand[which] = p;
+      }
     }
     if (kind === "xray") {
       // NOTE: X-ray segments (rigid line constraints) are currently disabled to keep spikes as blobs,
@@ -5590,15 +5663,17 @@ function updateParticles(T) {
 
   // Build magnetic particle chains for filament structure
   const magBehavior = LAYER_BEHAVIOR.mag || {};
-  const chainRebuildEvery = magBehavior.chainRebuildEvery || MAGNETIC_CHAIN_EVERY;
-  const chainK = magBehavior.chainK || 3;
-  if ((frameCount - magneticChainFrame) >= chainRebuildEvery) {
-    buildMagneticChains(particles, chainK);
-    magneticChainFrame = frameCount;
+  if (!magBehavior.emitFromHandsChain) {
+    const chainRebuildEvery = magBehavior.chainRebuildEvery || MAGNETIC_CHAIN_EVERY;
+    const chainK = magBehavior.chainK || 3;
+    if ((frameCount - magneticChainFrame) >= chainRebuildEvery) {
+      buildMagneticChains(particles, chainK);
+      magneticChainFrame = frameCount;
+    }
   }
 
   // Magnetic coherence: high mag signal = organized filaments, low = chaotic/broken filaments
-  const magneticCoherence = constrain(mag, 0, 1);
+  const magneticCoherence = constrain(abs(mag), 0, 1);
 
   const stridePhase = frameCount % COHESION_APPLY_STRIDE;
   const heavyPhase = frameCount % HEAVY_FIELD_STRIDE;
@@ -5675,7 +5750,10 @@ function updateParticles(T) {
     collisionState.itersLast = 0;
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
-      if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
+      if (!p) continue;
+      if (!COLLISION_KINDS[p.kind]) continue;
+      if (p.kind === "xray" && p.blobId) continue;
+      collisionList.push(p);
     }
     if (collisionList.length) {
       for (let i = 0; i < collisionList.length; i++) {
@@ -5711,7 +5789,10 @@ function updateParticles(T) {
       collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
       collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
       collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-    const cellFrac = 1;
+      const nCol = collisionList.length | 0;
+      const cellFrac = trouble
+        ? 1
+        : (nCol >= 9000 ? 0.28 : nCol >= 6500 ? 0.40 : nCol >= 4000 ? 0.60 : 1);
       resolveSpaceCollisions(
         collisionList,
         T.c,
@@ -5820,6 +5901,7 @@ function applyForcesMainThread(
     applyDensityCoupling,
     applyAlignment,
     applyCohesion,
+    applyMagneticHistoryForce,
     applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
@@ -6165,6 +6247,7 @@ function Particle(x, y, vx, vy, life, size, col, kind) {
   this.magPrev = null; // previous particle in magnetic chain
   this.magNext = null; // next particle in magnetic chain
   this.magTangent = createVector(0, 0); // local filament tangent direction
+  this.magCohBirth = 0.5; // coherence at spawn time (history)
   this.active = true;
   this.generation = 0;
 }
@@ -6208,12 +6291,20 @@ Particle.prototype.resetFromSpawn = function(kind, x, y, vx, vy, life, size, col
   this.magNext = null;
   this.magTangent.x = 0;
   this.magTangent.y = 0;
+  this.magCohBirth = (kind === "mag") ? constrain(abs(mag), 0, 1) : 0.5;
 
   this.active = true;
   this.generation = (this.generation + 1) | 0;
 };
 
 Particle.prototype.deactivate = function() {
+  // Detach magnetic neighbors so pooled objects don't leave dangling links.
+  if (this.kind === "mag") {
+    const a = this.magPrev;
+    const b = this.magNext;
+    if (a && a.magNext === this) a.magNext = null;
+    if (b && b.magPrev === this) b.magPrev = null;
+  }
   this.active = false;
   this.inHand = false;
   this.hand = null;
@@ -6226,6 +6317,7 @@ Particle.prototype.deactivate = function() {
   this.xrayRadPref = 0;
   this.magPrev = null;
   this.magNext = null;
+  this.magCohBirth = 0.5;
   this.layerTargetFrac = null;
   this.strength = 1.0;
   this.life = 0;
