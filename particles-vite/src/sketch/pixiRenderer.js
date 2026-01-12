@@ -45,8 +45,6 @@ function ensureCanvasSpriteTexture(sprite, canvas) {
   // Keep CanvasSource in sync when p5 mutates pixels.
   const src = sprite.texture?.source;
   if (src && typeof src.update === "function") src.update();
-  const bt = sprite.texture?.baseTexture;
-  if (bt && typeof bt.update === "function") bt.update();
 }
 
 export async function initPixiRenderer({ parent, width, height }) {
@@ -72,6 +70,9 @@ export async function initPixiRenderer({ parent, width, height }) {
 
   const stage = new Container();
   app.stage.addChild(stage);
+
+  const bgGfx = new Graphics();
+  stage.addChild(bgGfx);
 
   const fieldLayer = new Container();
   const clockStaticLayer = new Container();
@@ -117,6 +118,7 @@ export async function initPixiRenderer({ parent, width, height }) {
     stage,
     width,
     height,
+    bgGfx,
     field,
     clockStatic,
     fieldLayer,
@@ -139,15 +141,13 @@ export function resizePixiRenderer(state, width, height) {
 
 function drawHandPoly(gfx, pts, col, alpha01) {
   if (!pts || pts.length < 6) return;
-  gfx.beginFill(col, alpha01);
-  gfx.drawPolygon(pts);
-  gfx.endFill();
+  gfx.poly(pts);
+  gfx.fill({ color: col, alpha: alpha01 });
 }
 
 function drawTriangle(gfx, a, b, c, col, alpha01) {
-  gfx.beginFill(col, alpha01);
-  gfx.drawPolygon([a.x, a.y, b.x, b.y, c.x, c.y]);
-  gfx.endFill();
+  gfx.poly([a.x, a.y, b.x, b.y, c.x, c.y]);
+  gfx.fill({ color: col, alpha: alpha01 });
 }
 
 export function renderPixiFrame(state, opts) {
@@ -181,6 +181,15 @@ export function renderPixiFrame(state, opts) {
     PI,
   } = opts;
 
+  // Solid background so the chamber never renders "transparent" during chunked face updates.
+  {
+    const bg = (COL && COL.bg) ? COL.bg : [0, 0, 0];
+    const bgCol = rgbToHex(bg);
+    const gfx = state.bgGfx;
+    gfx.clear();
+    gfx.rect(0, 0, canvasW, canvasH).fill({ color: bgCol, alpha: 1 });
+  }
+
   // Face field (p5.Graphics -> canvas texture)
   {
     const canvas = canvasFromP5Graphics(fieldGraphics);
@@ -194,6 +203,7 @@ export function renderPixiFrame(state, opts) {
       state.field.sprite.height = canvasH;
       state.field.sprite.x = 0;
       state.field.sprite.y = 0;
+      state.field.sprite.alpha = 1;
     }
   }
 
@@ -274,13 +284,11 @@ export function renderPixiFrame(state, opts) {
     const drawHead = (p, r) => {
       const glow = 18 + h_ions * 40 + xray * 30;
       const glowR = r * 1.1 + glow * 0.5;
-      gfx.beginFill(0xffffff, 18 / 255);
-      gfx.drawCircle(p.x, p.y, glowR);
-      gfx.endFill();
+      gfx.circle(p.x, p.y, glowR);
+      gfx.fill({ color: 0xffffff, alpha: 18 / 255 });
 
-      gfx.beginFill(rgbToHex(COL.head), 1);
-      gfx.drawCircle(p.x, p.y, r);
-      gfx.endFill();
+      gfx.circle(p.x, p.y, r);
+      gfx.fill({ color: rgbToHex(COL.head), alpha: 1 });
     };
 
     drawHead(T.hourP, HAND_HEAD_R.hour);

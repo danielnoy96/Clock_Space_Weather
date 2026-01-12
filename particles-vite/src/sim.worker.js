@@ -45,6 +45,7 @@ function setArrays(nextN, buffers) {
 
 function stepSim(params, activeN) {
   const dt = +params.dt || 1.0;
+  const stepScale = +params.stepScale || 1.0;
   const drag = +params.drag || 1.0;
   const cx = +params.cx || 0.0;
   const cy = +params.cy || 0.0;
@@ -69,6 +70,9 @@ function stepSim(params, activeN) {
   const electrons = +params.electrons || 0.0;
   const protons = +params.protons || 0.0;
   const fillFrac = clamp(+params.fillFrac || 0.0, 0.0, 1.0);
+  const densityPressure = +params.densityPressure || 0.04;
+  const densityViscosity = +params.densityViscosity || 0.30;
+  const denseVelSmooth = +params.denseVelSmooth || 0.60;
 
   // Age spiral constants
   const ageWindow = Math.max(1, (params.ageWindow | 0) || 1);
@@ -216,17 +220,17 @@ function stepSim(params, activeN) {
         const gm = Math.sqrt(gdx * gdx + gdy * gdy) || 1.0;
         const ax = -(gdx / gm);
         const ay = -(gdy / gm);
-        const base = 0.04 * (0.55 + fillFrac * 1.05) * overlapFactor; // matches main DENSITY_PRESSURE curve
+        const base = densityPressure * (0.55 + fillFrac * 1.05) * overlapFactor; // matches main DENSITY_PRESSURE curve
         vxi += ax * base;
         vyi += ay * base;
 
         // Local viscosity: dense cells slow down and flow together more smoothly.
-        const visc = clamp((c - 2) * 0.03, 0.0, 1.0) * 0.30;
+        const visc = clamp((c - 2) * 0.03, 0.0, 1.0) * densityViscosity;
         if (visc > 0) {
           // Match main-thread behavior: one multiply plus a soft lerp-to-zero (no double multiply).
           vxi *= (1.0 - visc);
           vyi *= (1.0 - visc);
-          const smooth = 0.60;
+          const smooth = denseVelSmooth;
           const t = clamp(visc * smooth, 0.0, 1.0);
           vxi += (0.0 - vxi) * t;
           vyi += (0.0 - vyi) * t;
@@ -237,8 +241,8 @@ function stepSim(params, activeN) {
     // Basic motion: drag + integrate.
     vxi *= drag;
     vyi *= drag;
-    let xi = xi0 + vxi * dt;
-    let yi = yi0 + vyi * dt;
+    let xi = xi0 + vxi * dt * stepScale;
+    let yi = yi0 + vyi * dt * stepScale;
 
     const dx = xi - cx;
     const dy = yi - cy;

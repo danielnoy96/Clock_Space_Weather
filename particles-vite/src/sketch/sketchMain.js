@@ -12,6 +12,9 @@ import {
   CAPACITY_DYNAMIC_UPDATE_MS,
   CAPACITY_MIN,
   CAPACITY_TARGET_FULL,
+  CLOCK_TUNING,
+  EMIT_TUNING,
+  TIME_TUNING,
   COL,
   LAYER_BEHAVIOR,
   PARTICLE_PROFILE,
@@ -777,30 +780,46 @@ function postStep() {
   activeN = required;
   wlog("N", activeN);
 
-  if (required <= 0 || filled <= 0) {
-    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.empty");
-    return;
-  }
+	  if (required <= 0 || filled <= 0) {
+	    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.empty");
+	    // Keep the worker pump alive so a later reset/reload (which temporarily empties `particles`)
+	    // doesn't permanently stop motion once particles start spawning again.
+	    scheduleNextStep();
+	    return;
+	  }
 
   if (required > capacity) {
     initWorkerCapacity(chooseCapacity(required));
     return;
   }
 
-  const dt = getSmoothedDt();
+	  const dt = getSmoothedDt();
   if (!simLoggedDt) {
     wlog("dt", dt);
     simLoggedDt = true;
   }
-  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
-  const params = {
-    dt,
-    drag: (0.985 + protons * 0.01),
-    cx: T.c.x,
-    cy: T.c.y,
-    radius: T.radius,
-    w: width,
-    h: height,
+	  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+	  const dragBase = (CLOCK_TUNING && typeof CLOCK_TUNING.dragBase === "number") ? CLOCK_TUNING.dragBase : 0.985;
+	  const dragProtonsAdd = (CLOCK_TUNING && typeof CLOCK_TUNING.dragProtonsAdd === "number") ? CLOCK_TUNING.dragProtonsAdd : 0.01;
+	  const densityPressure = (CLOCK_TUNING && typeof CLOCK_TUNING.densityPressure === "number") ? CLOCK_TUNING.densityPressure : 0.04;
+	  const densityViscosity = (CLOCK_TUNING && typeof CLOCK_TUNING.densityViscosity === "number") ? CLOCK_TUNING.densityViscosity : 0.30;
+	  const denseVelSmooth = (CLOCK_TUNING && typeof CLOCK_TUNING.denseVelSmooth === "number") ? CLOCK_TUNING.denseVelSmooth : 0.60;
+	  const stepScale = (TIME_TUNING && typeof TIME_TUNING.motionStepScale === "number") ? TIME_TUNING.motionStepScale : 1.0;
+	  const dragRaw = (dragBase + protons * dragProtonsAdd);
+	  const drag = 1.0 - (1.0 - dragRaw) * constrain(stepScale, 0, 1);
+	  // Scale per-step density forces/damping by the global time scale.
+	  // Otherwise, when `stepScale` is small, viscosity can "pin" velocities to ~0 and look frozen.
+	  const densityPressureEff = densityPressure * constrain(stepScale, 0, 1);
+	  const densityViscosityEff = densityViscosity * constrain(stepScale, 0, 1);
+	  const denseVelSmoothEff = denseVelSmooth * constrain(stepScale, 0, 1);
+	  const params = {
+	    dt,
+	    drag,
+	    cx: T.c.x,
+	    cy: T.c.y,
+	    radius: T.radius,
+	    w: width,
+	    h: height,
     // STEP 6B: spiral/orbit force (ported from applyCalmOrbit, without per-kind modifiers).
     spiralEnable: !!WORKER_SPIRAL,
     spiralSwirl: (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * 0.40,
@@ -814,12 +833,16 @@ function postStep() {
     mag: +mag || 0.0,
     h_ions: +h_ions || 0.0,
     electrons: +electrons || 0.0,
-    protons: +protons || 0.0,
-    fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
-    enableDensity: !!enableDensity,
-    enableAgeSpiral: !!enableAgeSpiral,
-    enableCohesion: !!enableCohesion,
-    enableXrayBlobForce: !!enableXrayBlobForce,
+	    protons: +protons || 0.0,
+	    fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
+	    enableDensity: !!enableDensity,
+	    densityPressure: densityPressureEff,
+	    densityViscosity: densityViscosityEff,
+	    denseVelSmooth: denseVelSmoothEff,
+	    stepScale,
+	    enableAgeSpiral: !!enableAgeSpiral,
+	    enableCohesion: !!enableCohesion,
+	    enableXrayBlobForce: !!enableXrayBlobForce,
     // Age spiral constants
     ageWindow: AGE_WINDOW_FRAMES,
     ageOuterFrac: AGE_OUTER_FRAC,
@@ -1263,6 +1286,7 @@ function drawProfilerHUD() {
 
 // ---------- Proxies ----------
 let xray = 0, mag = 0, h_ions = 0, electrons = 0, protons = 0, overallAmp = 0;
+let xBandPrev = 0; // raw (unsmoothed) xray-band history for honest spike detection
 let raw = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
 let state = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
 let prevState = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
@@ -1293,8 +1317,8 @@ let faceRowCursor = 1;
 
 // Space-field motion controls (global multipliers).
 // Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
-let SPACE_SWIRL_MULT = 1.0;    // tangential orbit strength
-let SPACE_DRIFTIN_MULT = 0.80;  // inward spiral strength
+let SPACE_SWIRL_MULT = (CLOCK_TUNING && typeof CLOCK_TUNING.spaceSwirlMult === "number") ? CLOCK_TUNING.spaceSwirlMult : 1.0; // tangential orbit strength
+let SPACE_DRIFTIN_MULT = (CLOCK_TUNING && typeof CLOCK_TUNING.spaceDriftInMult === "number") ? CLOCK_TUNING.spaceDriftInMult : 0.70; // inward spiral strength
 let SPACE_JITTER_MULT = 1.0;   // micro-turbulence strength
 
 // Age spiral: newest near rim, oldest toward center (independent of kind).
@@ -1422,7 +1446,9 @@ const XRAY_PULSE_SPEED_RAND = 0.35;    // random speed component
 const XRAY_PULSE_SPEED_SPIKE = 0.85;   // extra speed at s=1
 const XRAY_PULSE_TANGENTIAL = 0.45;    // tangential bias around blob center
 // X-ray burst shaping: make spikes form ONE compact blob (not a streak dragged by the fast second hand).
-const XRAY_BASELINE_EMIT_MULT = 0.08; // keep a faint background xray drizzle from hands; events are the main signal
+// X-ray should read as "pulses/jumps" (events) rather than a constant drizzle.
+// Keep baseline from hands at zero; bursts/events create the visible x-ray signatures.
+const XRAY_BASELINE_EMIT_MULT = 0.0;
 const XRAY_BURST_SPIKE_MIN = 0.06; // trigger only on sharp rises (derivative), not sustained highs
 const XRAY_BURST_COOLDOWN_FRAMES = 26; // refractory period to avoid "trail lines" from repeated bursts
 const XRAY_BURST_FRAMES_BASE = 16;
@@ -1917,7 +1943,7 @@ const COLLISION_RADIUS_SCALE = 2;
 const DENSITY_W = 64;
 const DENSITY_H = 64;
 const DENSITY_UPDATE_EVERY = 2;
-const DENSITY_PRESSURE = 0.04;
+const DENSITY_PRESSURE = (CLOCK_TUNING && typeof CLOCK_TUNING.densityPressure === "number") ? CLOCK_TUNING.densityPressure : 0.06;
 const DENSE_DISABLE_COHESION = false;
 // Density grids (per-kind + total) for cross-kind "one medium" coupling.
 let densAll = null;
@@ -1927,9 +1953,9 @@ let densProtons = null;
 let densHIons = null;
 let densMag = null;
 let densityGridFrame = -1;
-const DENSITY_VISCOSITY = 0.30;
+const DENSITY_VISCOSITY = (CLOCK_TUNING && typeof CLOCK_TUNING.densityViscosity === "number") ? CLOCK_TUNING.densityViscosity : 0.30;
 const DENSITY_DAMPING = 0.35;
-const DENSE_VEL_SMOOTH = 0.60;
+const DENSE_VEL_SMOOTH = (CLOCK_TUNING && typeof CLOCK_TUNING.denseVelSmooth === "number") ? CLOCK_TUNING.denseVelSmooth : 0.60;
 
 const DENSITY_KINDS = ["xray", "electrons", "protons", "h_ions", "mag"];
 const DENSITY_COUPLING = {
@@ -1942,9 +1968,12 @@ const DENSITY_COUPLING = {
   mag:       { xray: 0.10, electrons: 0.08, protons: 0.18, h_ions: 0.10, mag: 0.00 },
 };
 
-const ELECTRON_TREMOR_COUPLING = 0.45; // adds diffusion/noise to others via electrons gradient
-const HION_FLOW_COUPLING = 0.28;       // adds "streamline" bias via h_ions gradient
-const MAG_ALIGN_COUPLING = 0.12;       // alignment steering strength from local mag density
+const ELECTRON_TREMOR_COUPLING =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.electronTremorCoupling === "number") ? CLOCK_TUNING.electronTremorCoupling : 0.45; // adds diffusion/noise to others via electrons gradient
+const HION_FLOW_COUPLING =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.hionFlowCoupling === "number") ? CLOCK_TUNING.hionFlowCoupling : 0.28; // adds "streamline" bias via h_ions gradient
+const MAG_ALIGN_COUPLING =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.magAlignCoupling === "number") ? CLOCK_TUNING.magAlignCoupling : 0.12; // alignment steering strength from local mag density
 const XRAY_EVENT_SHOCK_BOOST = 1.6;    // boosts xray coupling during events
 const DENSITY_COUPLING_ENABLE_AT = 0.06; // enable coupling once chamber has a little mass
 
@@ -1978,13 +2007,19 @@ let debugPerfHUD = false;
 let debugPoolHUD = false;
 let enableDensity = true;
 let enableCollisions = true;
-let enableAgeSpiral = true;
-let enableCohesion = true;
-let enableXrayBlobForce = true;
-let handParticles = { hour: [], minute: [], second: [] };
-let handSlots = { hour: null, minute: null, second: null };
-let handSlotMeta = { hour: null, minute: null, second: null };
-let handFill = { hour: 0, minute: 0, second: 0 };
+	let enableAgeSpiral = true;
+	let enableCohesion = true;
+	let enableXrayBlobForce = true;
+	let emitCarry = { hour: 0, minute: 0, second: 0 };
+	let emitKindCarry = {
+	  hour:   { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	  minute: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	  second: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	};
+	let handParticles = { hour: [], minute: [], second: [] };
+	let handSlots = { hour: null, minute: null, second: null };
+	let handSlotMeta = { hour: null, minute: null, second: null };
+	let handFill = { hour: 0, minute: 0, second: 0 };
 
 // Visual-system arrays used by resetVisualSystems().
 let jets = [];
@@ -1994,6 +2029,7 @@ let ripples = [];
 // Persistent energy field
 let field, fieldW = 0, fieldH = 0;
 let fieldBuf, fieldBuf2;
+let fieldImgData;
 let faceLogOnce = false;
 
 // UI
@@ -2146,10 +2182,10 @@ function ensureParticleGraphics() {
 
 function ensureFaceField() {
   const next = ensureFaceFieldCore(
-    { field, fieldW, fieldH, fieldBuf, fieldBuf2, faceLogOnce },
+    { field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, faceLogOnce },
     { FACE_SCALE, setCanvasWillReadFrequently }
   );
-  ({ field, fieldW, fieldH, fieldBuf, fieldBuf2, faceLogOnce } = next);
+  ({ field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, faceLogOnce } = next);
 }
 
 function ensureParticleGL() {
@@ -4018,11 +4054,16 @@ function draw() {
     }
   }
 
-  profStart("background");
-  const tBg0 = PROF_LITE ? profLiteNow() : 0;
-  background(...COL.bg);
-  if (PROF_LITE) profLite.backgroundMs = profLiteEma(profLite.backgroundMs, profLiteNow() - tBg0);
-  profEnd("background");
+	  profStart("background");
+	  const tBg0 = PROF_LITE ? profLiteNow() : 0;
+	  if (usePixiNow) {
+	    // p5 canvas is a HUD overlay above Pixi; keep it transparent.
+	    clear();
+	  } else {
+	    background(...COL.bg);
+	  }
+	  if (PROF_LITE) profLite.backgroundMs = profLiteEma(profLite.backgroundMs, profLiteNow() - tBg0);
+	  profEnd("background");
 
   // Always compute correct time (hands should never “stop rotating”)
   profStart("time");
@@ -4307,14 +4348,14 @@ function draw() {
         HAND_SIDE_SPIKE_MULT,
         computeHandBasis,
         handWidthAt,
-        handFillRatio,
-        mixEnergyColor,
-        particles,
-        SOLO_KIND,
-        PARTICLE_PROFILE,
-        kindStrength,
-        ALPHA_STRENGTH_MIX,
-        ALPHA_SCALE,
+	        handFillRatio,
+	        mixEnergyColor,
+	        particles,
+	        SOLO_KIND: VIEW_SOLO_KIND,
+	        PARTICLE_PROFILE,
+	        kindStrength,
+	        ALPHA_STRENGTH_MIX,
+	        ALPHA_SCALE,
         PARTICLE_SIZE_SCALE,
         renderStamp,
         millisFn: millis,
@@ -4552,10 +4593,17 @@ function resetVisualSystems() {
   particles.length = 0;
   particlesActive = 0;
   handParticles = { hour: [], minute: [], second: [] };
-  handSlots = { hour: null, minute: null, second: null };
-  handSlotMeta = { hour: null, minute: null, second: null };
-  handFill = { hour: 0, minute: 0, second: 0 };
-  xrayBlobs = [];
+	  handSlots = { hour: null, minute: null, second: null };
+	  handSlotMeta = { hour: null, minute: null, second: null };
+	  handFill = { hour: 0, minute: 0, second: 0 };
+	  emitCarry = { hour: 0, minute: 0, second: 0 };
+	  emitKindCarry = {
+	    hour:   { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	    minute: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	    second: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	  };
+	  VIEW_SOLO_KIND = null;
+	  xrayBlobs = [];
   xrayBlobIndex = new Map();
   xraySegments = [];
   xraySegIndex = new Map();
@@ -4590,9 +4638,8 @@ function updateAudioFeatures() {
   const aE = constrain(level * 4.0, 0, 1);
 
   // shape
-  // PERF/VIS: boost low x-ray values so typical tracks still produce visible X-ray activity.
-  // (Same band mapping; just a gentler curve than pow(...,1.15) which suppresses lows.)
-  const xRaw = constrain(pow(xE, 0.72) * 1.25, 0, 1);
+  // Keep x-ray band "honest" to the sound (no low-end boost); x-ray visuals come mainly from spikes.
+  const xRaw = constrain(pow(xE, 1.15), 0, 1);
   const mRaw = pow(mE, 1.0);
   const hRaw = pow(hE, 1.05);
   const eRaw = pow(eE, 1.05);
@@ -4606,8 +4653,9 @@ function updateAudioFeatures() {
   protons   = lerp(protons,   pRaw, SMOOTH_SLOW);
   h_ions    = lerp(h_ions,    hRaw, SMOOTH_SLOW);
   overallAmp= lerp(overallAmp, aE,  SMOOTH_FAST);
-  // Raw spike measure (before global compression) to drive bursts even when baseline xray is low.
-  const xSpikeRaw = max(0, xRaw - prevX);
+  // Honest spike measure from the raw band (before smoothing/compression).
+  const xSpikeRaw = max(0, xE - xBandPrev);
+  xBandPrev = xE;
 
   // Global reactivity boost with soft-knee to avoid saturating at 1.0.
   const react = (v) => {
@@ -4639,9 +4687,9 @@ function updateAudioFeatures() {
   }
 
   if (!xrayBurst && nowF >= xrayBurstCooldownUntil && CURRENT_T && CURRENT_T.secP) {
-    const spike01 = constrain(xSpikeRaw * 6.0, 0, 1);
+    const spike01 = constrain(xSpikeRaw * 9.0, 0, 1);
     if (spike01 >= XRAY_BURST_SPIKE_MIN) {
-      const s = constrain(max(spike01, changeEmph.xray * 0.65), 0, 1);
+      const s = spike01;
       const dur = floor(lerp(XRAY_BURST_FRAMES_BASE, XRAY_BURST_FRAMES_MAX, pow(s, 0.85)));
       const rawCount = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
       const startCount = max(XRAY_EVENT_MIN_COUNT, floor(rawCount * PARTICLE_SCALE * XRAY_EVENT_COUNT_SCALE));
@@ -4675,7 +4723,7 @@ function fallbackFeatures() {
 
 // ---------- Face field ----------
 function updateFaceFieldChunk(yStart, yEnd) {
-  updateFaceFieldChunkCore({ field, fieldW, fieldH, fieldBuf, fieldBuf2 }, yStart, yEnd, {
+  updateFaceFieldChunkCore({ field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData }, yStart, yEnd, {
     h_ions,
     protons,
     COL,
@@ -4695,7 +4743,7 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
 }
 
 // ---------- Emission ----------
-function emitEnergy(T) {
+	function emitEnergy(T) {
   // Make it feel “full”. Lower base to reduce overall particle count (bigger particles)
   const base = 4;
   let rate = base + overallAmp * 40 + electrons * 30 + h_ions * 18;
@@ -4711,20 +4759,39 @@ function emitEnergy(T) {
     const throttle = (fps < 30) ? 0.4 : (fps < 45 ? 0.7 : 1.0);
     rate *= throttle;
   }
-  // Apply global particle count scale (reduce emission by scale)
-  rate *= PARTICLE_SCALE;
-  // Temporary emission throttle under sustained frame budget pressure.
-  rate *= spawnThrottleScale;
+	  // Apply global particle count scale (reduce emission by scale)
+	  rate *= PARTICLE_SCALE;
+	  // Temporary emission throttle under sustained frame budget pressure.
+	  rate *= spawnThrottleScale;
 
-  emitFromHand(T, "hour",   rate * 0.75);
-  emitFromHand(T, "minute", rate * 0.95);
-  emitFromHand(T, "second", rate * 1.20);
-  // Do not hard-cap here; capacity control is handled in enforceCapacity().
-}
+	  // Target average lifetime at ~100% fill by scaling total emission.
+	  // In this sketch, particles mostly die only when overflow is pruned, so steady-state
+	  // average lifetime ~= CAPACITY / spawnsPerSecond.
+	  if (TIME_TUNING && TIME_TUNING.lifetimeControlEnabled) {
+	    const lifeSec = +TIME_TUNING.particleLifetimeSec || 0;
+	    if (lifeSec > 1) {
+	      const fpsEff = (typeof fps10 === "number" && isFinite(fps10) && fps10 > 0) ? fps10 : frameRate();
+	      const fpsUse = max(1, fpsEff || 60);
+	      const desiredPerFrame = (CAPACITY / lifeSec) / fpsUse;
+	      // `rate` is the per-hand base; total is roughly (0.75+0.95+1.20)=2.90x.
+	      const currentPerFrame = max(1e-6, rate * 2.90);
+	      let s = desiredPerFrame / currentPerFrame;
+	      const sMin = (typeof TIME_TUNING.lifetimeScaleMin === "number") ? TIME_TUNING.lifetimeScaleMin : 0.05;
+	      const sMax = (typeof TIME_TUNING.lifetimeScaleMax === "number") ? TIME_TUNING.lifetimeScaleMax : 2.0;
+	      s = constrain(s, sMin, sMax);
+	      rate *= s;
+	    }
+	  }
 
-function allocateCounts(total, weightsByKind) {
-  const n = max(0, floor(total));
-  if (n <= 0) return { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
+	  emitFromHand(T, "hour",   rate * 0.75);
+	  emitFromHand(T, "minute", rate * 0.95);
+	  emitFromHand(T, "second", rate * 1.20);
+	  // Do not hard-cap here; capacity control is handled in enforceCapacity().
+	}
+
+	function allocateCounts(total, weightsByKind) {
+	  const n = max(0, floor(total));
+	  if (n <= 0) return { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
 
   let sum = 0;
   // PERF: fixed order, no arrays/sorts per frame.
@@ -4746,10 +4813,10 @@ function allocateCounts(total, weightsByKind) {
   let fP = rP - bP,  fH = rH - bH,  fM = rM - bM,  fE = rE - bE,  fX = rX - bX;
   let baseSum = bP + bH + bM + bE + bX;
 
-  let rem = n - baseSum;
-  if (rem > 0) {
-    // Distribute remainder to the highest fractional parts (only 5 kinds => cheap linear scans).
-    for (let k = 0; k < 5 && rem > 0; k++) {
+	  let rem = n - baseSum;
+	  if (rem > 0) {
+	    // Distribute remainder to the highest fractional parts (only 5 kinds => cheap linear scans).
+	    for (let k = 0; k < 5 && rem > 0; k++) {
       let best = fP, which = 0;
       if (fH > best) { best = fH; which = 1; }
       if (fM > best) { best = fM; which = 2; }
@@ -4761,22 +4828,63 @@ function allocateCounts(total, weightsByKind) {
       else if (which === 2) { bM++; fM = -1; }
       else if (which === 3) { bE++; fE = -1; }
       else { bX++; fX = -1; }
-      rem--;
-    }
-  }
+	      rem--;
+	    }
+	  }
 
-  return {
-    protons: bP,
-    h_ions: bH,
-    mag: bM,
+	  // Ensure low-weight kinds still appear when we're emitting enough particles overall.
+	  // This avoids "never see mag/h_ions" when `n` is small and rounding favors dominant kinds.
+	  if (n >= 3) {
+	    const wantProton = (weightsByKind.protons || 0) > 1e-6;
+	    const wantHIon = (weightsByKind.h_ions || 0) > 1e-6;
+	    const wantMag = (weightsByKind.mag || 0) > 1e-6;
+
+	    const stealOne = (exclude) => {
+	      // Prefer stealing from the largest bucket so totals stay stable.
+	      // Never steal from the bucket we are trying to ensure.
+	      let which = null;
+	      let best = -1;
+	      const consider = (name, v) => {
+	        if (exclude && exclude[name]) return;
+	        if (v > best) { best = v; which = name; }
+	      };
+	      consider("protons", bP);
+	      consider("electrons", bE);
+	      consider("xray", bX);
+	      consider("h_ions", bH);
+	      consider("mag", bM);
+	      if (!which || best <= 1) return null; // don't zero out a bucket
+	      if (which === "protons") bP--;
+	      else if (which === "electrons") bE--;
+	      else if (which === "xray") bX--;
+	      else if (which === "h_ions") bH--;
+	      else if (which === "mag") bM--;
+	      return which;
+	    };
+
+	    if (wantProton && bP === 0) {
+	      if (stealOne({ protons: true })) bP = 1;
+	    }
+	    if (wantHIon && bH === 0) {
+	      if (stealOne({ h_ions: true })) bH = 1;
+	    }
+	    if (wantMag && bM === 0) {
+	      if (stealOne({ mag: true })) bM = 1;
+	    }
+	  }
+
+	  return {
+	    protons: bP,
+	    h_ions: bH,
+	    mag: bM,
     electrons: bE,
     xray: bX,
   };
 }
 
-function emitFromHand(T, which, rate) {
-  const w = HAND_W[which];
-  const head = (which === "hour") ? T.hourP : (which === "minute") ? T.minP : T.secP;
+	function emitFromHand(T, which, rate) {
+	  const w = HAND_W[which];
+	  const head = (which === "hour") ? T.hourP : (which === "minute") ? T.minP : T.secP;
 
   // PERF: scalar basis (avoids p5.Vector allocations in hot spawn loop).
   const dx = head.x - T.c.x;
@@ -4791,13 +4899,25 @@ function emitFromHand(T, which, rate) {
   // Using pow(random(), k) makes values cluster near 1.0
   const headBiasK = 3.2;
 
-  // How much each parameter contributes (hand weights * proxies)
-  // Keep baseline x-ray low (events/spikes are the readable signature).
-  const wx = w.x * xray * XRAY_BASELINE_EMIT_MULT;
-  const wm = w.m * mag;
-  const wh = w.h * h_ions;
-  const we = w.e * electrons;
-  const wp = w.p * protons;
+	  // How much each parameter contributes (hand weights * proxies)
+	  // Keep baseline x-ray low (events/spikes are the readable signature).
+	  const wx = w.x * xray * XRAY_BASELINE_EMIT_MULT;
+	  const pBase = (EMIT_TUNING?.baseline?.protons || 0);
+	  const hBase = (EMIT_TUNING?.baseline?.h_ions || 0);
+	  const eBase = (EMIT_TUNING?.baseline?.electrons || 0);
+	  const mBase = (EMIT_TUNING?.baseline?.mag || 0);
+	  const pMul = (EMIT_TUNING?.mult?.protons || 1);
+	  const hMul = (EMIT_TUNING?.mult?.h_ions || 1);
+	  const eMul = (EMIT_TUNING?.mult?.electrons || 1);
+	  const mMul = (EMIT_TUNING?.mult?.mag || 1);
+	  const protonsEff = constrain(protons + pBase, 0, 1) * pMul;
+	  const hIonsEff = constrain(h_ions + hBase, 0, 1) * hMul;
+	  const electronsEff = constrain(electrons + eBase, 0, 1) * eMul;
+	  const magEff = constrain(mag + mBase, 0, 1) * mMul;
+	  const wm = w.m * magEff;
+	  const wh = w.h * hIonsEff;
+	  const we = w.e * electronsEff;
+	  const wp = w.p * protonsEff;
   const cx = w.x * changeEmph.xray;
   const cm = w.m * changeEmph.mag;
   const ch = w.h * changeEmph.h_ions;
@@ -4810,19 +4930,55 @@ function emitFromHand(T, which, rate) {
   const stiffness = 0.35 + protons * 0.65;
   const spread = (1.0 + electrons * 2.2 + mag * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
 
-  const count = floor(rate);
-  let kindSequence = [];
+	  // Support fractional emission rates (needed for slow time / long lifetimes).
+	  // Without this, rates < 1 would floor to 0 and appear "frozen".
+	  const carry = (emitCarry && typeof emitCarry[which] === "number") ? emitCarry[which] : 0;
+	  const total = max(0, rate + carry);
+	  const count = floor(total);
+	  if (emitCarry) emitCarry[which] = total - count;
+	  let kindSequence = [];
   {
-    const counts = allocateCounts(count, { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx });
-    for (const k of ["protons", "h_ions", "mag", "electrons", "xray"]) {
-      for (let j = 0; j < (counts[k] || 0); j++) kindSequence.push(k);
+    // Use per-kind quota carry so low-weight kinds (mag/h_ions) still appear even when
+    // `count` is small due to slow time / long lifetimes.
+    const weights = { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx };
+    let sumW = 0;
+    sumW += max(0, weights.protons || 0);
+    sumW += max(0, weights.h_ions || 0);
+    sumW += max(0, weights.mag || 0);
+    sumW += max(0, weights.electrons || 0);
+    sumW += max(0, weights.xray || 0);
+
+    if (!emitKindCarry || !emitKindCarry[which]) {
+      emitKindCarry = emitKindCarry || {};
+      emitKindCarry[which] = { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
     }
-    // Randomize order so types are interleaved but total proportions stay exact.
-    for (let i = kindSequence.length - 1; i > 0; i--) {
-      const j = floor(random() * (i + 1));
-      const tmp = kindSequence[i];
-      kindSequence[i] = kindSequence[j];
-      kindSequence[j] = tmp;
+
+    if (count > 0) {
+      const carryK = emitKindCarry[which];
+      if (sumW <= 1e-9) {
+        // Fallback: all protons.
+        carryK.protons += count;
+      } else {
+        carryK.protons += (max(0, weights.protons || 0) / sumW) * count;
+        carryK.h_ions += (max(0, weights.h_ions || 0) / sumW) * count;
+        carryK.mag += (max(0, weights.mag || 0) / sumW) * count;
+        carryK.electrons += (max(0, weights.electrons || 0) / sumW) * count;
+        carryK.xray += (max(0, weights.xray || 0) / sumW) * count;
+      }
+
+      // Emit exactly `count` particles by taking from the kind with the highest accumulated quota.
+      // This is deterministic and prevents starvation of subtle kinds.
+      for (let i = 0; i < count; i++) {
+        let bestKind = "protons";
+        let best = carryK.protons;
+        if (carryK.h_ions > best) { best = carryK.h_ions; bestKind = "h_ions"; }
+        if (carryK.mag > best) { best = carryK.mag; bestKind = "mag"; }
+        if (carryK.electrons > best) { best = carryK.electrons; bestKind = "electrons"; }
+        if (carryK.xray > best) { best = carryK.xray; bestKind = "xray"; }
+
+        kindSequence.push(bestKind);
+        carryK[bestKind] -= 1;
+      }
     }
   }
 
@@ -4859,9 +5015,9 @@ function emitFromHand(T, which, rate) {
     }
     if (!accepted) continue;
 
-    // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
-    let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
-    let vy = diry * (1.4 + random(1.8) + overallAmp * 2.2) + nrmy * ((random() - 0.5) * (0.8 + mag * 1.6));
+	    // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
+	    let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
+	    let vy = diry * (1.4 + random(1.8) + overallAmp * 2.2) + nrmy * ((random() - 0.5) * (0.8 + mag * 1.6));
 
     // parameter-specific feel (subtle—clock stays readable)
     if (kind === "xray") {    // sharp, fast
@@ -4883,14 +5039,17 @@ function emitFromHand(T, which, rate) {
       vx *= 0.85;
       vy *= 0.85;
     }
-    if (kind === "mag") {
-      const ang = (random() - 0.5) * 0.25 * mag;
-      const ca = cos(ang), sa = sin(ang);
-      const nvx = vx * ca - vy * sa;
-      const nvy = vx * sa + vy * ca;
-      vx = nvx;
-      vy = nvy;
-    }
+	    if (kind === "mag") {
+	      const ang = (random() - 0.5) * 0.25 * mag;
+	      const ca = cos(ang), sa = sin(ang);
+	      const nvx = vx * ca - vy * sa;
+	      const nvy = vx * sa + vy * ca;
+	      vx = nvx;
+	      vy = nvy;
+	    }
+
+		    // Global motion slow-down is applied in the integration step (worker/main), not here,
+		    // to avoid double-scaling (spawn velocity *and* integration).
 
     // Lifetime / size per type
     // Keep effectively infinite; only pruning should reduce life.
@@ -5108,8 +5267,14 @@ function updateParticles(T) {
   const smoothDense = denseMode && DENSE_SMOOTH_FLOW;
   const smoothAll = GLOBAL_SMOOTH_FLOW || smoothDense;
 
-  const drag = 0.985 + protons * 0.01;
-  const swirlBoost = 1.0 + mag * 0.8;
+	  const dragBase = (CLOCK_TUNING && typeof CLOCK_TUNING.dragBase === "number") ? CLOCK_TUNING.dragBase : 0.985;
+	  const dragProtonsAdd = (CLOCK_TUNING && typeof CLOCK_TUNING.dragProtonsAdd === "number") ? CLOCK_TUNING.dragProtonsAdd : 0.01;
+	  const swirlMagMult = (CLOCK_TUNING && typeof CLOCK_TUNING.swirlMagMult === "number") ? CLOCK_TUNING.swirlMagMult : 0.8;
+	  const stepScale = (TIME_TUNING && typeof TIME_TUNING.motionStepScale === "number") ? TIME_TUNING.motionStepScale : 1.0;
+	  const dragRaw = dragBase + protons * dragProtonsAdd;
+	  // When slowing motion, reduce per-frame damping proportionally so particles don't "stick" visually.
+	  const drag = 1.0 - (1.0 - dragRaw) * constrain(stepScale, 0, 1);
+	  const swirlBoost = 1.0 + mag * swirlMagMult;
   const cohesionCellSize = 110;
   const cohesionGrid = getCohesionGrid(particles, cohesionCellSize);
   const stridePhase = frameCount % COHESION_APPLY_STRIDE;

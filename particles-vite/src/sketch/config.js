@@ -147,3 +147,60 @@ export const CAPACITY_DYNAMIC_STEP_UP = 60;   // particles/sec (slow increase)
 export const CAPACITY_DYNAMIC_STEP_DOWN_MIN = 80;
 export const CAPACITY_DYNAMIC_STEP_DOWN_MAX = 220;
 export const CAPACITY_DYNAMIC_STEP_DOWN_K = 80; // extra step per FPS below target
+
+// Motion/space tuning (visual, not business logic).
+// Goal: calmer clock space + more uniform fill (less empty areas).
+export const CLOCK_TUNING = {
+  // Overall damping / orbit
+  dragBase: 0.978,
+  dragProtonsAdd: 0.008,
+  swirlMagMult: 0.45,
+  spaceSwirlMult: 0.85,
+  spaceDriftInMult: 0.55,
+
+  // Density coupling (uniformity vs turbulence)
+  densityPressure: 0.055,
+  densityViscosity: 0.40,
+  denseVelSmooth: 0.75,
+  electronTremorCoupling: 0.16,
+  hionFlowCoupling: 0.14,
+  magAlignCoupling: 0.08,
+};
+
+// Global time scaling.
+// Goal: slow motion + slow turnover without changing "what happens", only "how fast".
+export const TIME_TUNING = {
+  // Scales positional integration (lower = slower movement).
+  motionStepScale: 0.35,
+  // Target average particle "lifetime" at steady-state full chamber (seconds).
+  // Note: particles are pruned when over capacity; this value is enforced by emission scaling.
+  particleLifetimeSec: 240, // 4 minutes
+  // Enable emission scaling to hit `particleLifetimeSec` at ~100% fill.
+  lifetimeControlEnabled: true,
+  // Clamp emission scaling so audio still influences rate.
+  lifetimeScaleMin: 0.05,
+  lifetimeScaleMax: 2.0,
+};
+
+// Emission tuning (visual balance of particle kinds).
+export const EMIT_TUNING = {
+  // Baseline offsets added to audio-derived band strengths (clamped 0..1).
+  // Helps ensure visible flow of these kinds even on tracks where a band is quiet.
+  baseline: {
+    // Keep protons present even on quiet low-bass tracks (stable "mass/pressure").
+    protons: 0.18,
+    // Medium baseline so hydrogen flow is visible but not dominant.
+    h_ions: 0.18,
+    // Electrons should be common but mostly driven by continuous high-energy content.
+    electrons: 0.10,
+    // Magnetism is the most stable/slow; keep it subtle.
+    mag: 0.09,
+  },
+  // Multipliers applied after baseline; use to bias composition without increasing total emission.
+  mult: {
+    protons: 1.35,
+    h_ions: 1.45,
+    electrons: 1.30,
+    mag: 1.25,
+  },
+};

@@ -1,7 +1,13 @@
 export function ensureFaceField(state, { FACE_SCALE, setCanvasWillReadFrequently }) {
   const w = max(1, floor(width * FACE_SCALE));
   const h = max(1, floor(height * FACE_SCALE));
-  if (state.field && state.field.width === w && state.field.height === h) return state;
+  if (state.field && state.field.width === w && state.field.height === h && state.fieldImgData) return state;
+  if (state.field && state.field.width === w && state.field.height === h) {
+    const fieldImgData = state.field.drawingContext?.createImageData
+      ? state.field.drawingContext.createImageData(w, h)
+      : null;
+    return { ...state, fieldImgData };
+  }
 
   const fieldW = w;
   const fieldH = h;
@@ -11,12 +17,15 @@ export function ensureFaceField(state, { FACE_SCALE, setCanvasWillReadFrequently
 
   const fieldBuf = new Float32Array(fieldW * fieldH * 3);
   const fieldBuf2 = new Float32Array(fieldW * fieldH * 3);
+  const fieldImgData = field.drawingContext?.createImageData
+    ? field.drawingContext.createImageData(fieldW, fieldH)
+    : null;
 
   if (!state.faceLogOnce) {
     console.log("[face]", { FACE_SCALE, fieldW: field.width, fieldH: field.height });
   }
 
-  return { ...state, field, fieldW, fieldH, fieldBuf, fieldBuf2, faceLogOnce: true };
+  return { ...state, field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, faceLogOnce: true };
 }
 
 export function updateFaceFieldChunk(state, yStart, yEnd, { h_ions, protons, COL }) {
@@ -58,8 +67,25 @@ export function updateFaceFieldChunk(state, yStart, yEnd, { h_ions, protons, COL
   // global hydrogen fog bias (chunked)
   addGlobalFogChunk(state, 0.0015 + h_ions * 0.010, y0, y1, COL);
 
-  // render chunk to graphics
-  state.field.loadPixels();
+  // render chunk to graphics without readback (avoids p5 loadPixels/getImageData warning)
+  const img = state.fieldImgData;
+  const ctx = state.field?.drawingContext;
+  if (!img || !ctx || !img.data) return;
+
+  const bg = COL.bg;
+  const bgKey = `${bg[0]},${bg[1]},${bg[2]}`;
+  if (img._bgKey !== bgKey) {
+    const data = img.data;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i + 0] = bg[0];
+      data[i + 1] = bg[1];
+      data[i + 2] = bg[2];
+      data[i + 3] = 255;
+    }
+    img._bgKey = bgKey;
+  }
+
+  const data = img.data;
   for (let y = y0; y < y1; y++) {
     for (let x = 0; x < fieldW; x++) {
       const idx = (x + y * fieldW) * 3;
@@ -67,15 +93,14 @@ export function updateFaceFieldChunk(state, yStart, yEnd, { h_ions, protons, COL
       let g = 1.0 - exp(-state.fieldBuf[idx + 1] * 0.85);
       let b = 1.0 - exp(-state.fieldBuf[idx + 2] * 0.85);
 
-      const base = COL.bg;
       const p = 4 * (x + y * fieldW);
-      state.field.pixels[p + 0] = constrain(base[0] + r * 220, 0, 255);
-      state.field.pixels[p + 1] = constrain(base[1] + g * 220, 0, 255);
-      state.field.pixels[p + 2] = constrain(base[2] + b * 220, 0, 255);
-      state.field.pixels[p + 3] = 255;
+      data[p + 0] = constrain(bg[0] + r * 220, 0, 255);
+      data[p + 1] = constrain(bg[1] + g * 220, 0, 255);
+      data[p + 2] = constrain(bg[2] + b * 220, 0, 255);
+      data[p + 3] = 255;
     }
   }
-  state.field.updatePixels();
+  ctx.putImageData(img, 0, 0, 0, y0, fieldW, y1 - y0);
 }
 
 export function addGlobalFog(state, amount, COL) {
@@ -127,4 +152,3 @@ export function injectFieldAtScreenPos(state, x, y, rgb, strength) {
     }
   }
 }
-
