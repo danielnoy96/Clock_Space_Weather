@@ -204,3 +204,8 @@ export const EMIT_TUNING = {
     mag: 1.25,
   },
 };
+
+// Rendering-only knobs (do not affect physics / collisions)
+export const PARTICLE_RENDER_SCALE = 1.0;
+// Pixi point-sprite base texture diameter (increase to reduce blur when upscaling).
+export const PARTICLE_TEXTURE_DIAMETER = 64;

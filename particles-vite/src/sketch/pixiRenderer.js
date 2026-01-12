@@ -12,6 +12,7 @@ import {
   Sprite,
   Texture,
   TextureStyle,
+  TextureSource,
 } from "pixi.js";
 
 const KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
@@ -193,6 +194,10 @@ function rgbToHex([r, g, b]) {
   return ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
 }
 
+function clamp255(v) {
+  return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
 function createSoftCircleTexture(diameter = 64) {
   const d = Math.max(8, diameter | 0);
   const c = document.createElement("canvas");
@@ -232,6 +237,66 @@ function ensureCanvasSpriteTexture(sprite, canvas) {
   // Keep CanvasSource in sync when p5 mutates pixels.
   const src = sprite.texture?.source;
   if (src && typeof src.update === "function") src.update();
+}
+
+function ensureFaceFieldBufferTexture(state, fieldW, fieldH, bg) {
+  if (!state || !state.field) return;
+
+  const bgKey = bg ? `${bg[0]},${bg[1]},${bg[2]}` : "0,0,0";
+
+  const needsRecreate =
+    !state.field.sprite ||
+    !state.field.source ||
+    !state.field.buf ||
+    state.field.bufW !== fieldW ||
+    state.field.bufH !== fieldH;
+
+  if (needsRecreate) {
+    const buf = new Uint8ClampedArray(fieldW * fieldH * 4);
+    const r0 = bg ? bg[0] : 0;
+    const g0 = bg ? bg[1] : 0;
+    const b0 = bg ? bg[2] : 0;
+    for (let i = 0; i < buf.length; i += 4) {
+      buf[i + 0] = r0;
+      buf[i + 1] = g0;
+      buf[i + 2] = b0;
+      buf[i + 3] = 255;
+    }
+
+    const source = TextureSource.from({
+      resource: buf,
+      width: fieldW,
+      height: fieldH,
+    });
+
+    const texture = new Texture({ source });
+    const sprite = new Sprite(texture);
+    state.field.layer.removeChildren();
+    state.field.layer.addChild(sprite);
+
+    state.field.sprite = sprite;
+    state.field.source = source;
+    state.field.buf = buf;
+    state.field.bufW = fieldW;
+    state.field.bufH = fieldH;
+    state.field.bgKey = bgKey;
+    return;
+  }
+
+  if (state.field.bgKey !== bgKey) {
+    const buf = state.field.buf;
+    const r0 = bg ? bg[0] : 0;
+    const g0 = bg ? bg[1] : 0;
+    const b0 = bg ? bg[2] : 0;
+    for (let i = 0; i < buf.length; i += 4) {
+      buf[i + 0] = r0;
+      buf[i + 1] = g0;
+      buf[i + 2] = b0;
+      buf[i + 3] = 255;
+    }
+    state.field.bgKey = bgKey;
+    state.field.source.update();
+  }
 }
 
 export async function initPixiRenderer({ parent, width, height }) {
@@ -362,6 +427,12 @@ export function renderPixiFrame(state, opts) {
   const {
     fieldGraphics,
     clockStaticGraphics,
+    faceFieldBuf,
+    faceFieldW,
+    faceFieldH,
+    faceUpdatedThisFrame,
+    faceUpdateY0,
+    faceUpdateY1,
     canvasW,
     canvasH,
     T,
@@ -397,15 +468,53 @@ export function renderPixiFrame(state, opts) {
     gfx.rect(0, 0, canvasW, canvasH).fill({ color: bgCol, alpha: 1 });
   }
 
-  // Face field (p5.Graphics -> canvas texture)
+  // Face field (prefer buffer texture; fallback to p5.Graphics -> canvas texture)
   {
-    const canvas = canvasFromP5Graphics(fieldGraphics);
-    if (canvas) {
-      if (!state.field.sprite) {
-        state.field.sprite = new Sprite(Texture.from(canvas));
-        state.field.layer.addChild(state.field.sprite);
+    const bg = (COL && COL.bg) ? COL.bg : [0, 0, 0];
+
+    if (faceFieldBuf && faceFieldW > 0 && faceFieldH > 0) {
+      ensureFaceFieldBufferTexture(state, faceFieldW, faceFieldH, bg);
+
+      if (faceUpdatedThisFrame && state.field?.buf && state.field?.source) {
+        const y0 = Math.max(1, faceUpdateY0 | 0);
+        const y1 = Math.min(faceFieldH - 1, faceUpdateY1 | 0);
+        if (y1 > y0) {
+          const buf = state.field.buf;
+          const r0 = bg[0];
+          const g0 = bg[1];
+          const b0 = bg[2];
+
+          for (let y = y0; y < y1; y++) {
+            let row3 = (y * faceFieldW) * 3;
+            let row4 = (y * faceFieldW) * 4;
+            for (let x = 0; x < faceFieldW; x++) {
+              const rr = 1.0 - Math.exp(-faceFieldBuf[row3 + 0] * 0.85);
+              const gg = 1.0 - Math.exp(-faceFieldBuf[row3 + 1] * 0.85);
+              const bb = 1.0 - Math.exp(-faceFieldBuf[row3 + 2] * 0.85);
+              buf[row4 + 0] = clamp255(r0 + rr * 220);
+              buf[row4 + 1] = clamp255(g0 + gg * 220);
+              buf[row4 + 2] = clamp255(b0 + bb * 220);
+              buf[row4 + 3] = 255;
+              row3 += 3;
+              row4 += 4;
+            }
+          }
+
+          state.field.source.update();
+        }
       }
-      ensureCanvasSpriteTexture(state.field.sprite, canvas);
+    } else {
+      const canvas = canvasFromP5Graphics(fieldGraphics);
+      if (canvas) {
+        if (!state.field.sprite) {
+          state.field.sprite = new Sprite(Texture.from(canvas));
+          state.field.layer.addChild(state.field.sprite);
+        }
+        ensureCanvasSpriteTexture(state.field.sprite, canvas);
+      }
+    }
+
+    if (state.field.sprite) {
       state.field.sprite.width = canvasW;
       state.field.sprite.height = canvasH;
       state.field.sprite.x = 0;

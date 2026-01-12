@@ -1314,6 +1314,8 @@ const DISABLE_FACE_FIELD = false;
 let faceUpdateEvery = 1;
 let faceChunkRows = 32;
 let faceRowCursor = 1;
+let faceUpdateY0 = 0;
+let faceUpdateY1 = 0;
 
 // Space-field motion controls (global multipliers).
 // Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
@@ -4275,6 +4277,8 @@ function draw() {
       const y0 = faceRowCursor;
       const y1 = min(field.height - 1, y0 + faceChunkRows);
       updateFaceFieldChunk(y0, y1);
+      faceUpdateY0 = y0;
+      faceUpdateY1 = y1;
       faceRowCursor = (y1 >= field.height - 1) ? 1 : y1;
       faceUpdatedThisFrame = true;
       if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
@@ -4337,6 +4341,12 @@ function draw() {
       renderPixiFrame(pixi, {
         fieldGraphics: field,
         clockStaticGraphics: clockStatic,
+        faceFieldBuf: fieldBuf,
+        faceFieldW: fieldW,
+        faceFieldH: fieldH,
+        faceUpdatedThisFrame,
+        faceUpdateY0,
+        faceUpdateY1,
         canvasW: width,
         canvasH: height,
         T,
@@ -4723,7 +4733,7 @@ function fallbackFeatures() {
 
 // ---------- Face field ----------
 function updateFaceFieldChunk(yStart, yEnd) {
-  updateFaceFieldChunkCore({ field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData }, yStart, yEnd, {
+  updateFaceFieldChunkCore({ field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, disableGraphics: (USE_PIXI_RENDERER && !!pixi) }, yStart, yEnd, {
     h_ions,
     protons,
     COL,

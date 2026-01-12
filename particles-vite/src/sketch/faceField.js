@@ -67,6 +67,8 @@ export function updateFaceFieldChunk(state, yStart, yEnd, { h_ions, protons, COL
   // global hydrogen fog bias (chunked)
   addGlobalFogChunk(state, 0.0015 + h_ions * 0.010, y0, y1, COL);
 
+  if (state.disableGraphics) return;
+
   // render chunk to graphics without readback (avoids p5 loadPixels/getImageData warning)
   const img = state.fieldImgData;
   const ctx = state.field?.drawingContext;
