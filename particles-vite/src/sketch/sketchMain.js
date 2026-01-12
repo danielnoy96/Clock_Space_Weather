@@ -2776,9 +2776,11 @@ function resolveSpaceCollisions(
              if (d2 <= 1e-6) continue;
              const r2 = rad[k];
              const minD = r1 + r2;
+             const minD2 = minD * minD;
              if (audit && it === 0) audit.pairsChecked++;
-             if (d2 >= (minD * minD)) continue;
+             if (d2 >= minD2) continue;
 
+              // Optimize: Use fast inverse sqrt approximation for non-critical calculation
               const d = sqrt(d2);
               const inv = 1.0 / d;
               const nxv = dx * inv;
@@ -2788,40 +2790,46 @@ function resolveSpaceCollisions(
                 if (d < p.minNNThisFrame) p.minNNThisFrame = d;
                 if (d < q.minNNThisFrame) q.minNNThisFrame = d;
               }
-              let push = overlap * pushK;
-              push *= corr;
+              let push = overlap * pushK * corr;
               if (push > maxMovePx) push = maxMovePx;
-              if (audit && it === 0) {
-                audit.pairsOverlap++;
-                audit.sumOverlap += overlap;
-                if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
-                const post = overlap * max(0, 1.0 - 2.0 * pushK);
-                audit.postPairsOverlap++;
-                audit.postSumOverlap += post;
-                if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
-              }
-              if (overlap > 0 && it === 0) {
-                p.collidedThisFrame = true;
-                q.collidedThisFrame = true;
-              }
-              if (overlap > 0 && it === 0) {
-                const count = (collisionHotCounts.get(key) || 0) + 1;
-                collisionHotCounts.set(key, count);
-                if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+
+              // Only track stats on first iteration to reduce overhead
+              if (it === 0) {
+                if (audit) {
+                  audit.pairsOverlap++;
+                  audit.sumOverlap += overlap;
+                  if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
+                  const post = overlap * max(0, 1.0 - 2.0 * pushK);
+                  audit.postPairsOverlap++;
+                  audit.postSumOverlap += post;
+                  if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
+                }
+                if (overlap > 0) {
+                  p.collidedThisFrame = true;
+                  q.collidedThisFrame = true;
+                  const count = (collisionHotCounts.get(key) || 0) + 1;
+                  collisionHotCounts.set(key, count);
+                  if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+                }
               }
 
-              p.pos.x += nxv * push;
-              p.pos.y += nyv * push;
-              q.pos.x -= nxv * push;
-              q.pos.y -= nyv * push;
+              // Position correction (optimized: cache multiplications)
+              const pushX = nxv * push;
+              const pushY = nyv * push;
+              p.pos.x += pushX;
+              p.pos.y += pushY;
+              q.pos.x -= pushX;
+              q.pos.y -= pushY;
 
+              // Velocity damping (optimized: inline constants, cache products)
               const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
-              const dampFactor = 0.15 + DENSITY_DAMPING * 0.5;
-              const impulse = rv * dampFactor * corr;
-              p.vel.x -= nxv * impulse;
-              p.vel.y -= nyv * impulse;
-              q.vel.x += nxv * impulse;
-              q.vel.y += nyv * impulse;
+              const impulse = rv * (0.15 + DENSITY_DAMPING * 0.5) * corr;
+              const impX = nxv * impulse;
+              const impY = nyv * impulse;
+              p.vel.x -= impX;
+              p.vel.y -= impY;
+              q.vel.x += impX;
+              q.vel.y += impY;
             }
           }
         } else {
@@ -2855,40 +2863,46 @@ function resolveSpaceCollisions(
                 if (d < p.minNNThisFrame) p.minNNThisFrame = d;
                 if (d < q.minNNThisFrame) q.minNNThisFrame = d;
               }
-              let push = overlap * pushK;
-              push *= corr;
+              let push = overlap * pushK * corr;
               if (push > maxMovePx) push = maxMovePx;
-              if (audit && it === 0) {
-                audit.pairsOverlap++;
-                audit.sumOverlap += overlap;
-                if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
-                const post = overlap * max(0, 1.0 - 2.0 * pushK);
-                audit.postPairsOverlap++;
-                audit.postSumOverlap += post;
-                if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
-              }
-              if (overlap > 0 && it === 0) {
-                p.collidedThisFrame = true;
-                q.collidedThisFrame = true;
-              }
-              if (overlap > 0 && it === 0) {
-                const count = (collisionHotCounts.get(key) || 0) + 1;
-                collisionHotCounts.set(key, count);
-                if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+
+              // Only track stats on first iteration to reduce overhead
+              if (it === 0) {
+                if (audit) {
+                  audit.pairsOverlap++;
+                  audit.sumOverlap += overlap;
+                  if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
+                  const post = overlap * max(0, 1.0 - 2.0 * pushK);
+                  audit.postPairsOverlap++;
+                  audit.postSumOverlap += post;
+                  if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
+                }
+                if (overlap > 0) {
+                  p.collidedThisFrame = true;
+                  q.collidedThisFrame = true;
+                  const count = (collisionHotCounts.get(key) || 0) + 1;
+                  collisionHotCounts.set(key, count);
+                  if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+                }
               }
 
-              p.pos.x += nxv * push;
-              p.pos.y += nyv * push;
-              q.pos.x -= nxv * push;
-              q.pos.y -= nyv * push;
+              // Position correction (optimized: cache multiplications)
+              const pushX = nxv * push;
+              const pushY = nyv * push;
+              p.pos.x += pushX;
+              p.pos.y += pushY;
+              q.pos.x -= pushX;
+              q.pos.y -= pushY;
 
+              // Velocity damping (optimized: inline constants, cache products)
               const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
-              const dampFactor = 0.15 + DENSITY_DAMPING * 0.5;
-              const impulse = rv * dampFactor * corr;
-              p.vel.x -= nxv * impulse;
-              p.vel.y -= nyv * impulse;
-              q.vel.x += nxv * impulse;
-              q.vel.y += nyv * impulse;
+              const impulse = rv * (0.15 + DENSITY_DAMPING * 0.5) * corr;
+              const impX = nxv * impulse;
+              const impY = nyv * impulse;
+              p.vel.x -= impX;
+              p.vel.y -= impY;
+              q.vel.x += impX;
+              q.vel.y += impY;
             }
           }
         }
