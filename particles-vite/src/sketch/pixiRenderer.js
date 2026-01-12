@@ -1,6 +1,193 @@
-import { Application, Container, Graphics, Particle, ParticleContainer, Sprite, Texture } from "pixi.js";
+import {
+  Application,
+  Color,
+  Container,
+  GlProgram,
+  GpuProgram,
+  Graphics,
+  Matrix,
+  Particle,
+  ParticleContainer,
+  Shader,
+  Sprite,
+  Texture,
+  TextureStyle,
+} from "pixi.js";
 
 const KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
+const KIND_INDEX = Object.freeze({
+  protons: 0,
+  h_ions: 1,
+  mag: 2,
+  electrons: 3,
+  xray: 4,
+});
+
+// PERF tuning knobs (safe defaults; opt-in for experimentation).
+const PIXI_RENDERER_PREFERENCE = "webgl"; // "webgl" | "webgpu"
+const USE_GPU_FLICKER_SHADER = false;
+// Capping DPR reduces fill-rate cost (often a big FPS win on high-DPI displays).
+const PIXI_MAX_RESOLUTION = 1.0;
+
+const PI2 = Math.PI * 2;
+
+function createFlickerParticleShader() {
+  const glVertex = `
+attribute vec2 aVertex;
+attribute vec2 aUV;
+attribute vec4 aColor;
+
+attribute vec2 aPosition;
+attribute float aRotation;
+
+uniform mat3 uTranslationMatrix;
+uniform float uRound;
+uniform vec2 uResolution;
+uniform vec4 uColor;
+uniform float uTime;
+uniform float uHz;
+uniform float uFlickerBase;
+uniform float uFlickerAmp;
+uniform float uSeedPhaseMul;
+
+varying vec2 vUV;
+varying vec4 vColor;
+
+vec2 roundPixels(vec2 position, vec2 targetSize)
+{
+  return (floor(((position * 0.5 + 0.5) * targetSize) + 0.5) / targetSize) * 2.0 - 1.0;
+}
+
+void main(void){
+  // Intentionally ignore rotation for geometry; re-use aRotation as a stable per-particle seed.
+  vec2 v = aVertex + aPosition;
+  gl_Position = vec4((uTranslationMatrix * vec3(v, 1.0)).xy, 0.0, 1.0);
+
+  if(uRound == 1.0)
+  {
+    gl_Position.xy = roundPixels(gl_Position.xy, uResolution);
+  }
+
+  float flick = 1.0;
+  if (uHz > 0.0) {
+    flick = uFlickerBase + uFlickerAmp * sin(uTime * (uHz * ${PI2}) + aRotation * uSeedPhaseMul);
+  }
+
+  vUV = aUV;
+  float a = aColor.a * flick;
+  vColor = vec4(aColor.rgb * a, a) * uColor;
+}
+`;
+
+  const glFragment = `
+varying vec2 vUV;
+varying vec4 vColor;
+
+uniform sampler2D uTexture;
+
+void main(void){
+  vec4 color = texture2D(uTexture, vUV) * vColor;
+  gl_FragColor = color;
+}
+`;
+
+  const wgsl = `
+struct ParticleUniforms {
+  uTranslationMatrix:mat3x3<f32>,
+  uColor:vec4<f32>,
+  uRound:f32,
+  uResolution:vec2<f32>,
+  uTime:f32,
+  uHz:f32,
+  uFlickerBase:f32,
+  uFlickerAmp:f32,
+  uSeedPhaseMul:f32,
+};
+
+fn roundPixels(position: vec2<f32>, targetSize: vec2<f32>) -> vec2<f32>
+{
+  return (floor(((position * 0.5 + 0.5) * targetSize) + 0.5) / targetSize) * 2.0 - 1.0;
+}
+
+@group(0) @binding(0) var<uniform> uniforms: ParticleUniforms;
+
+@group(1) @binding(0) var uTexture: texture_2d<f32>;
+@group(1) @binding(1) var uSampler : sampler;
+
+struct VSOutput {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv : vec2<f32>,
+  @location(1) color : vec4<f32>,
+};
+
+@vertex
+fn mainVertex(
+  @location(0) aVertex: vec2<f32>,
+  @location(1) aPosition: vec2<f32>,
+  @location(2) aUV: vec2<f32>,
+  @location(3) aColor: vec4<f32>,
+  @location(4) aRotation: f32,
+) -> VSOutput {
+  // Intentionally ignore rotation for geometry; re-use aRotation as a stable per-particle seed.
+  let v = aVertex + aPosition;
+
+  var position = vec4((uniforms.uTranslationMatrix * vec3(v, 1.0)).xy, 0.0, 1.0);
+
+  if(uniforms.uRound == 1.0) {
+    position = vec4(roundPixels(position.xy, uniforms.uResolution), position.zw);
+  }
+
+  var flick = 1.0;
+  if (uniforms.uHz > 0.0) {
+    flick = uniforms.uFlickerBase + uniforms.uFlickerAmp * sin(uniforms.uTime * (uniforms.uHz * ${PI2}) + aRotation * uniforms.uSeedPhaseMul);
+  }
+
+  let a = aColor.a * flick;
+  let vColor = vec4(aColor.rgb * a, a) * uniforms.uColor;
+
+  return VSOutput(
+    position,
+    aUV,
+    vColor,
+  );
+}
+
+@fragment
+fn mainFragment(
+  @location(0) uv: vec2<f32>,
+  @location(1) color: vec4<f32>,
+  @builtin(position) position: vec4<f32>,
+) -> @location(0) vec4<f32> {
+  var sample = textureSample(uTexture, uSampler, uv) * color;
+  return sample;
+}`;
+
+  const glProgram = GlProgram.from({ vertex: glVertex, fragment: glFragment });
+  const gpuProgram = GpuProgram.from({
+    fragment: { source: wgsl, entryPoint: "mainFragment" },
+    vertex: { source: wgsl, entryPoint: "mainVertex" },
+  });
+
+  return new Shader({
+    glProgram,
+    gpuProgram,
+    resources: {
+      uTexture: Texture.WHITE.source,
+      uSampler: new TextureStyle({}),
+      uniforms: {
+        uTranslationMatrix: { value: new Matrix(), type: "mat3x3<f32>" },
+        uColor: { value: new Color(0xffffff), type: "vec4<f32>" },
+        uRound: { value: 1, type: "f32" },
+        uResolution: { value: [0, 0], type: "vec2<f32>" },
+        uTime: { value: 0, type: "f32" },
+        uHz: { value: 0, type: "f32" },
+        uFlickerBase: { value: 1, type: "f32" },
+        uFlickerAmp: { value: 0, type: "f32" },
+        uSeedPhaseMul: { value: 6, type: "f32" },
+      },
+    },
+  });
+}
 
 function rgbToHex([r, g, b]) {
   return ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
@@ -49,14 +236,28 @@ function ensureCanvasSpriteTexture(sprite, canvas) {
 
 export async function initPixiRenderer({ parent, width, height }) {
   const app = new Application();
-  await app.init({
+  const isWindows =
+    (navigator.userAgentData && navigator.userAgentData.platform === "Windows") ||
+    /Windows/i.test(navigator.userAgent || "");
+
+  const dpr = Math.max(1, Number(window.devicePixelRatio || 1));
+  const resolution = Math.max(1, Math.min(dpr, PIXI_MAX_RESOLUTION));
+
+  const initOpts = {
     width,
     height,
-    antialias: true,
+    // Prefer GPU throughput over edge smoothing (huge particle counts benefit).
+    antialias: false,
     backgroundAlpha: 0,
     autoDensity: true,
-    resolution: Math.max(1, Math.round(window.devicePixelRatio || 1)),
-  });
+    resolution,
+    preference: PIXI_RENDERER_PREFERENCE,
+    // Hint to browsers to pick the discrete GPU when possible.
+    // Chrome currently ignores this on Windows (and warns), so skip it there.
+    ...(isWindows ? {} : { powerPreference: "high-performance" }),
+  };
+
+  await app.init(initOpts);
   if (app.ticker && typeof app.ticker.stop === "function") app.ticker.stop();
 
   const view = app.canvas;
@@ -95,8 +296,10 @@ export async function initPixiRenderer({ parent, width, height }) {
 
   const byKind = {};
   for (const kind of KIND_ORDER) {
+    const shader = USE_GPU_FLICKER_SHADER ? createFlickerParticleShader() : undefined;
     const container = new ParticleContainer({
       texture: particleTexture,
+      ...(shader ? { shader } : {}),
       dynamicProperties: {
         x: true,
         y: true,
@@ -109,7 +312,7 @@ export async function initPixiRenderer({ parent, width, height }) {
       roundPixels: false,
       particles: [],
     });
-    byKind[kind] = { container, pool: [] };
+    byKind[kind] = { container, pool: [], shader };
     particleLayer.addChild(container);
   }
 
@@ -127,6 +330,10 @@ export async function initPixiRenderer({ parent, width, height }) {
     handsGfx,
     headsGfx,
     byKind,
+    kindBuckets: KIND_ORDER.map((k) => byKind[k]),
+    kindOutN: new Uint32Array(KIND_ORDER.length),
+    kindTint: new Uint32Array(KIND_ORDER.length),
+    kindProf: new Array(KIND_ORDER.length),
     particleTexture,
     disposed: false,
   };
@@ -299,67 +506,110 @@ export function renderPixiFrame(state, opts) {
   // Particles (Pixi ParticleContainer)
   {
     const t = millisFn();
-    const pi2 = (PI || Math.PI) * 2;
 
-    for (const kind of KIND_ORDER) {
-      const baseCol = COL[kind] || COL.protons;
-      const tint = rgbToHex(baseCol);
-      const bucket = state.byKind[kind];
-      const pool = bucket.pool;
-      let outN = 0;
+    const buckets = state.kindBuckets;
+    const outNByKind = state.kindOutN;
+    const tintByKind = state.kindTint;
+    const profByKind = state.kindProf;
+    outNByKind.fill(0);
 
-      for (let i = 0; i < particles.length; i++) {
-        const p = particles[i];
-        if (!p || !p.active || p.dead()) continue;
-        if (SOLO_KIND && p.kind !== SOLO_KIND) continue;
-        if (p.kind !== kind) continue;
+    for (let k = 0; k < KIND_ORDER.length; k++) {
+      const kind = KIND_ORDER[k];
+      const baseCol = (COL && COL[kind]) ? COL[kind] : (COL && COL.protons) ? COL.protons : [255, 255, 255];
+      tintByKind[k] = rgbToHex(baseCol);
+      profByKind[k] = (PARTICLE_PROFILE && PARTICLE_PROFILE[kind]) ? PARTICLE_PROFILE[kind] : PARTICLE_PROFILE.protons;
 
-        const aLife = Math.max(0, Math.min(1, p.life / Math.max(1e-9, p.maxLife)));
-        const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
-        const strength = Math.max(0, Math.min(1, (p.strength !== undefined ? p.strength : kindStrength(p.kind))));
-
-        let flick = 1.0;
-        const hz = prof.flickerHz;
-        if (hz > 0) flick = 0.75 + 0.25 * sinFn(t * (hz * pi2) + p.seed * 6.0);
-        if (p.kind === "xray") flick = 0.60 + 0.40 * sinFn(t * (hz * pi2) + p.seed * 10.0);
-
-        const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
-        const alpha255 = (prof.alphaBase + alphaStrength * strength) * aLife * flick * ALPHA_SCALE;
-        const alpha01 = Math.max(0, Math.min(1, alpha255 / 255));
-        if (alpha01 <= 0) continue;
-
-        const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
-
-        const useInterp =
-          p.renderStamp === renderStamp &&
-          Number.isFinite(p.renderX) &&
-          Number.isFinite(p.renderY);
-        const rx = useInterp ? p.renderX : p.pos.x;
-        const ry = useInterp ? p.renderY : p.pos.y;
-
-        let part = pool[outN];
-        if (!part) {
-          part = new Particle({
-            texture: state.particleTexture,
-            anchorX: 0.5,
-            anchorY: 0.5,
-          });
-          pool[outN] = part;
+      if (USE_GPU_FLICKER_SHADER) {
+        const bucket = buckets[k];
+        const shader = bucket?.shader || bucket?.container?.shader;
+        const uniforms = shader?.resources?.uniforms;
+        if (uniforms) {
+          uniforms.uTime = t;
+          uniforms.uHz = profByKind[k]?.flickerHz || 0;
+          if (kind === "xray") {
+            uniforms.uFlickerBase = 0.60;
+            uniforms.uFlickerAmp = 0.40;
+            uniforms.uSeedPhaseMul = 10.0;
+          } else {
+            uniforms.uFlickerBase = 0.75;
+            uniforms.uFlickerAmp = 0.25;
+            uniforms.uSeedPhaseMul = 6.0;
+          }
         }
+      }
+    }
 
-        part.x = rx;
-        part.y = ry;
-        part.tint = tint;
-        part.alpha = alpha01;
-        const scale = Math.max(0.001, s / 64);
-        part.scaleX = scale;
-        part.scaleY = scale;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p || !p.active || p.dead()) continue;
+      if (SOLO_KIND && p.kind !== SOLO_KIND) continue;
 
-        outN++;
+      const kindIdx = KIND_INDEX[p.kind];
+      if (kindIdx === undefined) continue;
+      const bucket = buckets[kindIdx];
+      if (!bucket) continue;
+
+      const aLife = Math.max(0, Math.min(1, p.life / Math.max(1e-9, p.maxLife)));
+      const prof = profByKind[kindIdx];
+      const strength = Math.max(0, Math.min(1, (p.strength !== undefined ? p.strength : kindStrength(p.kind))));
+
+      let flick = 1.0;
+      if (!USE_GPU_FLICKER_SHADER) {
+        const hz = prof.flickerHz;
+        if (hz > 0) flick = 0.75 + 0.25 * sinFn(t * (hz * PI2) + p.seed * 6.0);
+        if (p.kind === "xray") flick = 0.60 + 0.40 * sinFn(t * (hz * PI2) + p.seed * 10.0);
       }
 
-      pool.length = outN;
-      bucket.container.particleChildren = pool;
+      const alphaStrength = prof.alphaStrength * ALPHA_STRENGTH_MIX;
+      const alpha255 = (prof.alphaBase + alphaStrength * strength) * aLife * flick * ALPHA_SCALE;
+      const alpha01 = Math.max(0, Math.min(1, alpha255 / 255));
+      if (alpha01 <= 0) continue;
+
+      const s = p.size * prof.sizeMult * PARTICLE_SIZE_SCALE * (0.9 + 0.45 * (1.0 - aLife));
+
+      const useInterp =
+        p.renderStamp === renderStamp &&
+        Number.isFinite(p.renderX) &&
+        Number.isFinite(p.renderY);
+      const rx = useInterp ? p.renderX : p.pos.x;
+      const ry = useInterp ? p.renderY : p.pos.y;
+
+      const outN = outNByKind[kindIdx];
+      const pool = bucket.pool;
+      let part = pool[outN];
+      if (!part) {
+        part = new Particle({
+          texture: state.particleTexture,
+          anchorX: 0.5,
+          anchorY: 0.5,
+        });
+        pool[outN] = part;
+      }
+
+      part.x = rx;
+      part.y = ry;
+      if (USE_GPU_FLICKER_SHADER) {
+        // Feed a stable per-particle seed to the shader via the rotation attribute.
+        if (part._seed !== p.seed) {
+          part._seed = p.seed;
+          part.rotation = p.seed || 0;
+        }
+      }
+      part.tint = tintByKind[kindIdx];
+      part.alpha = alpha01;
+      const scale = Math.max(0.001, s / 64);
+      part.scaleX = scale;
+      part.scaleY = scale;
+
+      outNByKind[kindIdx] = outN + 1;
+    }
+
+    for (let k = 0; k < KIND_ORDER.length; k++) {
+      const bucket = buckets[k];
+      if (!bucket) continue;
+      const pool = bucket.pool;
+      pool.length = outNByKind[k];
+      if (bucket.container.particleChildren !== pool) bucket.container.particleChildren = pool;
       bucket.container.update();
     }
   }
