@@ -23,6 +23,7 @@ export function applyForcesStage(ctx) {
     enableDensity,
     enableCohesion,
     enableXrayBlobForce,
+    magneticCoherence,
     infoRec,
     infoRecSampleStride,
     DENSE_DISABLE_COHESION,
@@ -35,10 +36,12 @@ export function applyForcesStage(ctx) {
     applyElectronBreath,
     applyAgeSpiral,
     applyLayerBehavior,
+    applyLayerStratification,
     applyVolumetricMix,
     applyDensityCoupling,
     applyAlignment,
     applyCohesion,
+    applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
     returnToPool,
@@ -129,6 +132,11 @@ export function applyForcesStage(ctx) {
     ageRankFromNewest++;
     applyLayerBehavior(p, T);
     if (sampleThisFrame) infoRec.incCounter("force.applyLayerBehavior");
+
+    // Apply radial ring stratification (layer separation by kind)
+    applyLayerStratification(p, T);
+    if (sampleThisFrame) infoRec.incCounter("force.applyLayerStratification");
+
     if (!smoothAll && !isXrayBlob) applyVolumetricMix(p, T);
     if (sampleThisFrame && (!smoothAll && !isXrayBlob)) infoRec.incCounter("force.applyVolumetricMix");
 
@@ -148,6 +156,12 @@ export function applyForcesStage(ctx) {
         applyCohesion(p, i, cohesionGrid, cohesionCellSize, overlapFactor);
         if (sampleThisFrame) infoRec.incCounter("force.applyCohesion");
       }
+    }
+
+    // Apply magnetic filament force (only for mag particles)
+    if (p.kind === "mag" && applyMagneticFilamentForce) {
+      applyMagneticFilamentForce(p, magneticCoherence || 0.5);
+      if (sampleThisFrame) infoRec.incCounter("force.applyMagneticFilament");
     }
 
     // Apply blob containment late so it re-compacts after other forces.

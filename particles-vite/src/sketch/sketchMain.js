@@ -1395,6 +1395,8 @@ const PARTICLE_SCALE = 0.10;
 
 // Performance knobs (trade tiny smoothness for big FPS gains)
 let COHESION_GRID_EVERY = 2;   // rebuild neighbor grid every N frames
+let MAGNETIC_CHAIN_EVERY = 3;  // rebuild magnetic chains every N frames
+let magneticChainFrame = -999;
 let COHESION_APPLY_STRIDE = 2; // apply cohesion to 1/N particles per frame (rotating)
 let HEAVY_FIELD_STRIDE = 2;    // apply heavy per-particle fields 1/N per frame
 let FIELD_UPDATE_EVERY = 2;    // update face field buffers every N frames
@@ -1432,13 +1434,13 @@ let xrayBlobs = [];
 let xrayBlobIdCounter = 1;
 // PERF: keep blob index as a persistent Map (avoid per-frame maps).
 let xrayBlobIndex = new Map();
-const XRAY_PULSE_BASE = 90;
+const XRAY_PULSE_BASE = 50; // reduced from 90 for smaller initial blobs
 const XRAY_PULSE_MAX = 520;
-const XRAY_BLOB_BASE_RADIUS = 110;
-const XRAY_BLOB_MAX_RADIUS = 260;
+const XRAY_BLOB_BASE_RADIUS = 20; // VERY TIGHT clumps (was 30, still spreading)
+const XRAY_BLOB_MAX_RADIUS = 60; // VERY TIGHT max (was 100, still too big)
 // Make spikes readable: ensure bursts have enough particles to form a blob, even with PARTICLE_SCALE < 1.
 const XRAY_EVENT_COUNT_SCALE = 0.70;
-const XRAY_EVENT_MIN_COUNT = 120;
+const XRAY_EVENT_MIN_COUNT = 60; // reduced from 120 for smaller, more responsive blobs
 // Only use rigid segments on strong spikes; otherwise X-ray should read as blobs, not lines.
 const XRAY_SEGMENT_TRIGGER = 0.60;
 // X-ray pulse shaping: keep spikes compact (blob), not long streaks.
@@ -1451,8 +1453,8 @@ const XRAY_PULSE_TANGENTIAL = 0.45;    // tangential bias around blob center
 // X-ray should read as "pulses/jumps" (events) rather than a constant drizzle.
 // Keep baseline from hands at zero; bursts/events create the visible x-ray signatures.
 const XRAY_BASELINE_EMIT_MULT = 0.0;
-const XRAY_BURST_SPIKE_MIN = 0.06; // trigger only on sharp rises (derivative), not sustained highs
-const XRAY_BURST_COOLDOWN_FRAMES = 26; // refractory period to avoid "trail lines" from repeated bursts
+const XRAY_BURST_SPIKE_MIN = 0.035; // balanced sensitivity (was 0.06 originally, 0.015 was too sensitive)
+const XRAY_BURST_COOLDOWN_FRAMES = 18; // balanced cooldown (was 26 originally, 12 was too frequent)
 const XRAY_BURST_FRAMES_BASE = 16;
 const XRAY_BURST_FRAMES_MAX = 58;
 let xrayBurst = null; // { blobId, startFrame, duration, untilFrame, startCount, strength }
@@ -1487,7 +1489,8 @@ function kindStrength(kind) {
 let xrayMemory = 0;
 function updateLayerMemory() {
   // "Memory of peak": keeps x-ray clumps coherent for a while after spikes.
-  xrayMemory = max(xrayMemory * 0.985, xray);
+  // Slower decay = longer blob coherence time (signature visibility)
+  xrayMemory = max(xrayMemory * 0.992, xray); // increased from 0.985 for longer memory
 }
 
 function updateControlLayer() {
@@ -1509,7 +1512,8 @@ function updateControlLayer() {
   state.electrons = lerp(state.electrons, raw.electrons, 0.62);
 
   // X-ray: event-driven (spikes over slow envelope)
-  envX = lerp(envX, raw.xray, 0.06);
+  // Balanced envelope tracking for moderate sensitivity
+  envX = lerp(envX, raw.xray, 0.045); // balanced (was 0.06 originally, 0.03 was too sensitive)
   const spike = max(0, raw.xray - envX);
   state.xray = lerp(state.xray, raw.xray, 0.55);
 
@@ -1536,8 +1540,9 @@ function updateControlLayer() {
   changeEmph.protons = emph(dState.protons) * 0.8;
 
   // Trigger x-ray events on spikes (shapes are truth; particles are texture)
-  if (CURRENT_T && spike > 0.08) {
-    const s = constrain(spike * 6.0, 0, 1);
+  // Balanced threshold for moderate sensitivity
+  if (CURRENT_T && spike > 0.04) { // balanced (was 0.08 originally, 0.02 was too sensitive)
+    const s = constrain(spike * 7.0, 0, 1); // balanced multiplier
     xrayEvents.push({
       x: CURRENT_T.secP.x,
       y: CURRENT_T.secP.y,
@@ -1621,7 +1626,8 @@ function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
   const radius = constrain(XRAY_BLOB_BASE_RADIUS + s * 140 + xray * 70, XRAY_BLOB_BASE_RADIUS, XRAY_BLOB_MAX_RADIUS);
   // PERF: store accumulators on the blob (no per-frame Object.create(null) maps).
   const nowF = frameCount || 0;
-  const anchorFor = floor(lerp(12, 30, pow(s, 0.8)));
+  // Extended anchor period to keep blobs cohesive for longer
+  const anchorFor = floor(lerp(45, 90, pow(s, 0.8))); // increased from 12-30 to 45-90 frames
   const blob = { id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, sumX: 0, sumY: 0, count: 0, anchorUntilFrame: nowF + anchorFor };
   xrayBlobs.push(blob);
   xrayBlobIndex.set(id, blob);
@@ -1633,18 +1639,16 @@ function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
     const px = blob.cx + cos(ang) * rr;
     const py = blob.cy + sin(ang) * rr;
 
-    // Small initial motion with a tangential bias around the blob center (keeps it cohesive).
+    // VERY SMALL initial motion - particles should stay tightly clumped, not spread
     const rx = px - blob.cx;
     const ry = py - blob.cy;
     const d = sqrt(rx * rx + ry * ry) + 1e-6;
     const tx = -ry / d;
     const ty = rx / d;
-    // Keep spike pulses compact: high spikes start slower to avoid immediate smearing into streaks.
-    const speedScale = lerp(1.0, 0.22, pow(s, 1.25));
-    const spd = max(0.02, (XRAY_PULSE_SPEED_BASE + random(XRAY_PULSE_SPEED_RAND) + s * XRAY_PULSE_SPEED_SPIKE) * speedScale);
-    const tang = XRAY_PULSE_TANGENTIAL * lerp(0.38, 0.16, pow(s, 1.25));
-    const vx = tx * (spd * tang) + (rx / d) * (spd * (1.0 - tang)) * 0.25;
-    const vy = ty * (spd * tang) + (ry / d) * (spd * (1.0 - tang)) * 0.25;
+    // NEAR-ZERO spawn velocity - particles are rigidly locked to blob anyway
+    // Just a tiny velocity for the first frame, then locking takes over
+    const vx = tx * 0.005 + (rx / d) * 0.002; // tiny tangential + radial
+    const vy = ty * 0.005 + (ry / d) * 0.002;
     const life = 1e9;
     const size = 1.6;
     const p = spawnFromPool("xray", px, py, vx, vy, life, size, COL.xray);
@@ -1653,6 +1657,9 @@ function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
     p.xrayTight = max(p.xrayTight || 0, s);
     p.xrayRadPref = random();
     p.blobId = id;
+    // Store particle's offset from blob center for rigid locking
+    p.blobOffsetX = rx;
+    p.blobOffsetY = ry;
     particles.push(p);
   }
 }
@@ -1671,11 +1678,9 @@ function spawnXrayIntoBlob(blob, s, count) {
     const d = sqrt(rx * rx + ry * ry) + 1e-6;
     const tx = -ry / d;
     const ty = rx / d;
-    const speedScale = lerp(1.0, 0.22, pow(s, 1.25));
-    const spd = max(0.02, (XRAY_PULSE_SPEED_BASE + random(XRAY_PULSE_SPEED_RAND) + s * XRAY_PULSE_SPEED_SPIKE) * speedScale);
-    const tang = XRAY_PULSE_TANGENTIAL * lerp(0.38, 0.16, pow(s, 1.25));
-    const vx = tx * (spd * tang) + (rx / d) * (spd * (1.0 - tang)) * 0.25;
-    const vy = ty * (spd * tang) + (ry / d) * (spd * (1.0 - tang)) * 0.25;
+    // NEAR-ZERO spawn velocity - particles are rigidly locked to blob anyway
+    const vx = tx * 0.005 + (rx / d) * 0.002; // tiny tangential + radial
+    const vy = ty * 0.005 + (ry / d) * 0.002;
 
     const p = spawnFromPool("xray", px, py, vx, vy, 1e9, 1.6, COL.xray);
     if (!p) return;
@@ -1683,6 +1688,9 @@ function spawnXrayIntoBlob(blob, s, count) {
     p.xrayTight = max(p.xrayTight || 0, s);
     p.xrayRadPref = random();
     p.blobId = blob.id;
+    // Store particle's offset from blob center for rigid locking
+    p.blobOffsetX = rx;
+    p.blobOffsetY = ry;
     particles.push(p);
   }
 }
@@ -1716,14 +1724,33 @@ function updateXrayBlobs() {
     if (n > 0) {
       const mx = b.sumX / n;
       const my = b.sumY / n;
-      // While a burst is active, keep its center fixed so it reads as a blob (not a dragged streak).
-      // After the anchor period, let the center drift slowly with the medium.
+
+      // --- BLOB CENTER DRIFT WITH AGE ---
+      // Initialize age tracking if not present
+      if (b.age === undefined) b.age = 0;
+      b.age++;
+
+      // BLOB CENTER DRIFT: Slowly move toward clock center as one solid unit
+      // Do NOT follow particle positions - this causes spreading
+      // Only drift the center itself, particles stay locked relative to it
       if (!(b.anchorUntilFrame && nowF < b.anchorUntilFrame)) {
-        b.cx = lerp(b.cx, mx, 0.14);
-        b.cy = lerp(b.cy, my, 0.14);
+        // Slow inward drift toward clock center
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const toCenterX = centerX - b.cx;
+        const toCenterY = centerY - b.cy;
+        const ageFrac = min(b.age / 240.0, 1.0);
+        const inwardDrift = 0.006 * ageFrac; // very slow inward drift
+        b.cx += toCenterX * inwardDrift;
+        b.cy += toCenterY * inwardDrift;
       }
-      // keep blob strength "remembered" but slowly relax
-      b.strength = max(b.strength * 0.998, xrayMemory);
+
+      // --- BLOB STRENGTH MEMORY with longer decay ---
+      // Keep blob strength "remembered" but slowly relax over time
+      // Longer memory means blobs stay coherent longer (signature visibility)
+      const memoryDecay = 0.9965; // slower decay = longer blob coherence
+      b.strength = max(b.strength * memoryDecay, xrayMemory);
+
       kept.push(b);
     } else {
       xrayBlobIndex.delete(b.id);
@@ -1838,61 +1865,29 @@ function applyXrayBlobForce(p) {
   }
   if (!blob || blob.count <= 1) return;
 
-  const s = constrain(max(blob.strength, xrayMemory, p.xrayTight || 0), 0, 1);
-  if (s <= 0.0001) return;
+  // --- RIGID LOCKING: Lock particle to its offset from blob center ---
+  // Particles move as one solid unit with the blob center
+  if (p.blobOffsetX !== undefined && p.blobOffsetY !== undefined) {
+    // Calculate target position based on blob center + stored offset
+    const targetX = blob.cx + p.blobOffsetX;
+    const targetY = blob.cy + p.blobOffsetY;
 
-  const dx = blob.cx - p.pos.x;
-  const dy = blob.cy - p.pos.y;
-  const d2 = dx * dx + dy * dy;
-  const d = sqrt(max(1e-6, d2));
-  const nx = dx / d;
-  const ny = dy / d;
+    // Add tiny jitter for subtle life (±1-2 pixels)
+    const t = millis() * 0.001;
+    const jitterX = (noise(p.seed * 0.1, t * 0.3) - 0.5) * 2.0;
+    const jitterY = (noise(p.seed * 0.1 + 100, t * 0.3) - 0.5) * 2.0;
 
-  // Springy "container": keep particles inside the blob radius AND distribute them across the blob area
-  // (so it reads as a real, filled clump instead of a line or a tiny dot).
-  const desired = blob.radius;
-  // Stronger hold on sharp spikes so clumps feel rigid and cohesive.
-  const stiff = pow(s, 1.8);
+    // Strongly lock position to target + jitter
+    const lockStrength = 0.85; // 85% lock per frame
+    p.pos.x = lerp(p.pos.x, targetX + jitterX, lockStrength);
+    p.pos.y = lerp(p.pos.y, targetY + jitterY, lockStrength);
 
-  const coreFrac = 0.38; // inner "do not collapse" core (smaller core => larger filled area)
-  const maxF = 0.46 + 0.18 * stiff;
-  if (d > desired) {
-    const over = (d - desired);
-    const pullIn = (0.016 + 0.060 * s + 0.075 * stiff) * (1.0 + over / max(1, desired));
-    p.vel.x += constrain(nx * pullIn, -maxF, maxF);
-    p.vel.y += constrain(ny * pullIn, -maxF, maxF);
+    // Kill most velocity - particles barely move relative to blob
+    p.vel.x *= 0.10; // keep only 10% of velocity
+    p.vel.y *= 0.10;
   } else {
-    // Distribute radii: each particle gets a stable preferred radius within the blob
-    // so the clump quickly fills an area instead of collapsing.
-    const pref = constrain((p.xrayRadPref === undefined ? 0.5 : p.xrayRadPref), 0, 1);
-    const targetR = desired * (0.22 + 0.70 * pref);
-    const dr = targetR - d; // + => want outward, - => inward
-    const k = (0.006 + 0.030 * stiff);
-    p.vel.x += constrain((-nx) * (dr * k), -maxF, maxF);
-    p.vel.y += constrain((-ny) * (dr * k), -maxF, maxF);
-
-    // Prevent core collapse
-    if (d < desired * coreFrac) {
-      const under = (desired * coreFrac - d);
-      const pushOut = (0.010 + 0.050 * s + 0.060 * stiff) * (under / max(1, desired));
-      p.vel.x += constrain((-nx) * pushOut, -maxF, maxF);
-      p.vel.y += constrain((-ny) * pushOut, -maxF, maxF);
-    }
-  }
-
-  // Kill tangential "stretch" inside tight blobs (keeps the clump chunky, not a streak).
-  {
-    const tangx = -ny;
-    const tangy = nx;
-    const vT = p.vel.x * tangx + p.vel.y * tangy;
-    const kill = 0.55 * stiff;
-    p.vel.x -= tangx * vT * kill;
-    p.vel.y -= tangy * vT * kill;
-  }
-
-  // Extra damping inside the blob core to prevent elongation into long broken lines.
-  if (d < desired * 0.85) {
-    const damp = 0.040 + 0.10 * s + 0.08 * stiff;
+    // Fallback for particles without stored offset (shouldn't happen)
+    const damp = 0.90;
     p.vel.x *= (1.0 - damp);
     p.vel.y *= (1.0 - damp);
   }
@@ -1927,15 +1922,15 @@ const DENSE_MODE_THRESHOLD = 0.22; // fraction of CAPACITY; 0.22 ~= 11k at CAPAC
 let chamberFillFrac = 0;
 
 // Temporary: disable any ring/layer forcing while we tune the core physics.
-const DISABLE_RINGS = true;
+const DISABLE_RINGS = false; // ENABLED - allow layer stratification
 // Stronger guarantee: disable any kind-based radial targets (prevents "each kind sits on a ring").
-const DISABLE_KIND_RINGS = true;
+const DISABLE_KIND_RINGS = false; // ENABLED - allow kind-based ring separation
 
 // When dense, keep motion smooth by disabling noisy forces.
 const DENSE_SMOOTH_FLOW = true;
 
 // Force a globally smooth flow by disabling noisy forces at all times.
-const GLOBAL_SMOOTH_FLOW = true;
+const GLOBAL_SMOOTH_FLOW = false; // DISABLED - allow distinct per-kind behaviors
 
 // Collision/packing: make collision radius match visual size (helps prevent overlap/whitening).
 const COLLISION_RADIUS_SCALE = 2;
@@ -2312,6 +2307,96 @@ function getCohesionGrid(list, cellSize) {
   return cohesionGridCache;
 }
 
+// Magnetic filament chain building: creates k-nearest neighbor links for magnetic particles
+// to form elongated threads (anisotropic, longitudinal connections)
+function buildMagneticChains(list, k = 3) {
+  // Clear all existing magnetic chain links
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || p.kind !== "mag") continue;
+    p.magPrev = null;
+    p.magNext = null;
+    p.magTangent.x = 0;
+    p.magTangent.y = 0;
+  }
+
+  // Extract only magnetic particles with their indices
+  const magParticles = [];
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || p.kind !== "mag") continue;
+    magParticles.push({ particle: p, index: i });
+  }
+
+  if (magParticles.length < 2) return;
+
+  // For each magnetic particle, find k-nearest magnetic neighbors
+  // and establish forward/backward chain links
+  for (let i = 0; i < magParticles.length; i++) {
+    const { particle: p } = magParticles[i];
+
+    // Find k-nearest neighbors
+    const neighbors = [];
+    for (let j = 0; j < magParticles.length; j++) {
+      if (i === j) continue;
+      const { particle: q } = magParticles[j];
+      const dx = q.pos.x - p.pos.x;
+      const dy = q.pos.y - p.pos.y;
+      const d2 = dx * dx + dy * dy;
+      neighbors.push({ particle: q, dist2: d2, dx, dy });
+    }
+
+    // Sort by distance and take k nearest
+    neighbors.sort((a, b) => a.dist2 - b.dist2);
+    const kNearest = neighbors.slice(0, k);
+
+    if (kNearest.length === 0) continue;
+
+    // Compute local tangent direction from velocity + nearest neighbor directions
+    let tx = p.vel.x;
+    let ty = p.vel.y;
+    for (let n of kNearest) {
+      tx += n.dx * 0.3;
+      ty += n.dy * 0.3;
+    }
+    const tmag = sqrt(tx * tx + ty * ty) + 1e-6;
+    tx /= tmag;
+    ty /= tmag;
+    p.magTangent.x = tx;
+    p.magTangent.y = ty;
+
+    // Find the most forward and most backward neighbors along the tangent
+    let maxForwardDot = -1;
+    let maxBackwardDot = -1;
+    let forwardNeighbor = null;
+    let backwardNeighbor = null;
+
+    for (let n of kNearest) {
+      const d = sqrt(n.dist2);
+      const nx = n.dx / d;
+      const ny = n.dy / d;
+      const dot = nx * tx + ny * ty;
+
+      if (dot > maxForwardDot) {
+        maxForwardDot = dot;
+        forwardNeighbor = n.particle;
+      }
+      if (dot < maxBackwardDot) {
+        maxBackwardDot = dot;
+        backwardNeighbor = n.particle;
+      }
+    }
+
+    // Establish bidirectional links (only if not already linked to avoid conflicts)
+    if (forwardNeighbor && !p.magNext) {
+      p.magNext = forwardNeighbor;
+    }
+    if (backwardNeighbor && !p.magPrev) {
+      p.magPrev = backwardNeighbor;
+    }
+  }
+}
+
 function buildNeighborGrid(list, cellSize) {
   // PERF: build into a reused Map and pooled arrays.
   const grid = new Map();
@@ -2426,6 +2511,9 @@ function getAlignmentGrid(list, cellSize) {
 }
 
 function computeCollisionRadius(p) {
+  // X-ray blob particles should NOT collide - collision pushes them apart
+  if (p.kind === "xray" && p.blobId) return 0; // zero radius = no collision
+
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const s = p.size * (prof.sizeMult || 1.0) * PARTICLE_SIZE_SCALE;
   return max(1.2, (s * 0.5) * COLLISION_RADIUS_SCALE);
@@ -2516,6 +2604,8 @@ function sampleDensityGradient(grid, idx) {
 
 function applyDensityCoupling(p, T, scale) {
   if (!densAll) return;
+  // X-ray blob particles should IGNORE density pressure - it pushes them apart
+  if (p.kind === "xray" && p.blobId) return;
   if (scale === undefined) scale = 1.0;
 
   const sx = DENSITY_W / max(1, width);
@@ -3189,6 +3279,12 @@ function applyVolumetricMix(p, T) {
 }
 
 function applyCohesion(p, index, grid, cellSize, forceScale) {
+  // X-ray blob particles should ONLY use blob cohesion, not global cohesion
+  if (p.kind === "xray" && p.blobId) return;
+
+  // OPTION 2: Skip cohesion for magnetic (uses filament force) and electrons (individual flutter)
+  if (p.kind === "mag" || p.kind === "electrons") return;
+
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const radius = prof.cohesionRadius || 0;
   if (radius <= 0) return;
@@ -3269,7 +3365,180 @@ function applyCohesion(p, index, grid, cellSize, forceScale) {
   p.vel.y += fy * s;
 }
 
+// Apply magnetic filament force: creates elongated, string-like structures
+// High coherence = straight, continuous filaments
+// Low coherence = jagged, broken, zigzag filaments
+function applyMagneticFilamentForce(p, magneticCoherence) {
+  if (p.kind !== "mag") return;
+
+  // Coherence controls organization vs chaos
+  const coherence = constrain(magneticCoherence, 0, 1);
+
+  // Get magnetic behavior config
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+
+  // Spring constants for longitudinal (forward/back) chaining (using config values)
+  const springStrength = lerp(
+    magBehavior.springStrengthLow || 0.08,
+    magBehavior.springStrengthHigh || 0.28,
+    coherence
+  );
+  const springMaxForce = lerp(
+    magBehavior.springMaxForceLow || 0.15,
+    magBehavior.springMaxForceHigh || 0.45,
+    coherence
+  );
+
+  // Lateral separation strength (keep threads thin, not blobby)
+  const lateralSeparation = lerp(
+    magBehavior.lateralSeparationLow || 0.55,
+    magBehavior.lateralSeparationHigh || 0.35,
+    coherence
+  );
+
+  // Velocity alignment along filament tangent
+  const alignmentStrength = lerp(
+    magBehavior.alignmentStrengthLow || 0.02,
+    magBehavior.alignmentStrengthHigh || 0.16,
+    coherence
+  );
+
+  // Directional noise amplitude (creates kinks and zigzags)
+  const noiseAmp = lerp(
+    magBehavior.noiseAmpLow || 0.35,
+    magBehavior.noiseAmpHigh || 0.08,
+    coherence
+  );
+
+  let springForceX = 0;
+  let springForceY = 0;
+  let alignVelX = 0;
+  let alignVelY = 0;
+  let chainCount = 0;
+
+  // Apply spring force to chain neighbors (forward and backward)
+  if (p.magNext) {
+    const q = p.magNext;
+    const dx = q.pos.x - p.pos.x;
+    const dy = q.pos.y - p.pos.y;
+    const d = sqrt(dx * dx + dy * dy) + 1e-6;
+
+    // Spring force along the chain (attractive)
+    springForceX += (dx / d) * springStrength;
+    springForceY += (dy / d) * springStrength;
+
+    // Collect velocity for alignment
+    alignVelX += q.vel.x;
+    alignVelY += q.vel.y;
+    chainCount++;
+  }
+
+  if (p.magPrev) {
+    const q = p.magPrev;
+    const dx = q.pos.x - p.pos.x;
+    const dy = q.pos.y - p.pos.y;
+    const d = sqrt(dx * dx + dy * dy) + 1e-6;
+
+    // Spring force along the chain (attractive)
+    springForceX += (dx / d) * springStrength;
+    springForceY += (dy / d) * springStrength;
+
+    // Collect velocity for alignment
+    alignVelX += q.vel.x;
+    alignVelY += q.vel.y;
+    chainCount++;
+  }
+
+  // Clamp spring force
+  const springMag = sqrt(springForceX * springForceX + springForceY * springForceY) + 1e-6;
+  if (springMag > springMaxForce) {
+    springForceX *= springMaxForce / springMag;
+    springForceY *= springMaxForce / springMag;
+  }
+
+  // Apply spring force
+  p.vel.x += springForceX;
+  p.vel.y += springForceY;
+
+  // Velocity alignment: align velocity with chain neighbors
+  if (chainCount > 0) {
+    const avgVelX = alignVelX / chainCount;
+    const avgVelY = alignVelY / chainCount;
+    const alignX = (avgVelX - p.vel.x) * alignmentStrength;
+    const alignY = (avgVelY - p.vel.y) * alignmentStrength;
+    p.vel.x += alignX;
+    p.vel.y += alignY;
+  }
+
+  // Add directional noise along and perpendicular to tangent (creates curvature/kinks)
+  if (noiseAmp > 0.001) {
+    const t = millis() * 0.001;
+    const nx = p.pos.x * 0.005 + t * 0.1;
+    const ny = p.pos.y * 0.005 + t * 0.1;
+
+    // Noise along tangent (creates longitudinal disturbance)
+    const noiseLong = (noise(nx, ny, p.seed * 0.01) - 0.5) * 2.0;
+    const noiseLat = (noise(nx + 5.5, ny + 7.7, p.seed * 0.01 + 10) - 0.5) * 2.0;
+
+    const tx = p.magTangent.x;
+    const ty = p.magTangent.y;
+    const px = -ty; // perpendicular to tangent
+    const py = tx;
+
+    p.vel.x += (tx * noiseLong + px * noiseLat) * noiseAmp;
+    p.vel.y += (ty * noiseLong + py * noiseLat) * noiseAmp;
+  }
+
+  // Lateral separation from other magnetic particles (prevents blobbing)
+  // This is a simplified repulsion that keeps the thread thin
+  const separationRadius = magBehavior.separationRadius || 45;
+  let sepX = 0;
+  let sepY = 0;
+  let sepCount = 0;
+
+  // Check nearby magnetic particles (crude linear scan for now; can optimize later)
+  for (let i = 0; i < particles.length; i++) {
+    const q = particles[i];
+    if (!q || q === p || q.kind !== "mag") continue;
+
+    // Skip chain neighbors (we want to stay close to them)
+    if (q === p.magNext || q === p.magPrev) continue;
+
+    const dx = p.pos.x - q.pos.x;
+    const dy = p.pos.y - q.pos.y;
+    const d2 = dx * dx + dy * dy;
+
+    if (d2 > separationRadius * separationRadius || d2 < 0.01) continue;
+
+    const d = sqrt(d2);
+    const w = (1.0 - d / separationRadius);
+    sepX += (dx / d) * w;
+    sepY += (dy / d) * w;
+    sepCount++;
+
+    if (sepCount >= 8) break; // limit check count
+  }
+
+  if (sepCount > 0) {
+    sepX = (sepX / sepCount) * lateralSeparation;
+    sepY = (sepY / sepCount) * lateralSeparation;
+    p.vel.x += sepX;
+    p.vel.y += sepY;
+  }
+}
+
 function applyCalmOrbit(p, center, scale, pullScale) {
+  // X-ray particles in blobs should IGNORE global orbital forces to stay clumped
+  if (p.kind === "xray" && p.blobId) {
+    scale = 0.05; // reduce to 5% for blob particles
+  }
+  // Reduce orbital force for magnetic (filament behavior) and electrons (jittery individual motion)
+  if (p.kind === "mag") {
+    scale = (scale || 1.0) * 0.1; // 10% for magnetic - MUCH less, let filament dominate completely
+  }
+  if (p.kind === "electrons") {
+    scale = (scale || 1.0) * 0.4; // 40% for electrons - let flutter dominate
+  }
   if (scale === undefined) scale = 1.0;
   const pull = (pullScale === undefined) ? 1.0 : pullScale;
   // tangential swirl around center (scalar math: avoids p5.Vector allocations)
@@ -3307,6 +3576,17 @@ function applyCalmOrbit(p, center, scale, pullScale) {
 }
 
 function applyAgeSpiral(p, T, ageRank01, scale, pullScale) {
+  // X-ray particles in blobs should IGNORE age spiral to stay clumped
+  if (p.kind === "xray" && p.blobId) {
+    scale = 0.03; // reduce to 3% for blob particles
+  }
+  // Reduce age spiral for magnetic and electrons to preserve their unique motion
+  if (p.kind === "mag") {
+    scale = (scale || 1.0) * 0.05; // 5% for magnetic - almost none, filament structure is the priority
+  }
+  if (p.kind === "electrons") {
+    scale = (scale || 1.0) * 0.35; // 35% for electrons
+  }
   if (scale === undefined) scale = 1.0;
   const pullScaleUse = (pullScale === undefined) ? 1.0 : pullScale;
   if (DEBUG_DISABLE_AGE_SPIRAL) return;
@@ -3412,6 +3692,9 @@ function applyLayerBehavior(p, T) {
     // If this xray belongs to a rigid segment, keep it locked to the segment shape.
     if (p.segId) applyXraySegmentConstraint(p);
 
+    // Blob particles should NOT receive kick forces - they need to stay clumped
+    if (p.blobId) return;
+
     const b = LAYER_BEHAVIOR.xray;
     // IMPORTANT: X-ray "peak memory" is encoded by particle age/order.
     // Do not time-decay strength here; let particles persist until they become the oldest
@@ -3428,6 +3711,9 @@ function applyLayerBehavior(p, T) {
 }
 
 function applyEddyField(p, T, pullScale) {
+  // X-ray particles in blobs should IGNORE eddy field to stay clumped
+  if (p.kind === "xray" && p.blobId) return; // completely skip for blob particles
+
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const s = prof.eddyMult * kindStrength(p.kind);
   if (s <= 0.0001) return;
@@ -5301,6 +5587,19 @@ function updateParticles(T) {
 	  const swirlBoost = 1.0 + mag * swirlMagMult;
   const cohesionCellSize = 110;
   const cohesionGrid = getCohesionGrid(particles, cohesionCellSize);
+
+  // Build magnetic particle chains for filament structure
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const chainRebuildEvery = magBehavior.chainRebuildEvery || MAGNETIC_CHAIN_EVERY;
+  const chainK = magBehavior.chainK || 3;
+  if ((frameCount - magneticChainFrame) >= chainRebuildEvery) {
+    buildMagneticChains(particles, chainK);
+    magneticChainFrame = frameCount;
+  }
+
+  // Magnetic coherence: high mag signal = organized filaments, low = chaotic/broken filaments
+  const magneticCoherence = constrain(mag, 0, 1);
+
   const stridePhase = frameCount % COHESION_APPLY_STRIDE;
   const heavyPhase = frameCount % HEAVY_FIELD_STRIDE;
   const alignmentPhase = frameCount % ALIGNMENT_STRIDE;
@@ -5340,7 +5639,8 @@ function updateParticles(T) {
     alignmentCellSize,
     cohesionGrid,
     cohesionCellSize,
-    ageRankDen
+    ageRankDen,
+    magneticCoherence
   );
 
   if (PROF_LITE) {
@@ -5475,7 +5775,8 @@ function applyForcesMainThread(
   alignmentCellSize,
   cohesionGrid,
   cohesionCellSize,
-  ageRankDen
+  ageRankDen,
+  magneticCoherence
 ) {
   applyForcesStage({
     particles,
@@ -5501,6 +5802,7 @@ function applyForcesMainThread(
     enableDensity,
     enableCohesion,
     enableXrayBlobForce,
+    magneticCoherence,
     infoRec: infoRec.isRecording() ? infoRec : null,
     infoRecSampleStride: INFOREC_FORCES_SAMPLE_STRIDE,
     DENSE_DISABLE_COHESION,
@@ -5513,10 +5815,12 @@ function applyForcesMainThread(
     applyElectronBreath,
     applyAgeSpiral,
     applyLayerBehavior,
+    applyLayerStratification,
     applyVolumetricMix,
     applyDensityCoupling,
     applyAlignment,
     applyCohesion,
+    applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
     returnToPool,
@@ -5857,6 +6161,10 @@ function Particle(x, y, vx, vy, life, size, col, kind) {
   this.linkGen = 0;
   this.xrayTight = 0; // per-particle "rigidity" for X-ray spikes (0..1)
   this.xrayRadPref = 0; // stable radius preference inside xray blobs (0..1)
+  // Magnetic filament chain properties
+  this.magPrev = null; // previous particle in magnetic chain
+  this.magNext = null; // next particle in magnetic chain
+  this.magTangent = createVector(0, 0); // local filament tangent direction
   this.active = true;
   this.generation = 0;
 }
@@ -5895,6 +6203,12 @@ Particle.prototype.resetFromSpawn = function(kind, x, y, vx, vy, life, size, col
   this.xrayTight = 0;
   this.xrayRadPref = 0;
 
+  // Reset magnetic chain links
+  this.magPrev = null;
+  this.magNext = null;
+  this.magTangent.x = 0;
+  this.magTangent.y = 0;
+
   this.active = true;
   this.generation = (this.generation + 1) | 0;
 };
@@ -5910,6 +6224,8 @@ Particle.prototype.deactivate = function() {
   this.linkGen = 0;
   this.xrayTight = 0;
   this.xrayRadPref = 0;
+  this.magPrev = null;
+  this.magNext = null;
   this.layerTargetFrac = null;
   this.strength = 1.0;
   this.life = 0;

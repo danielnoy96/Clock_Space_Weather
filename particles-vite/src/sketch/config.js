@@ -2,11 +2,35 @@
 
 // Visual behavior profiles (make each force readable by "shape in motion")
 export const LAYER_BEHAVIOR = {
+  // X-ray: discrete events form coherent blobs (signature = clumps)
+  // - eventDecay: memory decay rate (higher = longer blob coherence)
+  // - kick: tangential acceleration on spikes
+  // - Blobs use: cohesion (spring to centroid) + swirl + moderate separation
   xray: { eventDecay: 0.992, kick: 0.22 },
   electrons: { noiseAmp: 0.22, noiseFreq: 0.65, flutter: 0.22 },
   protons: { calm: 0.985 },
   h_ions: { flowAmp: 0.18, flowFreq: 0.18, align: 0.05 },
-  mag: { struct: 0.16, structFreq: 0.1, settle: 0.975 },
+  mag: {
+    struct: 0.16,
+    structFreq: 0.1,
+    settle: 0.975,
+    // Filament behavior (string/thread signature)
+    // Goal: Calm, controlled filaments like slow-motion magnetic field lines
+    chainK: 4,                    // k-nearest neighbors for chain building (more connections)
+    chainRebuildEvery: 2,         // rebuild chains every 2 frames (more responsive)
+    springStrengthLow: 0.12,      // spring force at low coherence (gentle, was 0.45)
+    springStrengthHigh: 0.35,     // spring force at high coherence (moderate, was 1.20)
+    springMaxForceLow: 0.20,      // max spring force at low coherence (gentle cap, was 0.75)
+    springMaxForceHigh: 0.50,     // max spring force at high coherence (moderate cap, was 1.80)
+    lateralSeparationLow: 0.08,   // lateral separation at low coherence (gentle, was 0.25)
+    lateralSeparationHigh: 0.05,  // lateral separation at high coherence (very gentle, was 0.10)
+    alignmentStrengthLow: 0.04,   // velocity alignment at low coherence (gentle, was 0.08)
+    alignmentStrengthHigh: 0.15,  // velocity alignment at high coherence (moderate, was 0.45)
+    noiseAmpLow: 0.18,            // directional noise at low coherence (gentle waves, was 0.65)
+    noiseAmpHigh: 0.02,           // directional noise at high coherence - very straight
+    separationRadius: 45,         // radius for lateral separation from non-chain neighbors
+    drawChainLines: true,         // visual debug: draw lines between chain-linked particles
+  },
 };
 
 export const COL = {
@@ -47,12 +71,12 @@ export const PARTICLE_PROFILE = {
     alphaBase: 16,
     alphaStrength: 90,
     sizeMult: 1.0,
-    dragMult: 0.992,
-    viscMult: 0.6,
-    swirlMult: 1.35,
-    jitterMult: 0.55,
-    eddyMult: 1.0,
-    reservoirJitterMult: 0.55,
+    dragMult: 0.998,             // MUCH higher drag (was 0.992) - slow controlled motion like protons
+    viscMult: 1.4,               // Higher viscosity (was 0.6) - resist sudden changes
+    swirlMult: 0.35,             // Reduced swirl (was 1.35) - less chaotic spinning
+    jitterMult: 0.15,            // Much less jitter (was 0.55) - smooth motion
+    eddyMult: 0.25,              // Reduced eddy turbulence (was 1.0) - calmer
+    reservoirJitterMult: 0.15,   // Less emission jitter (was 0.55) - controlled
     flickerHz: 0.03,
     cohesionRadius: 170,
     cohesionStrength: 0.18,
@@ -61,8 +85,8 @@ export const PARTICLE_PROFILE = {
     ringStrength: 0.02,
     separationRadiusMult: 1.0,
     separationStrength: 0.28,
-    layerRadiusFrac: 0.62,
-    layerStrength: 0.01,
+    layerRadiusFrac: 0.50,      // MIDDLE ring (distinct from electrons/h-ions)
+    layerStrength: 0.12,        // MUCH STRONGER (was 0.01) - force to stay in ring
   },
   h_ions: {
     alphaBase: 14,
@@ -82,8 +106,8 @@ export const PARTICLE_PROFILE = {
     streamStrength: 0.02,
     separationRadiusMult: 1.05,
     separationStrength: 0.25,
-    layerRadiusFrac: 0.46,
-    layerStrength: 0.015,
+    layerRadiusFrac: 0.35,      // INNER-MIDDLE ring (distinct)
+    layerStrength: 0.10,        // MUCH STRONGER (was 0.015)
   },
   electrons: {
     alphaBase: 16,
@@ -103,8 +127,8 @@ export const PARTICLE_PROFILE = {
     breatheStrength: 0.02,
     separationRadiusMult: 0.95,
     separationStrength: 0.22,
-    layerRadiusFrac: 0.74,
-    layerStrength: 0.02,
+    layerRadiusFrac: 0.80,      // OUTER ring (far from others)
+    layerStrength: 0.15,        // MUCH STRONGER (was 0.02) - keep scattered but in outer ring
   },
   protons: {
     alphaBase: 60,
@@ -123,8 +147,8 @@ export const PARTICLE_PROFILE = {
     cohesionMaxForce: 0.3,
     separationRadiusMult: 1.15,
     separationStrength: 0.2,
-    layerRadiusFrac: 0.34,
-    layerStrength: 0.018,
+    layerRadiusFrac: 0.25,      // INNER ring (dense core)
+    layerStrength: 0.08,        // MUCH STRONGER (was 0.018)
   },
 };
 
