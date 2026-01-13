@@ -15,27 +15,33 @@ export const LAYER_BEHAVIOR = {
     structFreq: 0.1,
     settle: 0.975,
     // Filament behavior (string/thread signature)
-    // Goal: Calm, controlled filaments like slow-motion magnetic field lines
-    chainK: 4,                    // k-nearest neighbors for chain building (more connections)
-    chainRebuildEvery: 2,         // rebuild chains every 2 frames (more responsive)
-    springStrengthLow: 0.12,      // spring force at low coherence (gentle, was 0.45)
-    springStrengthHigh: 0.35,     // spring force at high coherence (moderate, was 1.20)
-    springMaxForceLow: 0.20,      // max spring force at low coherence (gentle cap, was 0.75)
-    springMaxForceHigh: 0.50,     // max spring force at high coherence (moderate cap, was 1.80)
-    lateralSeparationLow: 0.08,   // lateral separation at low coherence (gentle, was 0.25)
-    lateralSeparationHigh: 0.05,  // lateral separation at high coherence (very gentle, was 0.10)
-    alignmentStrengthLow: 0.04,   // velocity alignment at low coherence (gentle, was 0.08)
-    alignmentStrengthHigh: 0.15,  // velocity alignment at high coherence (moderate, was 0.45)
-    noiseAmpLow: 0.18,            // directional noise at low coherence (gentle waves, was 0.65)
-    noiseAmpHigh: 0.02,           // directional noise at high coherence - very straight
-    restLength: 28,               // preferred spacing between chained particles
-    separationRadius: 45,         // radius for lateral separation from non-chain neighbors
+    // EMIT ALREADY CONNECTED: Particles spawn linked into chains from clock hands
+    // Goal: STRONG spring connections like graph edges - should look like connected line segments
+    chainK: 2,                    // k-nearest neighbors for chain building (avoid branching)
+    chainRebuildEvery: 4,         // rebuild chains periodically (used when not pre-chained)
+    springStrengthLow: 0.18,      // spring accel at low coherence
+    springStrengthHigh: 0.55,     // spring accel at high coherence (stiffer thread)
+    springMaxForceLow: 0.40,      // clamp per-frame spring accel (low coherence)
+    springMaxForceHigh: 1.25,     // clamp per-frame spring accel (high coherence)
+    lateralSeparationLow: 1.40,   // strong self-avoidance at low coherence (prevents blobs)
+    lateralSeparationHigh: 0.90,  // self-avoidance at high coherence (keeps thread thin)
+    alignmentStrengthLow: 0.25,   // velocity alignment at low coherence - moderate coordination
+    alignmentStrengthHigh: 0.65,  // velocity alignment at high coherence - strong coordinated motion
+    tangentAlignLow: 0.04,        // align velocity to local filament tangent at low coherence
+    tangentAlignHigh: 0.22,       // align velocity to local filament tangent at high coherence (straighter threads)
+    bendStrengthLow: 0.01,        // curvature tightening at low coherence (kinks allowed)
+    bendStrengthHigh: 0.07,       // curvature tightening at high coherence (straight filaments)
+    noiseAmpLow: 0.16,            // directional noise at low coherence (more jaggedness)
+    noiseAmpHigh: 0.02,           // directional noise at high coherence (almost straight)
+    restLength: 40,               // preferred spacing between chained particles
+    separationRadius: 90,         // self-avoidance radius (prevents coiling/clumps)
+    separationMaxNeighbors: 10,   // max neighbors to consider for lateral separation
     emitFromHandsChain: true,     // emit mag as pre-connected chains from hands
     historyOuterFrac: 0.92,       // newest radius (time axis)
     historyInnerFrac: 0.18,       // ~4 minutes ago radius
-    historyStrength: 0.007,       // radial pull strength toward the time axis
-    historyBlend: 0.75,           // 0=current coherence, 1=spawn-time coherence (history)
-    drawChainLines: true,         // visual debug: draw lines between chain-linked particles
+    historyStrength: 0.055,       // radial pull strength toward the time axis - strong time-based stratification
+    historyBlend: 0.90,           // 0=current coherence, 1=spawn-time coherence - mostly use birth coherence
+    drawChainLines: false,        // visual debug: draw lines between chain-linked particles (off - using spiral force instead)
   },
 };
 
@@ -77,22 +83,22 @@ export const PARTICLE_PROFILE = {
     alphaBase: 16,
     alphaStrength: 90,
     sizeMult: 1.0,
-    dragMult: 0.998,             // MUCH higher drag (was 0.992) - slow controlled motion like protons
-    viscMult: 1.4,               // Higher viscosity (was 0.6) - resist sudden changes
-    swirlMult: 0.35,             // Reduced swirl (was 1.35) - less chaotic spinning
-    jitterMult: 0.15,            // Much less jitter (was 0.55) - smooth motion
-    eddyMult: 0.25,              // Reduced eddy turbulence (was 1.0) - calmer
-    reservoirJitterMult: 0.15,   // Less emission jitter (was 0.55) - controlled
+    dragMult: 0.988,             // Low drag to allow thread motion
+    viscMult: 0.6,               // Moderate viscosity - flows with medium but maintains threads
+    swirlMult: 0.25,             // Moderate swirl - participates in medium flow
+    jitterMult: 0.15,            // Light jitter - natural motion
+    eddyMult: 0.20,              // Light eddy - flows with turbulence
+    reservoirJitterMult: 0.12,   // Light emission jitter
     flickerHz: 0.03,
     cohesionRadius: 170,
-    cohesionStrength: 0.18,
+    cohesionStrength: 0.12,      // Light cohesion - subtle grouping tendency
     cohesionMaxNeighbors: 14,
-    cohesionMaxForce: 0.26,
-    ringStrength: 0.02,
+    cohesionMaxForce: 0.18,      // Moderate cohesion force
+    ringStrength: 0.015,         // Minimal ring force
     separationRadiusMult: 1.0,
-    separationStrength: 0.28,
-    layerRadiusFrac: 0.50,      // MIDDLE ring (distinct from electrons/h-ions)
-    layerStrength: 0.12,        // MUCH STRONGER (was 0.01) - force to stay in ring
+    separationStrength: 0.20,    // Moderate separation - prevents excessive overlap
+    layerRadiusFrac: 0.50,       // MIDDLE ring (distinct from electrons/h-ions)
+    layerStrength: 0.02,         // Minimal layer force - subtle stratification
   },
   h_ions: {
     alphaBase: 14,
@@ -195,6 +201,15 @@ export const CLOCK_TUNING = {
   electronTremorCoupling: 0.16,
   hionFlowCoupling: 0.14,
   magAlignCoupling: 0.08,
+
+  // Distribution: reduce ring trapping and let particles occupy the full clock disk.
+  // 0 = strict per-kind rings, 1 = per-particle targets sampled across the disk.
+  kindRingSpreadMix: 0.78,
+  // Allow targets close to center (previously a hard minimum created a visible empty core).
+  kindRingMinFrac: 0.03,
+  kindRingMaxFrac: 0.98,
+  // Global multiplier for the per-particle radial target force.
+  layerStratificationStrengthMult: 0.14,
 };
 
 // Global time scaling.

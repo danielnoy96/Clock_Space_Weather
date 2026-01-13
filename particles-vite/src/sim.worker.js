@@ -157,15 +157,11 @@ function stepSim(params, activeN) {
 
     // Per-kind micro-behavior (approximates Particle.update + applyLayerBehavior without p5/noise).
     const k = kind ? (kind[i] | 0) : 2; // default protons
-    if (k === 4 && enableCohesion) {
-      // mag: tiny rotation warble based on seed + time
-      const sd = seed ? seed[i] : 0.0;
-      const w = (Math.sin(sd + nowS * (1.2 + 3.2 * mag)) ) * 0.03 * mag;
-      const ca = Math.cos(w), sa = Math.sin(w);
-      const nvx = vxi * ca - vyi * sa;
-      const nvy = vxi * sa + vyi * ca;
-      vxi = nvx;
-      vyi = nvy;
+    if (k === 4) {
+      // mag: filament/chaining is handled on the main thread (needs neighbor links + path state).
+      // Keep only mild damping so accidental inclusion in the worker doesn't create "fake threads".
+      vxi *= 0.99;
+      vyi *= 0.99;
     } else if (k === 1 && enableCohesion) {
       // electrons: fast vibration (LUT-based), scales with electrons proxy
       const sd = seed ? seed[i] : 0.0;
