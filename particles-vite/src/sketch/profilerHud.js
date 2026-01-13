@@ -38,7 +38,7 @@ export function drawLiteProfilerHUD(state, opts) {
   while (state.ftWindow10s.length && (now - state.ftWindow10s[0].t) > 10000) state.ftWindow10s.shift();
   if (!state.fpsDisplayNext || now >= state.fpsDisplayNext) {
     state.fpsDisplay = frameRate();
-    state.fpsDisplayNext = now + 250; // update 4x/sec to keep it readable
+    state.fpsDisplayNext = now + 1000; // update 1x/sec so spikes are easier to read
     let worst = 0;
     for (let i = 0; i < state.ftWindow2s.length; i++) {
       if (state.ftWindow2s[i].ft > worst) worst = state.ftWindow2s[i].ft;
@@ -63,24 +63,53 @@ export function drawLiteProfilerHUD(state, opts) {
   const fps10 = state.fps10 || 0;
   const n = particlesActive | 0;
   const col = profLite.colMs;
+  const colL = profLite.colLastMs || 0;
   const drw = profLite.particlesDrawMs;
+  const drwL = profLite.particlesDrawLastMs || 0;
   const clk = profLite.clockDrawMs;
+  const clkL = profLite.clockDrawLastMs || 0;
   const clkStatic = profLite.clockStaticMs;
   const clkDyn = profLite.clockDynamicMs;
   const clkOther = profLite.clockOtherMs;
+  const msTime = profLite.timeMs || 0;
+  const msTimeL = profLite.timeLastMs || 0;
+  const msAudio = profLite.audioMs || 0;
+  const msAudioL = profLite.audioLastMs || 0;
   const hud = profLite.hudDrawMs;
+  const hudL = profLite.hudDrawLastMs || 0;
   const bg = profLite.backgroundMs;
+  const bgL = profLite.backgroundLastMs || 0;
   const msFace = profLite.faceMs;
   const msFields = profLite.fieldsMs;
+  const msFieldsL = profLite.fieldsLastMs || 0;
+  const pixiPresent = profLite.pixiPresentMs || 0;
+  const pixiPresentL = profLite.pixiPresentLastMs || 0;
   const msForces = profLite.forcesMs;
   const msHouse = profLite.houseEmitMs + profLite.houseCapMs + profLite.houseCleanMs;
   const upd = msFace + msFields + msForces + msHouse;
-  const tot = upd + col + drw + clk + hud + bg;
+  const tot = upd + col + drw + clk + hud + bg + pixiPresent + msTime + msAudio;
+  const slack = ft - tot;
+  const jsL = profLite.jsFrameLastMs || 0;
+  const measuredL = colL + drwL + clkL + hudL + bgL + pixiPresentL + msTimeL + msAudioL + msFieldsL;
+  const slackL = ft - measuredL;
+  const hot = (() => {
+    let name = "upd";
+    let v = upd;
+    if (col > v) { name = "col"; v = col; }
+    if (drw > v) { name = "particles"; v = drw; }
+    if (clk > v) { name = "clock"; v = clk; }
+    if (hud > v) { name = "hud"; v = hud; }
+    if (bg > v) { name = "bg"; v = bg; }
+    if (pixiPresent > v) { name = "present"; v = pixiPresent; }
+    if (msAudio > v) { name = "audio"; v = msAudio; }
+    if (msTime > v) { name = "time"; v = msTime; }
+    return { name, v };
+  })();
 
   push();
   noStroke();
   fill(0, 170);
-  const extraLines = (debugClumpDiag ? 1 : 0) + (debugCollisionAudit ? 1 : 0);
+  const extraLines = 1 + (debugClumpDiag ? 1 : 0) + (debugCollisionAudit ? 1 : 0);
   rect(x - 8, y - 8, 640, 100 + extraLines * 18, 10);
   fill(255, 230);
   textAlign(LEFT, TOP);
@@ -99,7 +128,11 @@ export function drawLiteProfilerHUD(state, opts) {
     y
   );
   text(
-    `N ${n} | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | bg ${nf(bg, 1, 2)}ms | upd ${nf(
+    `N ${n} | hot ${hot.name} ${nf(hot.v, 1, 2)}ms | pg ${USE_LOWRES_RENDER ? Math.round(PG_SCALE * 100) : 100}% | bg ${nf(
+      bg,
+      1,
+      2
+    )}ms | upd ${nf(
       upd,
       1,
       2
@@ -107,9 +140,26 @@ export function drawLiteProfilerHUD(state, opts) {
       hud,
       1,
       2
-    )}ms | total ${nf(tot, 1, 2)}ms`,
+    )}ms | time ${nf(msTime, 1, 2)}ms | audio ${nf(msAudio, 1, 2)}ms | present ${nf(pixiPresent, 1, 2)}ms | total ${nf(
+      tot,
+      1,
+      2
+    )}ms | slack ${nf(slack, 1, 2)}ms`,
     x,
     y + 18
+  );
+  text(
+    `last: col ${nf(colL, 1, 2)}ms | particles ${nf(drwL, 1, 2)}ms | clock ${nf(clkL, 1, 2)}ms | fields ${nf(
+      msFieldsL,
+      1,
+      2
+    )}ms | present ${nf(pixiPresentL, 1, 2)}ms | time ${nf(msTimeL, 1, 2)}ms | audio ${nf(
+      msAudioL,
+      1,
+      2
+    )}ms | js ${nf(jsL, 1, 2)}ms | slackL ${nf(slackL, 1, 2)}ms`,
+    x,
+    y + 90
   );
   text(
     `stage upd ${nf(upd, 1, 2)}ms | col ${nf(col, 1, 2)}ms | render ${nf(drw, 1, 2)}ms | face ${nf(
@@ -173,7 +223,16 @@ export function drawLiteProfilerHUD(state, opts) {
     x,
     y + 72
   );
-  let lineY = y + 90;
+  text(
+    (() => {
+      const jsL = profLite.jsFrameLastMs || 0;
+      const gapL = profLite.frameGapLastMs || 0;
+      return `gap ${nf(gapL, 1, 2)}ms | js ${nf(jsL, 1, 2)}ms | slack ${nf(slack, 1, 2)}ms`;
+    })(),
+    x,
+    y + 90
+  );
+  let lineY = y + 108;
   if (debugCollisionAudit && collisionAudit) {
     const avgOv = (collisionAudit.pairsOverlap > 0) ? (collisionAudit.sumOverlap / collisionAudit.pairsOverlap) : 0;
     const postAvgOv = (collisionAudit.postPairsOverlap > 0) ? (collisionAudit.postSumOverlap / collisionAudit.postPairsOverlap) : 0;

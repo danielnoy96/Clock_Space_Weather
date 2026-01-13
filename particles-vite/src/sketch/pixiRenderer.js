@@ -362,7 +362,7 @@ export async function initPixiRenderer({ parent, width, height }) {
   stage.addChild(headsGfx);
 
   const field = { sprite: null, layer: fieldLayer };
-  const clockStatic = { sprite: null, layer: clockStaticLayer };
+  const clockStatic = { sprite: null, layer: clockStaticLayer, lastRedrawCount: -1, lastW: 0, lastH: 0 };
 
   const particleTexture = createSoftCircleTexture(64);
   const particleLayer = new Container();
@@ -426,8 +426,13 @@ function drawHandPoly(gfx, pts, col, alpha01) {
   gfx.fill({ color: col, alpha: alpha01 });
 }
 
-function drawTriangle(gfx, a, b, c, col, alpha01) {
-  gfx.poly([a.x, a.y, b.x, b.y, c.x, c.y]);
+function drawTriangle(gfx, ax, ay, bx, by, cx, cy, col, alpha01, tmp) {
+  // PERF: reuse a tiny array to avoid per-triangle allocations.
+  const pts = tmp || [0, 0, 0, 0, 0, 0];
+  pts[0] = ax; pts[1] = ay;
+  pts[2] = bx; pts[3] = by;
+  pts[4] = cx; pts[5] = cy;
+  gfx.poly(pts);
   gfx.fill({ color: col, alpha: alpha01 });
 }
 
@@ -466,15 +471,30 @@ export function renderPixiFrame(state, opts) {
     millisFn,
     sinFn,
     PI,
+    clockStaticRedrawCount,
+    perfOut,
   } = opts;
+
+  const nowPerf = (typeof performance !== "undefined" && performance.now) ? () => performance.now() : () => Date.now();
+  const tFrame0 = perfOut ? nowPerf() : 0;
+  let t0 = tFrame0;
 
   // Solid background so the chamber never renders "transparent" during chunked face updates.
   {
     const bg = (COL && COL.bg) ? COL.bg : [0, 0, 0];
     const bgCol = rgbToHex(bg);
     const gfx = state.bgGfx;
-    gfx.clear();
-    gfx.rect(0, 0, canvasW, canvasH).fill({ color: bgCol, alpha: 1 });
+
+    const bgKey = (bgCol >>> 0) + ":" + (canvasW | 0) + "x" + (canvasH | 0);
+    if (state._bgKey !== bgKey) {
+      state._bgKey = bgKey;
+      gfx.clear();
+      gfx.rect(0, 0, canvasW, canvasH).fill({ color: bgCol, alpha: 1 });
+    }
+  }
+  if (perfOut) {
+    perfOut.pixiBgMs = nowPerf() - t0;
+    t0 = nowPerf();
   }
 
   // Face field (prefer buffer texture; fallback to p5.Graphics -> canvas texture)
@@ -531,21 +551,39 @@ export function renderPixiFrame(state, opts) {
       state.field.sprite.alpha = 1;
     }
   }
+  if (perfOut) {
+    perfOut.pixiFieldMs = nowPerf() - t0;
+    t0 = nowPerf();
+  }
 
   // Clock static ring (p5.Graphics -> canvas texture)
   {
-    const canvas = canvasFromP5Graphics(clockStaticGraphics);
-    if (canvas) {
-      if (!state.clockStatic.sprite) {
-        state.clockStatic.sprite = new Sprite(Texture.from(canvas));
-        state.clockStatic.layer.addChild(state.clockStatic.sprite);
+    const needsUpdate =
+      (typeof clockStaticRedrawCount === "number" && clockStaticRedrawCount !== state.clockStatic.lastRedrawCount) ||
+      state.clockStatic.lastW !== canvasW ||
+      state.clockStatic.lastH !== canvasH;
+
+    if (needsUpdate) {
+      const canvas = canvasFromP5Graphics(clockStaticGraphics);
+      if (canvas) {
+        if (!state.clockStatic.sprite) {
+          state.clockStatic.sprite = new Sprite(Texture.from(canvas));
+          state.clockStatic.layer.addChild(state.clockStatic.sprite);
+        }
+        ensureCanvasSpriteTexture(state.clockStatic.sprite, canvas);
+        state.clockStatic.sprite.width = canvasW;
+        state.clockStatic.sprite.height = canvasH;
+        state.clockStatic.sprite.x = 0;
+        state.clockStatic.sprite.y = 0;
       }
-      ensureCanvasSpriteTexture(state.clockStatic.sprite, canvas);
-      state.clockStatic.sprite.width = canvasW;
-      state.clockStatic.sprite.height = canvasH;
-      state.clockStatic.sprite.x = 0;
-      state.clockStatic.sprite.y = 0;
+      state.clockStatic.lastRedrawCount = (typeof clockStaticRedrawCount === "number") ? clockStaticRedrawCount : state.clockStatic.lastRedrawCount;
+      state.clockStatic.lastW = canvasW;
+      state.clockStatic.lastH = canvasH;
     }
+  }
+  if (perfOut) {
+    perfOut.pixiClockStaticMs = nowPerf() - t0;
+    t0 = nowPerf();
   }
 
   // Hand shapes (Pixi Graphics)
@@ -556,9 +594,13 @@ export function renderPixiFrame(state, opts) {
     glowGfx.clear();
     mainGfx.clear();
 
+    if (!state._handPts) state._handPts = { hour: [], minute: [], second: [] };
+    if (!state._triPts) state._triPts = [0, 0, 0, 0, 0, 0];
+
     const drawOne = (gfx, which, colHex, alpha01) => {
       const b = computeHandBasis(T, which);
-      const pts = [];
+      const pts = state._handPts[which] || (state._handPts[which] = []);
+      pts.length = 0;
       for (let i = 0; i <= steps; i++) {
         const t = (i / steps) * b.len;
         const ww = handWidthAt(t, b.len, b.headR);
@@ -575,18 +617,28 @@ export function renderPixiFrame(state, opts) {
       }
       drawHandPoly(gfx, pts, colHex, alpha01);
 
-      const baseN1 = { x: b.head.x + b.nrm.x * b.headR, y: b.head.y + b.nrm.y * b.headR };
-      const baseN2 = { x: b.head.x - b.nrm.x * b.headR, y: b.head.y - b.nrm.y * b.headR };
-      const baseD1 = { x: b.head.x + b.dir.x * b.headR, y: b.head.y + b.dir.y * b.headR };
-      const baseD2 = { x: b.head.x - b.dir.x * b.headR, y: b.head.y - b.dir.y * b.headR };
-      const apexF = { x: b.head.x + b.dir.x * b.forwardLen, y: b.head.y + b.dir.y * b.forwardLen };
-      const apexB = { x: b.head.x - b.dir.x * b.backLen, y: b.head.y - b.dir.y * b.backLen };
-      const apexL = { x: b.head.x - b.nrm.x * b.sideLen, y: b.head.y - b.nrm.y * b.sideLen };
-      const apexR = { x: b.head.x + b.nrm.x * b.sideLen, y: b.head.y + b.nrm.y * b.sideLen };
-      drawTriangle(gfx, baseN1, baseN2, apexF, colHex, alpha01);
-      drawTriangle(gfx, baseN1, baseN2, apexB, colHex, alpha01);
-      drawTriangle(gfx, baseD1, baseD2, apexL, colHex, alpha01);
-      drawTriangle(gfx, baseD1, baseD2, apexR, colHex, alpha01);
+      const bx = b.head.x;
+      const by = b.head.y;
+      const baseN1x = bx + b.nrm.x * b.headR;
+      const baseN1y = by + b.nrm.y * b.headR;
+      const baseN2x = bx - b.nrm.x * b.headR;
+      const baseN2y = by - b.nrm.y * b.headR;
+      const baseD1x = bx + b.dir.x * b.headR;
+      const baseD1y = by + b.dir.y * b.headR;
+      const baseD2x = bx - b.dir.x * b.headR;
+      const baseD2y = by - b.dir.y * b.headR;
+      const apexFx = bx + b.dir.x * b.forwardLen;
+      const apexFy = by + b.dir.y * b.forwardLen;
+      const apexBx = bx - b.dir.x * b.backLen;
+      const apexBy = by - b.dir.y * b.backLen;
+      const apexLx = bx - b.nrm.x * b.sideLen;
+      const apexLy = by - b.nrm.y * b.sideLen;
+      const apexRx = bx + b.nrm.x * b.sideLen;
+      const apexRy = by + b.nrm.y * b.sideLen;
+      drawTriangle(gfx, baseN1x, baseN1y, baseN2x, baseN2y, apexFx, apexFy, colHex, alpha01, state._triPts);
+      drawTriangle(gfx, baseN1x, baseN1y, baseN2x, baseN2y, apexBx, apexBy, colHex, alpha01, state._triPts);
+      drawTriangle(gfx, baseD1x, baseD1y, baseD2x, baseD2y, apexLx, apexLy, colHex, alpha01, state._triPts);
+      drawTriangle(gfx, baseD1x, baseD1y, baseD2x, baseD2y, apexRx, apexRy, colHex, alpha01, state._triPts);
     };
 
     // faint base glow under all hands
@@ -599,6 +651,10 @@ export function renderPixiFrame(state, opts) {
       const alpha = 18 + 110 * Math.pow(handFillRatio(which), 0.7);
       drawOne(mainGfx, which, rgbToHex(col), alpha / 255);
     }
+  }
+  if (perfOut) {
+    perfOut.pixiClockHandsMs = nowPerf() - t0;
+    t0 = nowPerf();
   }
 
   // Heads (Pixi Graphics)
@@ -619,6 +675,10 @@ export function renderPixiFrame(state, opts) {
     drawHead(T.hourP, HAND_HEAD_R.hour);
     drawHead(T.minP, HAND_HEAD_R.minute);
     drawHead(T.secP, HAND_HEAD_R.second);
+  }
+  if (perfOut) {
+    perfOut.pixiClockHeadsMs = nowPerf() - t0;
+    t0 = nowPerf();
   }
 
   // Particles (Pixi ParticleContainer)
@@ -731,7 +791,16 @@ export function renderPixiFrame(state, opts) {
       bucket.container.update();
     }
   }
+  if (perfOut) {
+    perfOut.pixiParticlesMs = nowPerf() - t0;
+    t0 = nowPerf();
+  }
 
   if (typeof state.app.render === "function") state.app.render();
   else state.app.renderer.render(state.app.stage);
+
+  if (perfOut) {
+    perfOut.pixiPresentMs = nowPerf() - t0;
+    perfOut.pixiTotalMs = nowPerf() - tFrame0;
+  }
 }

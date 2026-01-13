@@ -58,7 +58,8 @@ function stepSim(params, activeN) {
   const enableDensity = params.enableDensity !== false;
   const enableAgeSpiral = params.enableAgeSpiral !== false;
   const enableCohesion = params.enableCohesion !== false;
-  const enableXrayBlobForce = params.enableXrayBlobForce !== false;
+  // NOTE: X-ray blob forces moved to main thread (signatures.js)
+  const enableXrayBlobForce = false; // disabled - handled by signature system
 
   // STEP 6C: remaining per-particle forces (simplified, audio-driven).
   const nowS = +params.nowS || 0.0;
@@ -155,46 +156,14 @@ function stepSim(params, activeN) {
       vyi += (rx0 * inv0) * ageSwirl;
     }
 
-    // Per-kind micro-behavior (approximates Particle.update + applyLayerBehavior without p5/noise).
+    // Per-kind micro-behavior
+    // NOTE: Signature forces (X-ray blobs, Mag filaments, Electron texture, H-ion ribbons, Proton belts)
+    // are now handled on the main thread in signatures.js for better control and visual clarity.
+    // Worker handles only basic physics: age spiral, density pressure, and boundary containment.
     const k = kind ? (kind[i] | 0) : 2; // default protons
-    if (k === 4) {
-      // mag: filament/chaining is handled on the main thread (needs neighbor links + path state).
-      // Keep only mild damping so accidental inclusion in the worker doesn't create "fake threads".
-      vxi *= 0.99;
-      vyi *= 0.99;
-    } else if (k === 1 && enableCohesion) {
-      // electrons: fast vibration (LUT-based), scales with electrons proxy
-      const sd = seed ? seed[i] : 0.0;
-      const dirIdx = (((sd * 997.0) | 0) & DIR_MASK);
-      const j1 = (dirIdx + (frame & DIR_MASK)) & DIR_MASK;
-      const j2 = (dirIdx + 73 + ((frame * 3) & DIR_MASK)) & DIR_MASK;
-      const ampJ = (0.03 + 0.10 * electrons) * 1.55;
-      vxi += (DIR_X[j1] + 0.65 * DIR_X[j2]) * ampJ;
-      vyi += (DIR_Y[j1] + 0.65 * DIR_Y[j2]) * ampJ;
 
-      // breath: radial compress/expand
-      const phase = Math.sin(nowS * (0.55 + 0.35 * overallAmp));
-      vxi += (rx0 * inv0) * (-phase * (0.020 * electrons) * (0.8 + 0.6 * electrons));
-      vyi += (ry0 * inv0) * (-phase * (0.020 * electrons) * (0.8 + 0.6 * electrons));
-    } else if (k === 0 && enableXrayBlobForce) {
-      // xray: sharp jitter, scales with xray
-      const sd = seed ? seed[i] : 0.0;
-      const dirIdx = (((sd * 991.0) | 0) & DIR_MASK);
-      const j1 = (dirIdx + ((frame * 5) & DIR_MASK)) & DIR_MASK;
-      const j2 = (dirIdx + 131 + (frame & DIR_MASK)) & DIR_MASK;
-      const ampJ = (0.02 + 0.06 * xray) * 1.15;
-      vxi += (DIR_X[j1] + 0.50 * DIR_X[j2]) * ampJ;
-      vyi += (DIR_Y[j1] + 0.50 * DIR_Y[j2]) * ampJ;
-    } else if (k === 2 && enableCohesion) {
-      // protons: calm (slight damping)
-      vxi *= 0.985;
-      vyi *= 0.985;
-    } else if (k === 3 && enableCohesion) {
-      // h_ions: flow bias (tangential), medium
-      const flow = 0.06 + 0.10 * h_ions;
-      vxi += tangx0 * flow;
-      vyi += tangy0 * flow;
-    }
+    // All signature-specific forces disabled here; handled by main thread signature system
+    // This ensures clean separation: worker = physics simulation, main = visual signatures
 
     // Density pressure: repel from dense cells to encourage "filled matter" without pairwise collisions.
     if (enableDensity) {
