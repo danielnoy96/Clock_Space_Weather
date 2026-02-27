@@ -23,6 +23,7 @@ export function applyForcesStage(ctx) {
     enableDensity,
     enableCohesion,
     enableXrayBlobForce,
+    magneticCoherence,
     infoRec,
     infoRecSampleStride,
     DENSE_DISABLE_COHESION,
@@ -35,10 +36,14 @@ export function applyForcesStage(ctx) {
     applyElectronBreath,
     applyAgeSpiral,
     applyLayerBehavior,
+    applyLayerStratification,
     applyVolumetricMix,
     applyDensityCoupling,
     applyAlignment,
     applyCohesion,
+    applyMagneticHistoryForce,
+    applyMagneticPathForce,
+    applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
     returnToPool,
@@ -129,6 +134,11 @@ export function applyForcesStage(ctx) {
     ageRankFromNewest++;
     applyLayerBehavior(p, T);
     if (sampleThisFrame) infoRec.incCounter("force.applyLayerBehavior");
+
+    // Apply radial ring stratification (layer separation by kind)
+    applyLayerStratification(p, T);
+    if (sampleThisFrame) infoRec.incCounter("force.applyLayerStratification");
+
     if (!smoothAll && !isXrayBlob) applyVolumetricMix(p, T);
     if (sampleThisFrame && (!smoothAll && !isXrayBlob)) infoRec.incCounter("force.applyVolumetricMix");
 
@@ -150,13 +160,21 @@ export function applyForcesStage(ctx) {
       }
     }
 
+    // Apply magnetic filament force (only for mag particles)
+    if (p.kind === "mag" && applyMagneticFilamentForce) {
+      if (applyMagneticHistoryForce) applyMagneticHistoryForce(p, T);
+      applyMagneticFilamentForce(p, magneticCoherence || 0.5);
+      if (sampleThisFrame) infoRec.incCounter("force.applyMagneticFilament");
+    }
+
     // Apply blob containment late so it re-compacts after other forces.
     if (enableXrayBlobForce) applyXrayBlobForce(p);
     if (sampleThisFrame && enableXrayBlobForce) infoRec.incCounter("force.applyXrayBlobForce");
 
     // STEP 4B: when worker is enabled, move only basic motion (drag+integrate+confine) to worker.
     // Main thread keeps all forces/behaviors but does not advance position or clamp to clock.
-    if (USE_WORKER) {
+    // EXCEPTION: Magnetic particles use chain springs that need main-thread integration
+    if (USE_WORKER && p.kind !== "mag") {
       p.update(1.0, swirlBoost, false);
       if (sampleThisFrame) infoRec.incCounter("integrate.workerStub");
     } else {

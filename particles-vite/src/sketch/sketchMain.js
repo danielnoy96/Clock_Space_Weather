@@ -1,5 +1,24 @@
 // STEP 4A — Worker pipeline toggle (no behavior change yet).
-import { COL, LAYER_BEHAVIOR, PARTICLE_PROFILE } from "./config.js";
+import {
+  CAPACITY_DYNAMIC_DEADBAND_FPS,
+  CAPACITY_DYNAMIC_ENABLED,
+  CAPACITY_DYNAMIC_MAX,
+  CAPACITY_DYNAMIC_MIN,
+  CAPACITY_DYNAMIC_STEP_DOWN_K,
+  CAPACITY_DYNAMIC_STEP_DOWN_MAX,
+  CAPACITY_DYNAMIC_STEP_DOWN_MIN,
+  CAPACITY_DYNAMIC_STEP_UP,
+  CAPACITY_DYNAMIC_TARGET_FPS10,
+  CAPACITY_DYNAMIC_UPDATE_MS,
+  CAPACITY_MIN,
+  CAPACITY_TARGET_FULL,
+  CLOCK_TUNING,
+  EMIT_TUNING,
+  TIME_TUNING,
+  COL,
+  LAYER_BEHAVIOR,
+  PARTICLE_PROFILE,
+} from "./config.js";
 import { createAudioFileInput, initAudioAnalyzers } from "./audio.js";
 import { clockStatic, clockStaticRedrawCount, computeHandData, ensureClockStatic } from "./clock.js";
 import {
@@ -33,6 +52,7 @@ import {
   spawnFromPool as spawnFromPoolCore,
 } from "./particlePool.js";
 import { applyForcesStage } from "./forcesStage.js";
+import { initPixiRenderer, renderPixiFrame, resizePixiRenderer } from "./pixiRenderer.js";
 
 const USE_WORKER = true;
 const WORKER_DEBUG_LOG = false;
@@ -44,6 +64,8 @@ const WORKER_SPIRAL = true;
 const USE_LOWRES_RENDER = true;
 // GPU particles (point sprites) on a WEBGL layer.
 const USE_WEBGL_PARTICLES = true;
+// Render main visuals with PixiJS (p5 canvas becomes a transparent HUD overlay).
+const USE_PIXI_RENDERER = true;
 const PG_SCALE_BASE = 0.5;
 const PG_SCALE_MIN = 0.42;
 const PG_SCALE_STEP = 0.03;
@@ -51,6 +73,8 @@ let pgScale = PG_SCALE_BASE;
 let renderScaleDownStreak = 0;
 let renderScaleUpStreak = 0;
 let pg = null;
+let pixi = null;
+let pixiInitPromise = null;
 
 const DRAW_ALPHA_BUCKETS = 8;
 const DRAW_KIND_ORDER = ["protons", "h_ions", "mag", "electrons", "xray"];
@@ -188,9 +212,17 @@ let ftHistory = [];
 let ftWindow2s = [];
 let ftWindow10s = [];
 let ftDisplay = { current: 0, worst: 0, p95: 0 };
+<<<<<<< HEAD
 let fps10 = 0;
 let uiBottomY = 0;
 let uiBottomNextAt = 0;
+=======
+let ftWindow10s = [];
+let fps10 = 0;
+let uiBottomY = 0;
+let uiBottomNextAt = 0;
+let capDynNextAt = 0;
+>>>>>>> pixi-quick-test
 
 function profLiteNow() {
   return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
@@ -313,6 +345,36 @@ function drawLiteProfilerHUD() {
     }
   );
   ({ fpsDisplay, fpsDisplayNext, ftHistory, ftWindow2s, ftWindow10s, ftDisplay, fps10 } = next);
+<<<<<<< HEAD
+=======
+
+  // Dynamic max particles: adapt CAPACITY based on FPS10 (slowly, bounded).
+  if (CAPACITY_DYNAMIC_ENABLED) {
+    const now = millis();
+    if (!capDynNextAt || now >= capDynNextAt) {
+      capDynNextAt = now + (CAPACITY_DYNAMIC_UPDATE_MS | 0);
+      const f = fps10;
+      const target = +CAPACITY_DYNAMIC_TARGET_FPS10 || 0;
+      const dead = +CAPACITY_DYNAMIC_DEADBAND_FPS || 0;
+      if (isFinite(f) && f > 0 && target > 0) {
+        const minCap = max(CAPACITY_MIN, CAPACITY_DYNAMIC_MIN | 0);
+        const maxCap = max(minCap, CAPACITY_DYNAMIC_MAX | 0);
+        if (f < (target - dead)) {
+          const err = (target - dead) - f;
+          const step = constrain(
+            (CAPACITY_DYNAMIC_STEP_DOWN_MIN | 0) + Math.round(err * (+CAPACITY_DYNAMIC_STEP_DOWN_K || 0)),
+            CAPACITY_DYNAMIC_STEP_DOWN_MIN | 0,
+            CAPACITY_DYNAMIC_STEP_DOWN_MAX | 0
+          );
+          CAPACITY = max(minCap, (CAPACITY - step) | 0);
+        } else if (f > (target + dead)) {
+          CAPACITY = min(maxCap, (CAPACITY + (CAPACITY_DYNAMIC_STEP_UP | 0)) | 0);
+        }
+        SOFT_CAP = CAPACITY;
+      }
+    }
+  }
+>>>>>>> pixi-quick-test
 }
 
 function ensureClumpBuffers(sampleN, headCells) {
@@ -602,6 +664,8 @@ function fillSimArraysFromParticles(cap) {
   for (let i = 0; i < particles.length; i++) {
     const p = particles[i];
     if (!p || !p.active || p.dead()) continue;
+    // Magnetic particles are processed on the main thread (needs path access + filament springs).
+    if (p.kind === "mag") continue;
     required++;
     if (filled < cap) {
       simRefs[filled] = p;
@@ -728,30 +792,46 @@ function postStep() {
   activeN = required;
   wlog("N", activeN);
 
-  if (required <= 0 || filled <= 0) {
-    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.empty");
-    return;
-  }
+	  if (required <= 0 || filled <= 0) {
+	    if (infoRec.isRecording()) infoRec.incCounter("worker.post.skip.empty");
+	    // Keep the worker pump alive so a later reset/reload (which temporarily empties `particles`)
+	    // doesn't permanently stop motion once particles start spawning again.
+	    scheduleNextStep();
+	    return;
+	  }
 
   if (required > capacity) {
     initWorkerCapacity(chooseCapacity(required));
     return;
   }
 
-  const dt = getSmoothedDt();
+	  const dt = getSmoothedDt();
   if (!simLoggedDt) {
     wlog("dt", dt);
     simLoggedDt = true;
   }
-  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
-  const params = {
-    dt,
-    drag: (0.985 + protons * 0.01),
-    cx: T.c.x,
-    cy: T.c.y,
-    radius: T.radius,
-    w: width,
-    h: height,
+	  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+	  const dragBase = (CLOCK_TUNING && typeof CLOCK_TUNING.dragBase === "number") ? CLOCK_TUNING.dragBase : 0.985;
+	  const dragProtonsAdd = (CLOCK_TUNING && typeof CLOCK_TUNING.dragProtonsAdd === "number") ? CLOCK_TUNING.dragProtonsAdd : 0.01;
+	  const densityPressure = (CLOCK_TUNING && typeof CLOCK_TUNING.densityPressure === "number") ? CLOCK_TUNING.densityPressure : 0.04;
+	  const densityViscosity = (CLOCK_TUNING && typeof CLOCK_TUNING.densityViscosity === "number") ? CLOCK_TUNING.densityViscosity : 0.30;
+	  const denseVelSmooth = (CLOCK_TUNING && typeof CLOCK_TUNING.denseVelSmooth === "number") ? CLOCK_TUNING.denseVelSmooth : 0.60;
+	  const stepScale = (TIME_TUNING && typeof TIME_TUNING.motionStepScale === "number") ? TIME_TUNING.motionStepScale : 1.0;
+	  const dragRaw = (dragBase + protons * dragProtonsAdd);
+	  const drag = 1.0 - (1.0 - dragRaw) * constrain(stepScale, 0, 1);
+	  // Scale per-step density forces/damping by the global time scale.
+	  // Otherwise, when `stepScale` is small, viscosity can "pin" velocities to ~0 and look frozen.
+	  const densityPressureEff = densityPressure * constrain(stepScale, 0, 1);
+	  const densityViscosityEff = densityViscosity * constrain(stepScale, 0, 1);
+	  const denseVelSmoothEff = denseVelSmooth * constrain(stepScale, 0, 1);
+	  const params = {
+	    dt,
+	    drag,
+	    cx: T.c.x,
+	    cy: T.c.y,
+	    radius: T.radius,
+	    w: width,
+	    h: height,
     // STEP 6B: spiral/orbit force (ported from applyCalmOrbit, without per-kind modifiers).
     spiralEnable: !!WORKER_SPIRAL,
     spiralSwirl: (0.90 + 0.40 * mag + 0.20 * protons) * SPACE_SWIRL_MULT * 0.40,
@@ -765,12 +845,16 @@ function postStep() {
     mag: +mag || 0.0,
     h_ions: +h_ions || 0.0,
     electrons: +electrons || 0.0,
-    protons: +protons || 0.0,
-    fillFrac: Math.max(0, Math.min(1, (particlesActive || 0) / (CAPACITY || 1))),
-    enableDensity: !!enableDensity,
-    enableAgeSpiral: !!enableAgeSpiral,
-    enableCohesion: !!enableCohesion,
-    enableXrayBlobForce: !!enableXrayBlobForce,
+	    protons: +protons || 0.0,
+	    fillFrac: Math.max(0, Math.min(1, (filled || 0) / (CAPACITY || 1))),
+	    enableDensity: !!enableDensity,
+	    densityPressure: densityPressureEff,
+	    densityViscosity: densityViscosityEff,
+	    denseVelSmooth: denseVelSmoothEff,
+	    stepScale,
+	    enableAgeSpiral: !!enableAgeSpiral,
+	    enableCohesion: !!enableCohesion,
+	    enableXrayBlobForce: !!enableXrayBlobForce,
     // Age spiral constants
     ageWindow: AGE_WINDOW_FRAMES,
     ageOuterFrac: AGE_OUTER_FRAC,
@@ -926,11 +1010,66 @@ if (USE_WORKER) {
           p.vel.y = simVY[i];
         }
 
+        // CRITICAL: Process magnetic particles on MAIN THREAD (excluded from worker)
+        // Magnetic particles need access to magneticPaths + filament springs/links.
+        {
+          const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : computeHandData(new Date());
+          const magBehavior = LAYER_BEHAVIOR.mag || {};
+          const magneticCoherence = constrain(abs(mag), 0, 1);
+          const dragBase = (CLOCK_TUNING && typeof CLOCK_TUNING.dragBase === "number") ? CLOCK_TUNING.dragBase : 0.978;
+          const swirlMagMult = (CLOCK_TUNING && typeof CLOCK_TUNING.swirlMagMult === "number") ? CLOCK_TUNING.swirlMagMult : 0.45;
+          const dragRaw = dragBase;
+          const stepScale = (TIME_TUNING && typeof TIME_TUNING.motionStepScale === "number") ? TIME_TUNING.motionStepScale : 1.0;
+          const drag = 1.0 - (1.0 - dragRaw) * constrain(stepScale, 0, 1);
+          const swirlBoost = 1.0 + mag * swirlMagMult;
+
+          // Ensure magnetic chains exist if we are not using "emit pre-chained" mode.
+          if (!magBehavior.emitFromHandsChain) {
+            const chainRebuildEvery = magBehavior.chainRebuildEvery || MAGNETIC_CHAIN_EVERY;
+            const chainK = magBehavior.chainK || 3;
+            if ((frameCount - magneticChainFrame) >= chainRebuildEvery) {
+              buildMagneticChains(particles, chainK, magneticCoherence);
+              magneticChainFrame = frameCount;
+            }
+          }
+
+          const magNeighborCellSize = max(24, (magBehavior.separationRadius || 45));
+          const magNeighborGrid = getMagNeighborGrid(particles, magNeighborCellSize);
+
+          let magProcessed = 0;
+          for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (!p || p.kind !== "mag" || p.dead()) continue;
+            magProcessed++;
+
+            if (applyMagneticHistoryForce) applyMagneticHistoryForce(p, T);
+            // Worker integrates calm orbit for non-mag; apply it here for magnetic so it still "flows".
+            if (WORKER_SPIRAL) applyCalmOrbit(p, T.c, 1.0, 1.0);
+            if (applyMagneticFilamentForce) applyMagneticFilamentForce(p, magneticCoherence, magNeighborGrid, magNeighborCellSize);
+
+            // Integrate motion and confine to clock
+            p.update(drag, swirlBoost);
+            confineToClock(p, T.c, T.radius);
+          }
+
+          void magProcessed;
+        }
+
         // STEP 6C: forces are now applied in the worker. Main thread only does collisions + housekeeping.
         // Collisions (mass layers only) remain on main for now.
         if (PROF_LITE) {
           profLite.forcesMs = profLiteEma(profLite.forcesMs, 0);
           profLite.fieldsMs = profLiteEma(profLite.fieldsMs, 0);
+        }
+
+        // Keep X-ray blobs coherent on the main thread (the worker doesn't implement blob locking).
+        if (enableXrayBlobForce) {
+          updateXrayBlobs();
+          for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (!p || p.dead() || p.kind !== "xray" || !p.blobId) continue;
+            applyXrayBlobForce(p);
+          }
         }
         {
           collisionsEvery = 1;
@@ -945,7 +1084,10 @@ if (USE_WORKER) {
             for (let i = 0; i < particles.length; i++) {
               const p = particles[i];
               if (!p || p.dead()) continue;
-              if (COLLISION_KINDS[p.kind]) collisionList.push(p);
+              if (!COLLISION_KINDS[p.kind]) continue;
+              // X-ray blob particles should never collide (they are position-locked and/or zero-radius).
+              if (p.kind === "xray" && p.blobId) continue;
+              collisionList.push(p);
             }
             if (collisionList.length) {
               for (let i = 0; i < collisionList.length; i++) {
@@ -982,7 +1124,12 @@ if (USE_WORKER) {
             collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
             collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
             collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-            const cellFrac = 1;
+            // When many kinds collide, spread work across frames by scanning only a fraction of grid cells.
+            // (The solver already rotates a cursor across cells each frame.)
+            const nCol = collisionList.length | 0;
+            const cellFrac = trouble
+              ? 1
+              : (nCol >= 9000 ? 0.28 : nCol >= 6500 ? 0.40 : nCol >= 4000 ? 0.60 : 1);
               resolveSpaceCollisions(
                 collisionList,
                 T.c,
@@ -1214,13 +1361,8 @@ function drawProfilerHUD() {
 
 // ---------- Proxies ----------
 let xray = 0, mag = 0, h_ions = 0, electrons = 0, protons = 0, overallAmp = 0;
-let raw = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
-let state = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
-let prevState = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
-let dState = { xray: 0, mag: 0, h_ions: 0, electrons: 0, protons: 0, overall: 0 };
-let envX = 0;
+let xBandPrev = 0; // raw (unsmoothed) xray-band history for honest spike detection
 let CURRENT_T = null;
-let xrayEvents = [];
 const CHANGE_SMOOTH = 0.45;
 const CHANGE_GAIN = 28.0;
 const CHANGE_KNEE = 3.0;
@@ -1241,11 +1383,13 @@ const DISABLE_FACE_FIELD = false;
 let faceUpdateEvery = 1;
 let faceChunkRows = 32;
 let faceRowCursor = 1;
+let faceUpdateY0 = 0;
+let faceUpdateY1 = 0;
 
 // Space-field motion controls (global multipliers).
 // Edit these for "swirl / spiral-in / jitter" tuning without hunting through functions.
-let SPACE_SWIRL_MULT = 1.0;    // tangential orbit strength
-let SPACE_DRIFTIN_MULT = 0.80;  // inward spiral strength
+let SPACE_SWIRL_MULT = (CLOCK_TUNING && typeof CLOCK_TUNING.spaceSwirlMult === "number") ? CLOCK_TUNING.spaceSwirlMult : 1.0; // tangential orbit strength
+let SPACE_DRIFTIN_MULT = (CLOCK_TUNING && typeof CLOCK_TUNING.spaceDriftInMult === "number") ? CLOCK_TUNING.spaceDriftInMult : 0.70; // inward spiral strength
 let SPACE_JITTER_MULT = 1.0;   // micro-turbulence strength
 
 // Age spiral: newest near rim, oldest toward center (independent of kind).
@@ -1266,15 +1410,18 @@ const AGE_EASE = 1.6;
 // View-only solo (does NOT affect emission/sim); cycle with [ and ] or 0..5.
 let VIEW_SOLO_KIND = null;
 
-// XRAY "segments": event pulses that stay rigid and coherent (stiff sticks)
-let xraySegments = [];
-let xraySegmentIdCounter = 1;
-// PERF: keep segment index as a persistent Map (avoid per-frame Object.create(null)).
-let xraySegIndex = new Map();
-let lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
-
 // H-ions "chains": elongated streams that stick like a chain
 let lastHIonByHand = { hour: null, minute: null, second: null };
+// Magnetic "chains": emit mag already connected per hand.
+let lastMagByHand = { hour: null, minute: null, second: null };
+
+// Magnetic guide paths: invisible paths that magnetic particles follow
+// Each hand emits particles along a spiral/curved path from hand to center
+let magneticPaths = {
+  hour: [],   // array of {x, y, age} points
+  minute: [],
+  second: []
+};
 
 // Reusable occupancy buffer for grid drawing (avoid per-frame allocations)
 let usedCols = 0, usedRows = 0;
@@ -1282,7 +1429,9 @@ let usedStamp = null; // Uint32Array
 let usedStampXray = null; // Uint32Array (xray-only occupancy so xray stays visible)
 let usedFrameId = 1;
 
-const COLLISION_KINDS = { protons: true, h_ions: true };
+// Kinds that participate in the space collision solver (grid-based packing).
+// This defines the shared "medium" for those particles more strongly than density viscosity.
+const COLLISION_KINDS = { protons: true, h_ions: true, mag: true, electrons: true, xray: true }; // mag participates - spring forces maintain strings
 const COLLISION_ITERS_MASS = 3;
 
 // PERF: collision solver caches to avoid per-call allocations.
@@ -1314,16 +1463,17 @@ const SMOOTH_SLOW = 0.18;
 // ---------- Colors ----------
 // Palette is centralized in `./config.js`.
 
-const PARTICLE_SIZE_SCALE = 4;
+const PARTICLE_SIZE_SCALE = 4;  
 // Global scaling factor for particle counts (set to 0.1 for 10% of previous counts)
 const PARTICLE_SCALE = 0.10;
 
 // Performance knobs (trade tiny smoothness for big FPS gains)
 let COHESION_GRID_EVERY = 2;   // rebuild neighbor grid every N frames
+let MAGNETIC_CHAIN_EVERY = 3;  // rebuild magnetic chains every N frames
+let magneticChainFrame = -999;
 let COHESION_APPLY_STRIDE = 2; // apply cohesion to 1/N particles per frame (rotating)
 let HEAVY_FIELD_STRIDE = 2;    // apply heavy per-particle fields 1/N per frame
 let FIELD_UPDATE_EVERY = 2;    // update face field buffers every N frames
-let RESERVOIR_UPDATE_EVERY = 1; // update hand reservoir every N frames
 let COLLISION_ITERS = 3;       // position-based collision solver iterations (space only)
 // How strongly collisions correct positions (higher = resolves overlap faster, but can vibrate more).
 let COLLISION_PUSH = 0.18;
@@ -1357,25 +1507,34 @@ let xrayBlobs = [];
 let xrayBlobIdCounter = 1;
 // PERF: keep blob index as a persistent Map (avoid per-frame maps).
 let xrayBlobIndex = new Map();
-const XRAY_PULSE_BASE = 90;
+const XRAY_PULSE_BASE = 50; // reduced from 90 for smaller initial blobs
 const XRAY_PULSE_MAX = 520;
-const XRAY_BLOB_BASE_RADIUS = 110;
-const XRAY_BLOB_MAX_RADIUS = 260;
+const XRAY_BLOB_BASE_RADIUS = 20; // VERY TIGHT clumps (was 30, still spreading)
+const XRAY_BLOB_MAX_RADIUS = 60; // VERY TIGHT max (was 100, still too big)
 // Make spikes readable: ensure bursts have enough particles to form a blob, even with PARTICLE_SCALE < 1.
 const XRAY_EVENT_COUNT_SCALE = 0.70;
-const XRAY_EVENT_MIN_COUNT = 120;
+const XRAY_EVENT_MIN_COUNT = 60; // reduced from 120 for smaller, more responsive blobs
 // Only use rigid segments on strong spikes; otherwise X-ray should read as blobs, not lines.
 const XRAY_SEGMENT_TRIGGER = 0.60;
 // X-ray pulse shaping: keep spikes compact (blob), not long streaks.
 const XRAY_PULSE_POS_FRAC = 0.95;      // spawn across most of the blob radius (readable area, not a tiny dot)
-const XRAY_PULSE_SPEED_BASE = 0.10;    // base speed for pulse particles
-const XRAY_PULSE_SPEED_RAND = 0.35;    // random speed component
-const XRAY_PULSE_SPEED_SPIKE = 0.85;   // extra speed at s=1
-const XRAY_PULSE_TANGENTIAL = 0.45;    // tangential bias around blob center
+ const XRAY_PULSE_SPEED_BASE = 0.10;    // base speed for pulse particles
+ const XRAY_PULSE_SPEED_RAND = 0.35;    // random speed component
+ const XRAY_PULSE_SPEED_SPIKE = 0.85;   // extra speed at s=1
+ const XRAY_PULSE_TANGENTIAL = 0.45;    // tangential bias around blob center
+
+// X-ray "grid collision environment": keep blob centers snapped to a grid so blobs behave like discrete colliders.
+// (Also gives X-ray a strong, readable structural signature when solo-viewing.)
+const XRAY_GRID_ENV_ENABLED = true;
+const XRAY_GRID_CELL_SIZE = 34;     // pixels per cell (visual + collision)
+const XRAY_GRID_SNAP_LERP = 0.72;   // 0..1 (higher = snappier)
+const XRAY_GRID_MAX_RINGS = 4;      // neighbor search radius (cells) when occupied/outside disk
 // X-ray burst shaping: make spikes form ONE compact blob (not a streak dragged by the fast second hand).
-const XRAY_BASELINE_EMIT_MULT = 0.08; // keep a faint background xray drizzle from hands; events are the main signal
-const XRAY_BURST_SPIKE_MIN = 0.06; // trigger only on sharp rises (derivative), not sustained highs
-const XRAY_BURST_COOLDOWN_FRAMES = 26; // refractory period to avoid "trail lines" from repeated bursts
+// X-ray should read as "pulses/jumps" (events) rather than a constant drizzle.
+// Keep baseline from hands at zero; bursts/events create the visible x-ray signatures.
+const XRAY_BASELINE_EMIT_MULT = 0.0;
+const XRAY_BURST_SPIKE_MIN = 0.035; // balanced sensitivity (was 0.06 originally, 0.015 was too sensitive)
+const XRAY_BURST_COOLDOWN_FRAMES = 18; // balanced cooldown (was 26 originally, 12 was too frequent)
 const XRAY_BURST_FRAMES_BASE = 16;
 const XRAY_BURST_FRAMES_MAX = 58;
 let xrayBurst = null; // { blobId, startFrame, duration, untilFrame, startCount, strength }
@@ -1410,89 +1569,8 @@ function kindStrength(kind) {
 let xrayMemory = 0;
 function updateLayerMemory() {
   // "Memory of peak": keeps x-ray clumps coherent for a while after spikes.
-  xrayMemory = max(xrayMemory * 0.985, xray);
-}
-
-function updateControlLayer() {
-  // Derivatives from previous controlled state
-  const px = state.xray, pm = state.mag, ph = state.h_ions, pe = state.electrons, pp = state.protons, po = state.overall;
-
-  // Protons: very stable, slow mass/pressure
-  state.protons = lerp(state.protons, raw.protons, 0.08);
-
-  // Magnetic: ultra stable, very slow structure (with deadband)
-  const magDelta = raw.mag - state.mag;
-  if (abs(magDelta) > 0.01) state.mag = lerp(state.mag, raw.mag, 0.025);
-
-  // H-ions: medium smoothing + rate limit (flow)
-  const hStep = constrain(raw.h_ions - state.h_ions, -0.04, 0.04);
-  state.h_ions = lerp(state.h_ions, state.h_ions + hStep, 0.30);
-
-  // Electrons: unstable, fast continuous vibration
-  state.electrons = lerp(state.electrons, raw.electrons, 0.62);
-
-  // X-ray: event-driven (spikes over slow envelope)
-  envX = lerp(envX, raw.xray, 0.06);
-  const spike = max(0, raw.xray - envX);
-  state.xray = lerp(state.xray, raw.xray, 0.55);
-
-  // Overall amplitude (keeps "how much" separate from composition)
-  state.overall = lerp(state.overall, raw.overall, 0.35);
-
-  // Derivatives
-  dState.xray = abs(state.xray - px);
-  dState.mag = abs(state.mag - pm);
-  dState.h_ions = abs(state.h_ions - ph);
-  dState.electrons = abs(state.electrons - pe);
-  dState.protons = abs(state.protons - pp);
-  dState.overall = abs(state.overall - po);
-
-  // Emphasized change signals 0..1 (used for visual modulation only)
-  const emph = (d) => {
-    const u = constrain(d * 14.0, 0, 3.0);
-    return u / (1 + u);
-  };
-  changeEmph.xray = emph(dState.xray) + emph(spike) * 0.8;
-  changeEmph.mag = emph(dState.mag);
-  changeEmph.h_ions = emph(dState.h_ions);
-  changeEmph.electrons = emph(dState.electrons) * 1.25;
-  changeEmph.protons = emph(dState.protons) * 0.8;
-
-  // Trigger x-ray events on spikes (shapes are truth; particles are texture)
-  if (CURRENT_T && spike > 0.08) {
-    const s = constrain(spike * 6.0, 0, 1);
-    xrayEvents.push({
-      x: CURRENT_T.secP.x,
-      y: CURRENT_T.secP.y,
-      strength: s,
-      birthFrame: frameCount || 0,
-      ttl: 55 + floor(120 * s),
-      baseRadius: 14 + 34 * s,
-      expansionRate: 0.9 + 2.6 * s,
-    });
-    // Texture: a readable cohesive blob inside the event region (min particle mass to form a blob).
-    spawnXrayPulse(CURRENT_T, s, XRAY_EVENT_COUNT_SCALE, XRAY_EVENT_MIN_COUNT);
-  }
-  // Keep only active events (used for short-lived "shock" coupling, not for persistent memory).
-  if (xrayEvents.length) {
-    const now = frameCount || 0;
-    const kept = [];
-    for (let i = 0; i < xrayEvents.length; i++) {
-      const e = xrayEvents[i];
-      if (!e) continue;
-      if ((now - (e.birthFrame || 0)) < (e.ttl || 0)) kept.push(e);
-    }
-    xrayEvents = kept;
-  }
-  if (xrayEvents.length > 32) xrayEvents.splice(0, xrayEvents.length - 32);
-
-  // Publish to legacy globals so existing code keeps working.
-  xray = state.xray;
-  mag = state.mag;
-  h_ions = state.h_ions;
-  electrons = state.electrons;
-  protons = state.protons;
-  overallAmp = state.overall;
+  // Slower decay = longer blob coherence time (signature visibility)
+  xrayMemory = max(xrayMemory * 0.992, xray); // increased from 0.985 for longer memory
 }
 
 function updatePerfThrottles() {
@@ -1505,14 +1583,12 @@ function updatePerfThrottles() {
     COHESION_APPLY_STRIDE = 6;
     HEAVY_FIELD_STRIDE = 6;
     FIELD_UPDATE_EVERY = 4;
-    RESERVOIR_UPDATE_EVERY = 2;
     COLLISION_ITERS = 1;
   } else if (fpsSmoothed < 32) {
     COHESION_GRID_EVERY = 3;
     COHESION_APPLY_STRIDE = 4;
     HEAVY_FIELD_STRIDE = 4;
     FIELD_UPDATE_EVERY = 3;
-    RESERVOIR_UPDATE_EVERY = 2;
     COLLISION_ITERS = 2;
   } else if (fpsSmoothed < 45) {
     // PERF: rebuild cohesion grid less often (reduces Map churn).
@@ -1520,7 +1596,6 @@ function updatePerfThrottles() {
     COHESION_APPLY_STRIDE = 3;
     HEAVY_FIELD_STRIDE = 3;
     FIELD_UPDATE_EVERY = 2;
-    RESERVOIR_UPDATE_EVERY = 1;
     COLLISION_ITERS = 3;
   } else {
     // PERF: rebuild cohesion grid less often (reduces Map churn).
@@ -1528,7 +1603,6 @@ function updatePerfThrottles() {
     COHESION_APPLY_STRIDE = 2;
     HEAVY_FIELD_STRIDE = 2;
     FIELD_UPDATE_EVERY = 2;
-    RESERVOIR_UPDATE_EVERY = 1;
     COLLISION_ITERS = 4;
   }
 }
@@ -1544,7 +1618,8 @@ function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
   const radius = constrain(XRAY_BLOB_BASE_RADIUS + s * 140 + xray * 70, XRAY_BLOB_BASE_RADIUS, XRAY_BLOB_MAX_RADIUS);
   // PERF: store accumulators on the blob (no per-frame Object.create(null) maps).
   const nowF = frameCount || 0;
-  const anchorFor = floor(lerp(12, 30, pow(s, 0.8)));
+  // Extended anchor period to keep blobs cohesive for longer
+  const anchorFor = floor(lerp(45, 90, pow(s, 0.8))); // increased from 12-30 to 45-90 frames
   const blob = { id, radius, strength: s, cx: T.secP.x, cy: T.secP.y, sumX: 0, sumY: 0, count: 0, anchorUntilFrame: nowF + anchorFor };
   xrayBlobs.push(blob);
   xrayBlobIndex.set(id, blob);
@@ -1556,18 +1631,16 @@ function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
     const px = blob.cx + cos(ang) * rr;
     const py = blob.cy + sin(ang) * rr;
 
-    // Small initial motion with a tangential bias around the blob center (keeps it cohesive).
+    // VERY SMALL initial motion - particles should stay tightly clumped, not spread
     const rx = px - blob.cx;
     const ry = py - blob.cy;
     const d = sqrt(rx * rx + ry * ry) + 1e-6;
     const tx = -ry / d;
     const ty = rx / d;
-    // Keep spike pulses compact: high spikes start slower to avoid immediate smearing into streaks.
-    const speedScale = lerp(1.0, 0.22, pow(s, 1.25));
-    const spd = max(0.02, (XRAY_PULSE_SPEED_BASE + random(XRAY_PULSE_SPEED_RAND) + s * XRAY_PULSE_SPEED_SPIKE) * speedScale);
-    const tang = XRAY_PULSE_TANGENTIAL * lerp(0.38, 0.16, pow(s, 1.25));
-    const vx = tx * (spd * tang) + (rx / d) * (spd * (1.0 - tang)) * 0.25;
-    const vy = ty * (spd * tang) + (ry / d) * (spd * (1.0 - tang)) * 0.25;
+    // NEAR-ZERO spawn velocity - particles are rigidly locked to blob anyway
+    // Just a tiny velocity for the first frame, then locking takes over
+    const vx = tx * 0.005 + (rx / d) * 0.002; // tiny tangential + radial
+    const vy = ty * 0.005 + (ry / d) * 0.002;
     const life = 1e9;
     const size = 1.6;
     const p = spawnFromPool("xray", px, py, vx, vy, life, size, COL.xray);
@@ -1576,6 +1649,9 @@ function spawnXrayPulse(T, spikeStrength, countScale, minCount) {
     p.xrayTight = max(p.xrayTight || 0, s);
     p.xrayRadPref = random();
     p.blobId = id;
+    // Store particle's offset from blob center for rigid locking
+    p.blobOffsetX = rx;
+    p.blobOffsetY = ry;
     particles.push(p);
   }
 }
@@ -1594,11 +1670,9 @@ function spawnXrayIntoBlob(blob, s, count) {
     const d = sqrt(rx * rx + ry * ry) + 1e-6;
     const tx = -ry / d;
     const ty = rx / d;
-    const speedScale = lerp(1.0, 0.22, pow(s, 1.25));
-    const spd = max(0.02, (XRAY_PULSE_SPEED_BASE + random(XRAY_PULSE_SPEED_RAND) + s * XRAY_PULSE_SPEED_SPIKE) * speedScale);
-    const tang = XRAY_PULSE_TANGENTIAL * lerp(0.38, 0.16, pow(s, 1.25));
-    const vx = tx * (spd * tang) + (rx / d) * (spd * (1.0 - tang)) * 0.25;
-    const vy = ty * (spd * tang) + (ry / d) * (spd * (1.0 - tang)) * 0.25;
+    // NEAR-ZERO spawn velocity - particles are rigidly locked to blob anyway
+    const vx = tx * 0.005 + (rx / d) * 0.002; // tiny tangential + radial
+    const vy = ty * 0.005 + (ry / d) * 0.002;
 
     const p = spawnFromPool("xray", px, py, vx, vy, 1e9, 1.6, COL.xray);
     if (!p) return;
@@ -1606,6 +1680,9 @@ function spawnXrayIntoBlob(blob, s, count) {
     p.xrayTight = max(p.xrayTight || 0, s);
     p.xrayRadPref = random();
     p.blobId = blob.id;
+    // Store particle's offset from blob center for rigid locking
+    p.blobOffsetX = rx;
+    p.blobOffsetY = ry;
     particles.push(p);
   }
 }
@@ -1613,6 +1690,12 @@ function spawnXrayIntoBlob(blob, s, count) {
 function updateXrayBlobs() {
   if (!xrayBlobs.length) return;
   const nowF = frameCount || 0;
+  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : null;
+  const gridCx = (T && T.c && Number.isFinite(T.c.x)) ? T.c.x : (width * 0.5);
+  const gridCy = (T && T.c && Number.isFinite(T.c.y)) ? T.c.y : (height * 0.5);
+  const gridR = (T && Number.isFinite(T.radius)) ? T.radius : (min(width, height) * 0.45);
+  const cell = max(8, XRAY_GRID_CELL_SIZE | 0);
+  const occ = XRAY_GRID_ENV_ENABLED ? new Map() : null; // key "ix,iy" -> blobId
   // Reset accumulators.
   for (let i = 0; i < xrayBlobs.length; i++) {
     const b = xrayBlobs[i];
@@ -1639,118 +1722,113 @@ function updateXrayBlobs() {
     if (n > 0) {
       const mx = b.sumX / n;
       const my = b.sumY / n;
-      // While a burst is active, keep its center fixed so it reads as a blob (not a dragged streak).
-      // After the anchor period, let the center drift slowly with the medium.
+      void mx; void my;
+
+      // --- BLOB CENTER DRIFT WITH AGE ---
+      // Initialize age tracking if not present
+      if (b.age === undefined) b.age = 0;
+      b.age++;
+
+      // BLOB CENTER DRIFT: Slowly move toward clock center as one solid unit
+      // Do NOT follow particle positions - this causes spreading
+      // Only drift the center itself, particles stay locked relative to it
       if (!(b.anchorUntilFrame && nowF < b.anchorUntilFrame)) {
-        b.cx = lerp(b.cx, mx, 0.14);
-        b.cy = lerp(b.cy, my, 0.14);
+        // Slow inward drift toward clock center
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const toCenterX = centerX - b.cx;
+        const toCenterY = centerY - b.cy;
+        const ageFrac = min(b.age / 240.0, 1.0);
+        const inwardDrift = 0.006 * ageFrac; // very slow inward drift
+        b.cx += toCenterX * inwardDrift;
+        b.cy += toCenterY * inwardDrift;
       }
-      // keep blob strength "remembered" but slowly relax
-      b.strength = max(b.strength * 0.998, xrayMemory);
+
+      // --- GRID COLLISION ENVIRONMENT (DISCRETE CELLS) ---
+      if (XRAY_GRID_ENV_ENABLED && occ) {
+        const rMax = max(0, gridR - max(6, (b.radius || 0) + 4));
+        const rMax2 = rMax * rMax;
+
+        const insideDisk = (x, y) => {
+          const dx = x - gridCx;
+          const dy = y - gridCy;
+          return (dx * dx + dy * dy) <= rMax2;
+        };
+
+        const ix0 = Math.round((b.cx - gridCx) / cell);
+        const iy0 = Math.round((b.cy - gridCy) / cell);
+
+        const tryCell = (ix, iy) => {
+          const key = `${ix},${iy}`;
+          if (occ.has(key)) return null;
+          const x = gridCx + ix * cell;
+          const y = gridCy + iy * cell;
+          if (!insideDisk(x, y)) return null;
+          return { key, x, y, ix, iy };
+        };
+
+        let chosen = tryCell(ix0, iy0);
+        if (!chosen) {
+          for (let ring = 1; ring <= XRAY_GRID_MAX_RINGS && !chosen; ring++) {
+            for (let dx = -ring; dx <= ring && !chosen; dx++) {
+              const dyA = ring - abs(dx);
+              const dyB = -dyA;
+              const a = tryCell(ix0 + dx, iy0 + dyA);
+              if (a) { chosen = a; break; }
+              if (dyB !== dyA) {
+                const b2 = tryCell(ix0 + dx, iy0 + dyB);
+                if (b2) { chosen = b2; break; }
+              }
+            }
+          }
+        }
+
+        let snapX = b.cx;
+        let snapY = b.cy;
+        let snapIx = ix0;
+        let snapIy = iy0;
+        let snapKey = `${snapIx},${snapIy}`;
+
+        if (chosen) {
+          snapX = chosen.x;
+          snapY = chosen.y;
+          snapIx = chosen.ix;
+          snapIy = chosen.iy;
+          snapKey = chosen.key;
+        } else {
+          const dx = b.cx - gridCx;
+          const dy = b.cy - gridCy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > rMax2 && d2 > 1e-6) {
+            const d = sqrt(d2);
+            const s = rMax / d;
+            snapX = gridCx + dx * s;
+            snapY = gridCy + dy * s;
+          }
+          snapIx = Math.round((snapX - gridCx) / cell);
+          snapIy = Math.round((snapY - gridCy) / cell);
+          snapKey = `${snapIx},${snapIy}`;
+        }
+
+        b.cx = lerp(b.cx, snapX, XRAY_GRID_SNAP_LERP);
+        b.cy = lerp(b.cy, snapY, XRAY_GRID_SNAP_LERP);
+        b.gridIx = snapIx;
+        b.gridIy = snapIy;
+        occ.set(snapKey, b.id);
+      }
+
+      // --- BLOB STRENGTH MEMORY with longer decay ---
+      // Keep blob strength "remembered" but slowly relax over time
+      // Longer memory means blobs stay coherent longer (signature visibility)
+      const memoryDecay = 0.9965; // slower decay = longer blob coherence
+      b.strength = max(b.strength * memoryDecay, xrayMemory);
+
       kept.push(b);
     } else {
       xrayBlobIndex.delete(b.id);
     }
   }
   xrayBlobs = kept;
-}
-
-function updateXraySegments() {
-  if (!xraySegments.length) return;
-
-  // Reset accumulators.
-  for (let i = 0; i < xraySegments.length; i++) {
-    const s = xraySegments[i];
-    s.sumX = 0;
-    s.sumY = 0;
-    s.count = 0;
-  }
-
-  for (let i = 0; i < particles.length; i++) {
-    const p = particles[i];
-    if (!p || p.kind !== "xray" || !p.segId) continue;
-    const s = xraySegIndex.get(p.segId);
-    if (!s) continue;
-    s.sumX += p.pos.x;
-    s.sumY += p.pos.y;
-    s.count++;
-  }
-
-  const kept = [];
-  for (let i = 0; i < xraySegments.length; i++) {
-    const s = xraySegments[i];
-    s.age = (s.age || 0) + 1;
-    // Keep segments as long as they still have particles.
-    // The particles themselves are the time-record; don't drop the constraint early.
-    if (s.count > 0) {
-      s.cx = s.sumX / s.count;
-      s.cy = s.sumY / s.count;
-      kept.push(s);
-      xraySegIndex.set(s.id, s);
-    } else {
-      xraySegIndex.delete(s.id);
-    }
-  }
-  xraySegments = kept;
-}
-
-function createXraySegment(head, dir, intensity) {
-  const id = xraySegmentIdCounter++;
-  const s = constrain(intensity, 0, 1);
-  const len = 50 + 120 * s;
-  const ttl = 40 + floor(120 * s);
-  const seg = {
-    id,
-    cx: head.x,
-    cy: head.y,
-    dirx: dir.x,
-    diry: dir.y,
-    len,
-    ttl,
-    age: 0,
-    count: 0,
-    sumX: 0,
-    sumY: 0,
-  };
-  xraySegments.push(seg);
-  xraySegIndex.set(id, seg);
-  return seg;
-}
-
-function applyXraySegmentConstraint(p) {
-  if (!p.segId) return;
-  const seg = xraySegIndex.get(p.segId);
-  if (!seg) return;
-
-  const dx = p.pos.x - seg.cx;
-  const dy = p.pos.y - seg.cy;
-  const dirx = seg.dirx;
-  const diry = seg.diry;
-  const nx = -diry;
-  const ny = dirx;
-
-  const along = dx * dirx + dy * diry;
-  const perp = dx * nx + dy * ny;
-
-  const half = seg.len * 0.5;
-  const clamped = constrain(along, -half, half);
-
-  // Target point on the segment "spine"
-  const tx = seg.cx + dirx * clamped;
-  const ty = seg.cy + diry * clamped;
-
-  // Strongly pull toward the spine and keep length bounded (rigid segment feel)
-  const spineK = 0.32;
-  const perpK = 0.50;
-  p.pos.x = lerp(p.pos.x, tx, spineK);
-  p.pos.y = lerp(p.pos.y, ty, spineK);
-  p.pos.x -= nx * perp * perpK;
-  p.pos.y -= ny * perp * perpK;
-
-  // Kill perpendicular velocity to keep it stiff
-  const vperp = p.vel.x * nx + p.vel.y * ny;
-  p.vel.x -= nx * vperp * 0.85;
-  p.vel.y -= ny * vperp * 0.85;
 }
 
 function applyXrayBlobForce(p) {
@@ -1761,61 +1839,29 @@ function applyXrayBlobForce(p) {
   }
   if (!blob || blob.count <= 1) return;
 
-  const s = constrain(max(blob.strength, xrayMemory, p.xrayTight || 0), 0, 1);
-  if (s <= 0.0001) return;
+  // --- RIGID LOCKING: Lock particle to its offset from blob center ---
+  // Particles move as one solid unit with the blob center
+  if (p.blobOffsetX !== undefined && p.blobOffsetY !== undefined) {
+    // Calculate target position based on blob center + stored offset
+    const targetX = blob.cx + p.blobOffsetX;
+    const targetY = blob.cy + p.blobOffsetY;
 
-  const dx = blob.cx - p.pos.x;
-  const dy = blob.cy - p.pos.y;
-  const d2 = dx * dx + dy * dy;
-  const d = sqrt(max(1e-6, d2));
-  const nx = dx / d;
-  const ny = dy / d;
+    // Add tiny jitter for subtle life (±1-2 pixels)
+    const t = millis() * 0.001;
+    const jitterX = (noise(p.seed * 0.1, t * 0.3) - 0.5) * 2.0;
+    const jitterY = (noise(p.seed * 0.1 + 100, t * 0.3) - 0.5) * 2.0;
 
-  // Springy "container": keep particles inside the blob radius AND distribute them across the blob area
-  // (so it reads as a real, filled clump instead of a line or a tiny dot).
-  const desired = blob.radius;
-  // Stronger hold on sharp spikes so clumps feel rigid and cohesive.
-  const stiff = pow(s, 1.8);
+    // Strongly lock position to target + jitter
+    const lockStrength = 0.85; // 85% lock per frame
+    p.pos.x = lerp(p.pos.x, targetX + jitterX, lockStrength);
+    p.pos.y = lerp(p.pos.y, targetY + jitterY, lockStrength);
 
-  const coreFrac = 0.38; // inner "do not collapse" core (smaller core => larger filled area)
-  const maxF = 0.46 + 0.18 * stiff;
-  if (d > desired) {
-    const over = (d - desired);
-    const pullIn = (0.016 + 0.060 * s + 0.075 * stiff) * (1.0 + over / max(1, desired));
-    p.vel.x += constrain(nx * pullIn, -maxF, maxF);
-    p.vel.y += constrain(ny * pullIn, -maxF, maxF);
+    // Kill most velocity - particles barely move relative to blob
+    p.vel.x *= 0.10; // keep only 10% of velocity
+    p.vel.y *= 0.10;
   } else {
-    // Distribute radii: each particle gets a stable preferred radius within the blob
-    // so the clump quickly fills an area instead of collapsing.
-    const pref = constrain((p.xrayRadPref === undefined ? 0.5 : p.xrayRadPref), 0, 1);
-    const targetR = desired * (0.22 + 0.70 * pref);
-    const dr = targetR - d; // + => want outward, - => inward
-    const k = (0.006 + 0.030 * stiff);
-    p.vel.x += constrain((-nx) * (dr * k), -maxF, maxF);
-    p.vel.y += constrain((-ny) * (dr * k), -maxF, maxF);
-
-    // Prevent core collapse
-    if (d < desired * coreFrac) {
-      const under = (desired * coreFrac - d);
-      const pushOut = (0.010 + 0.050 * s + 0.060 * stiff) * (under / max(1, desired));
-      p.vel.x += constrain((-nx) * pushOut, -maxF, maxF);
-      p.vel.y += constrain((-ny) * pushOut, -maxF, maxF);
-    }
-  }
-
-  // Kill tangential "stretch" inside tight blobs (keeps the clump chunky, not a streak).
-  {
-    const tangx = -ny;
-    const tangy = nx;
-    const vT = p.vel.x * tangx + p.vel.y * tangy;
-    const kill = 0.55 * stiff;
-    p.vel.x -= tangx * vT * kill;
-    p.vel.y -= tangy * vT * kill;
-  }
-
-  // Extra damping inside the blob core to prevent elongation into long broken lines.
-  if (d < desired * 0.85) {
-    const damp = 0.040 + 0.10 * s + 0.08 * stiff;
+    // Fallback for particles without stored offset (shouldn't happen)
+    const damp = 0.90;
     p.vel.x *= (1.0 - damp);
     p.vel.y *= (1.0 - damp);
   }
@@ -1850,15 +1896,27 @@ const DENSE_MODE_THRESHOLD = 0.22; // fraction of CAPACITY; 0.22 ~= 11k at CAPAC
 let chamberFillFrac = 0;
 
 // Temporary: disable any ring/layer forcing while we tune the core physics.
-const DISABLE_RINGS = true;
+const DISABLE_RINGS = false; // ENABLED - allow layer stratification
 // Stronger guarantee: disable any kind-based radial targets (prevents "each kind sits on a ring").
-const DISABLE_KIND_RINGS = true;
+const DISABLE_KIND_RINGS = false; // ENABLED - allow kind-based ring separation
+
+// Spread tuning: per-particle target radii (reduces fixed-ring clumping and fills the center).
+const KIND_RING_SPREAD_MIX =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.kindRingSpreadMix === "number") ? CLOCK_TUNING.kindRingSpreadMix : 0.78;
+const KIND_RING_MIN_FRAC =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.kindRingMinFrac === "number") ? CLOCK_TUNING.kindRingMinFrac : 0.03;
+const KIND_RING_MAX_FRAC =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.kindRingMaxFrac === "number") ? CLOCK_TUNING.kindRingMaxFrac : 0.98;
+const LAYER_STRAT_STRENGTH_MULT =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.layerStratificationStrengthMult === "number")
+    ? CLOCK_TUNING.layerStratificationStrengthMult
+    : 0.14;
 
 // When dense, keep motion smooth by disabling noisy forces.
 const DENSE_SMOOTH_FLOW = true;
 
 // Force a globally smooth flow by disabling noisy forces at all times.
-const GLOBAL_SMOOTH_FLOW = true;
+const GLOBAL_SMOOTH_FLOW = false; // DISABLED - allow distinct per-kind behaviors
 
 // Collision/packing: make collision radius match visual size (helps prevent overlap/whitening).
 const COLLISION_RADIUS_SCALE = 2;
@@ -1868,7 +1926,7 @@ const COLLISION_RADIUS_SCALE = 2;
 const DENSITY_W = 64;
 const DENSITY_H = 64;
 const DENSITY_UPDATE_EVERY = 2;
-const DENSITY_PRESSURE = 0.04;
+const DENSITY_PRESSURE = (CLOCK_TUNING && typeof CLOCK_TUNING.densityPressure === "number") ? CLOCK_TUNING.densityPressure : 0.06;
 const DENSE_DISABLE_COHESION = false;
 // Density grids (per-kind + total) for cross-kind "one medium" coupling.
 let densAll = null;
@@ -1878,9 +1936,9 @@ let densProtons = null;
 let densHIons = null;
 let densMag = null;
 let densityGridFrame = -1;
-const DENSITY_VISCOSITY = 0.30;
+const DENSITY_VISCOSITY = (CLOCK_TUNING && typeof CLOCK_TUNING.densityViscosity === "number") ? CLOCK_TUNING.densityViscosity : 0.30;
 const DENSITY_DAMPING = 0.35;
-const DENSE_VEL_SMOOTH = 0.60;
+const DENSE_VEL_SMOOTH = (CLOCK_TUNING && typeof CLOCK_TUNING.denseVelSmooth === "number") ? CLOCK_TUNING.denseVelSmooth : 0.60;
 
 const DENSITY_KINDS = ["xray", "electrons", "protons", "h_ions", "mag"];
 const DENSITY_COUPLING = {
@@ -1893,9 +1951,12 @@ const DENSITY_COUPLING = {
   mag:       { xray: 0.10, electrons: 0.08, protons: 0.18, h_ions: 0.10, mag: 0.00 },
 };
 
-const ELECTRON_TREMOR_COUPLING = 0.45; // adds diffusion/noise to others via electrons gradient
-const HION_FLOW_COUPLING = 0.28;       // adds "streamline" bias via h_ions gradient
-const MAG_ALIGN_COUPLING = 0.12;       // alignment steering strength from local mag density
+const ELECTRON_TREMOR_COUPLING =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.electronTremorCoupling === "number") ? CLOCK_TUNING.electronTremorCoupling : 0.45; // adds diffusion/noise to others via electrons gradient
+const HION_FLOW_COUPLING =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.hionFlowCoupling === "number") ? CLOCK_TUNING.hionFlowCoupling : 0.28; // adds "streamline" bias via h_ions gradient
+const MAG_ALIGN_COUPLING =
+  (CLOCK_TUNING && typeof CLOCK_TUNING.magAlignCoupling === "number") ? CLOCK_TUNING.magAlignCoupling : 0.12; // alignment steering strength from local mag density
 const XRAY_EVENT_SHOCK_BOOST = 1.6;    // boosts xray coupling during events
 const DENSITY_COUPLING_ENABLE_AT = 0.06; // enable coupling once chamber has a little mass
 
@@ -1929,13 +1990,16 @@ let debugPerfHUD = false;
 let debugPoolHUD = false;
 let enableDensity = true;
 let enableCollisions = true;
-let enableAgeSpiral = true;
-let enableCohesion = true;
-let enableXrayBlobForce = true;
-let handParticles = { hour: [], minute: [], second: [] };
-let handSlots = { hour: null, minute: null, second: null };
-let handSlotMeta = { hour: null, minute: null, second: null };
-let handFill = { hour: 0, minute: 0, second: 0 };
+	let enableAgeSpiral = true;
+	let enableCohesion = true;
+	let enableXrayBlobForce = true;
+	let emitCarry = { hour: 0, minute: 0, second: 0 };
+	let emitKindCarry = {
+	  hour:   { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	  minute: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	  second: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	};
+	let handFill = { hour: 0, minute: 0, second: 0 };
 
 // Visual-system arrays used by resetVisualSystems().
 let jets = [];
@@ -1945,6 +2009,7 @@ let ripples = [];
 // Persistent energy field
 let field, fieldW = 0, fieldH = 0;
 let fieldBuf, fieldBuf2;
+let fieldImgData;
 let faceLogOnce = false;
 
 // UI
@@ -1960,20 +2025,48 @@ let spawnGridFrame = -1;
 let spawnCellPool = [];
 let spawnCellsInUse = [];
 
+// Magnetic neighbor grid (for fast local separation + link repair).
+let magNeighborGridCache = null;
+let magNeighborGridFrame = -1;
+let magNeighborCellPool = [];
+let magNeighborCellsInUse = [];
+
 function setup() {
-  createCanvas(1200, 1200);
+  const mainCanvas = createCanvas(1200, 1200);
+  try {
+    mainCanvas.parent("app");
+    mainCanvas.elt.classList.add("p5-overlay");
+  } catch (e) {}
   angleMode(RADIANS);
   pixelDensity(1);
 
   // Render mode info (log once on startup).
   console.log("[render]", { USE_LOWRES_RENDER, USE_WEBGL_PARTICLES, pgScale });
 
-  if (USE_WEBGL_PARTICLES) {
-    ensureParticleGL();
-  } else if (USE_LOWRES_RENDER) {
-    ensureParticleGraphics();
+  if (!USE_PIXI_RENDERER) {
+    if (USE_WEBGL_PARTICLES) {
+      ensureParticleGL();
+    } else if (USE_LOWRES_RENDER) {
+      ensureParticleGraphics();
+    }
   }
   ensureClockStatic();
+
+  if (USE_PIXI_RENDERER && !pixiInitPromise) {
+    try {
+      const parent = document.getElementById("app") || document.body;
+      pixiInitPromise = initPixiRenderer({ parent, width, height })
+        .then((s) => {
+          pixi = s;
+        })
+        .catch((e) => {
+          console.error("[pixi] init failed", e);
+          pixi = null;
+        });
+    } catch (e) {
+      console.error("[pixi] init failed", e);
+    }
+  }
 
   // PERF: Fill direction LUT once (no random2D allocations in hot loops).
   DIR_X = new Float32Array(DIR_N);
@@ -2026,14 +2119,24 @@ function setup() {
 
   textFont("system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial");
 
-  {
-    const T = computeHandData(new Date());
-    const area = PI * T.radius * T.radius;
-    const cellArea = max(1, DRAW_GRID_SIZE * DRAW_GRID_SIZE);
-    const fillTarget = floor((area / cellArea) * 0.20); // 85% of grid occupancy
-    CAPACITY = max(2000, fillTarget);
-    SOFT_CAP = CAPACITY;
-  }
+	  {
+	    const T = computeHandData(new Date());
+	    const area = PI * T.radius * T.radius;
+	    const cellArea = max(1, DRAW_GRID_SIZE * DRAW_GRID_SIZE);
+	    const fillTarget = floor((area / cellArea) * 0.20); // 85% of grid occupancy
+	    const autoCapacity = max(CAPACITY_MIN, fillTarget);
+	    const fixedTarget = (typeof CAPACITY_TARGET_FULL === "number" && isFinite(CAPACITY_TARGET_FULL))
+	      ? (CAPACITY_TARGET_FULL | 0)
+	      : 0;
+	    if (CAPACITY_DYNAMIC_ENABLED) {
+	      const minCap = max(CAPACITY_MIN, CAPACITY_DYNAMIC_MIN | 0);
+	      const maxCap = max(minCap, CAPACITY_DYNAMIC_MAX | 0);
+	      CAPACITY = maxCap;
+	    } else {
+	      CAPACITY = (fixedTarget > 0) ? max(CAPACITY_MIN, fixedTarget) : autoCapacity;
+	    }
+	    SOFT_CAP = CAPACITY;
+	  }
 
   // PERF: prewarm particle pools (one-time load, smoother runtime).
   prewarmPools();
@@ -2045,10 +2148,14 @@ function setup() {
 
 function windowResized() {
   resizeCanvas(1200, 1200);
-  if (USE_WEBGL_PARTICLES) {
-    ensureParticleGL();
-  } else if (USE_LOWRES_RENDER) {
-    ensureParticleGraphics();
+  if (!USE_PIXI_RENDERER) {
+    if (USE_WEBGL_PARTICLES) {
+      ensureParticleGL();
+    } else if (USE_LOWRES_RENDER) {
+      ensureParticleGraphics();
+    }
+  } else if (pixi) {
+    resizePixiRenderer(pixi, width, height);
   }
   ensureFaceField();
   ensureClockStatic();
@@ -2061,10 +2168,10 @@ function ensureParticleGraphics() {
 
 function ensureFaceField() {
   const next = ensureFaceFieldCore(
-    { field, fieldW, fieldH, fieldBuf, fieldBuf2, faceLogOnce },
+    { field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, faceLogOnce },
     { FACE_SCALE, setCanvasWillReadFrequently }
   );
-  ({ field, fieldW, fieldH, fieldBuf, fieldBuf2, faceLogOnce } = next);
+  ({ field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, faceLogOnce } = next);
 }
 
 function ensureParticleGL() {
@@ -2189,23 +2296,107 @@ function getCohesionGrid(list, cellSize) {
   return cohesionGridCache;
 }
 
-function buildNeighborGrid(list, cellSize) {
-  // PERF: build into a reused Map and pooled arrays.
-  const grid = new Map();
+// Magnetic filament chain building: creates k-nearest neighbor links for magnetic particles
+// to form elongated threads (anisotropic, longitudinal connections)
+function buildMagneticChains(list, k = 3, magneticCoherence = 0.5) {
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const coh = constrain(magneticCoherence, 0, 1);
+  const restLength = magBehavior.restLength || 28;
+  const maxLinkDist = lerp(restLength * 1.4, restLength * 2.8, coh);
+  const dotMin = lerp(0.10, 0.45, coh);
+
+  // Clear all existing magnetic chain links
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
-    if (!p) continue;
-    const cx = floor(p.pos.x / cellSize);
-    const cy = floor(p.pos.y / cellSize);
-    const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
-    let cell = grid.get(key);
-    if (!cell) {
-      cell = [];
-      grid.set(key, cell);
-    }
-    cell.push(i);
+    if (!p || p.kind !== "mag") continue;
+    p.magPrev = null;
+    p.magNext = null;
+    p.magTangent.x = 0;
+    p.magTangent.y = 0;
   }
-  return grid;
+
+  // Extract only magnetic particles with their indices
+  const magParticles = [];
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || p.kind !== "mag") continue;
+    if (!p.active || (p.dead && p.dead())) continue;
+    magParticles.push(p);
+  }
+
+  if (magParticles.length < 2) return;
+
+  // For each magnetic particle, find k-nearest magnetic neighbors
+  // and establish forward/backward chain links
+  for (let i = 0; i < magParticles.length; i++) {
+    const p = magParticles[i];
+
+    // Find k-nearest neighbors
+    const neighbors = [];
+    for (let j = 0; j < magParticles.length; j++) {
+      if (i === j) continue;
+      const q = magParticles[j];
+      const dx = q.pos.x - p.pos.x;
+      const dy = q.pos.y - p.pos.y;
+      const d2 = dx * dx + dy * dy;
+      neighbors.push({ particle: q, dist2: d2, dx, dy });
+    }
+
+    // Sort by distance and take k nearest
+    neighbors.sort((a, b) => a.dist2 - b.dist2);
+    const kNearest = neighbors.slice(0, k);
+
+    if (kNearest.length === 0) continue;
+
+    // Compute local tangent direction from velocity + nearest neighbor directions
+    let tx = (p.magTangent && Number.isFinite(p.magTangent.x)) ? p.magTangent.x * 0.65 : 0;
+    let ty = (p.magTangent && Number.isFinite(p.magTangent.y)) ? p.magTangent.y * 0.65 : 0;
+    tx += p.vel.x;
+    ty += p.vel.y;
+    for (const n of kNearest) {
+      tx += n.dx * 0.3;
+      ty += n.dy * 0.3;
+    }
+    const tmag = sqrt(tx * tx + ty * ty) + 1e-6;
+    tx /= tmag;
+    ty /= tmag;
+    p.magTangent.x = tx;
+    p.magTangent.y = ty;
+
+    // Find the most forward and most backward neighbors along the tangent
+    let bestForwardScore = -1e9;
+    let bestBackwardScore = -1e9;
+    let forwardNeighbor = null;
+    let backwardNeighbor = null;
+
+    for (const n of kNearest) {
+      const d = sqrt(n.dist2) + 1e-6;
+      if (d > maxLinkDist) continue;
+      const nx = n.dx / d;
+      const ny = n.dy / d;
+      const dot = nx * tx + ny * ty;
+
+      // Prefer strong longitudinal alignment; downweight longer links.
+      const score = abs(dot) / d;
+      if (dot >= dotMin && score > bestForwardScore) {
+        bestForwardScore = score;
+        forwardNeighbor = n.particle;
+      } else if (dot <= -dotMin && score > bestBackwardScore) {
+        bestBackwardScore = score;
+        backwardNeighbor = n.particle;
+      }
+    }
+
+    // Establish bidirectional links (avoid branching: only connect into free slots).
+    if (forwardNeighbor && !p.magNext && !forwardNeighbor.magPrev) {
+      p.magNext = forwardNeighbor;
+      forwardNeighbor.magPrev = p;
+    }
+    if (backwardNeighbor && !p.magPrev && !backwardNeighbor.magNext) {
+      p.magPrev = backwardNeighbor;
+      backwardNeighbor.magNext = p;
+    }
+  }
 }
 
 function rebuildNeighborGridInto(list, cellSize, grid, cellsInUse, pool) {
@@ -2263,6 +2454,40 @@ function rebuildSpawnGrid(list, cellSize, grid, cellsInUse, pool) {
   return grid;
 }
 
+function rebuildMagNeighborGrid(list, cellSize, grid, cellsInUse, pool) {
+  if (!grid) grid = new Map();
+  for (let i = 0; i < cellsInUse.length; i++) {
+    const arr = cellsInUse[i];
+    arr.length = 0;
+    pool.push(arr);
+  }
+  cellsInUse.length = 0;
+  grid.clear();
+
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || !p.active || p.kind !== "mag" || (p.dead && p.dead())) continue;
+    const cx = floor(p.pos.x / cellSize);
+    const cy = floor(p.pos.y / cellSize);
+    const key = ((cx & 0xffff) << 16) | (cy & 0xffff);
+    let cell = grid.get(key);
+    if (!cell) {
+      cell = pool.pop() || [];
+      cellsInUse.push(cell);
+      grid.set(key, cell);
+    }
+    cell.push(p);
+  }
+  return grid;
+}
+
+function getMagNeighborGrid(list, cellSize) {
+  if (magNeighborGridFrame === frameCount && magNeighborGridCache) return magNeighborGridCache;
+  magNeighborGridCache = rebuildMagNeighborGrid(list, cellSize, magNeighborGridCache, magNeighborCellsInUse, magNeighborCellPool);
+  magNeighborGridFrame = frameCount;
+  return magNeighborGridCache;
+}
+
 function ensureSpawnGrid() {
   if (spawnGridFrame === frameCount && spawnGridCache) return;
   spawnGridCache = rebuildSpawnGrid(particles, SPAWN_CELL_SIZE, spawnGridCache, spawnCellsInUse, spawnCellPool);
@@ -2303,6 +2528,9 @@ function getAlignmentGrid(list, cellSize) {
 }
 
 function computeCollisionRadius(p) {
+  // X-ray blob particles should NOT collide - collision pushes them apart
+  if (p.kind === "xray" && p.blobId) return 0; // zero radius = no collision
+
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const s = p.size * (prof.sizeMult || 1.0) * PARTICLE_SIZE_SCALE;
   return max(1.2, (s * 0.5) * COLLISION_RADIUS_SCALE);
@@ -2353,30 +2581,6 @@ function rebuildDensityGrids() {
     const g = getDensityGridForKind(p.kind);
     if (g && g[idx] < 65535) g[idx]++;
   }
-
-  // X-ray events inject short-lived "shock density" so other kinds react locally.
-  if (Array.isArray(xrayEvents) && xrayEvents.length) {
-    for (let i = 0; i < xrayEvents.length; i++) {
-      const e = xrayEvents[i];
-      if (!e) continue;
-      let gx = floor(e.x * sx);
-      let gy = floor(e.y * sy);
-      if (gx < 1) gx = 1; else if (gx > DENSITY_W - 2) gx = DENSITY_W - 2;
-      if (gy < 1) gy = 1; else if (gy > DENSITY_H - 2) gy = DENSITY_H - 2;
-      const idx = gy * DENSITY_W + gx;
-      // Keep the "shock" local and short-lived; avoid carving big empty holes around long-lived xray clumps.
-      const add = floor(8 + (e.strength || 0) * 22);
-      const addTo = (j, v) => {
-        densXray[j] = min(65535, densXray[j] + v);
-        densAll[j] = min(65535, densAll[j] + v);
-      };
-      addTo(idx, add);
-      addTo(idx - 1, floor(add * 0.45));
-      addTo(idx + 1, floor(add * 0.45));
-      addTo(idx - DENSITY_W, floor(add * 0.45));
-      addTo(idx + DENSITY_W, floor(add * 0.45));
-    }
-  }
 }
 
 function sampleDensityGradient(grid, idx) {
@@ -2393,6 +2597,8 @@ function sampleDensityGradient(grid, idx) {
 
 function applyDensityCoupling(p, T, scale) {
   if (!densAll) return;
+  // X-ray blob particles should IGNORE density pressure - it pushes them apart
+  if (p.kind === "xray" && p.blobId) return;
   if (scale === undefined) scale = 1.0;
 
   const sx = DENSITY_W / max(1, width);
@@ -2653,9 +2859,11 @@ function resolveSpaceCollisions(
              if (d2 <= 1e-6) continue;
              const r2 = rad[k];
              const minD = r1 + r2;
+             const minD2 = minD * minD;
              if (audit && it === 0) audit.pairsChecked++;
-             if (d2 >= (minD * minD)) continue;
+             if (d2 >= minD2) continue;
 
+              // Optimize: Use fast inverse sqrt approximation for non-critical calculation
               const d = sqrt(d2);
               const inv = 1.0 / d;
               const nxv = dx * inv;
@@ -2665,40 +2873,46 @@ function resolveSpaceCollisions(
                 if (d < p.minNNThisFrame) p.minNNThisFrame = d;
                 if (d < q.minNNThisFrame) q.minNNThisFrame = d;
               }
-              let push = overlap * pushK;
-              push *= corr;
+              let push = overlap * pushK * corr;
               if (push > maxMovePx) push = maxMovePx;
-              if (audit && it === 0) {
-                audit.pairsOverlap++;
-                audit.sumOverlap += overlap;
-                if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
-                const post = overlap * max(0, 1.0 - 2.0 * pushK);
-                audit.postPairsOverlap++;
-                audit.postSumOverlap += post;
-                if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
-              }
-              if (overlap > 0 && it === 0) {
-                p.collidedThisFrame = true;
-                q.collidedThisFrame = true;
-              }
-              if (overlap > 0 && it === 0) {
-                const count = (collisionHotCounts.get(key) || 0) + 1;
-                collisionHotCounts.set(key, count);
-                if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+
+              // Only track stats on first iteration to reduce overhead
+              if (it === 0) {
+                if (audit) {
+                  audit.pairsOverlap++;
+                  audit.sumOverlap += overlap;
+                  if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
+                  const post = overlap * max(0, 1.0 - 2.0 * pushK);
+                  audit.postPairsOverlap++;
+                  audit.postSumOverlap += post;
+                  if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
+                }
+                if (overlap > 0) {
+                  p.collidedThisFrame = true;
+                  q.collidedThisFrame = true;
+                  const count = (collisionHotCounts.get(key) || 0) + 1;
+                  collisionHotCounts.set(key, count);
+                  if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+                }
               }
 
-              p.pos.x += nxv * push;
-              p.pos.y += nyv * push;
-              q.pos.x -= nxv * push;
-              q.pos.y -= nyv * push;
+              // Position correction (optimized: cache multiplications)
+              const pushX = nxv * push;
+              const pushY = nyv * push;
+              p.pos.x += pushX;
+              p.pos.y += pushY;
+              q.pos.x -= pushX;
+              q.pos.y -= pushY;
 
+              // Velocity damping (optimized: inline constants, cache products)
               const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
-              const dampFactor = 0.15 + DENSITY_DAMPING * 0.5;
-              const impulse = rv * dampFactor * corr;
-              p.vel.x -= nxv * impulse;
-              p.vel.y -= nyv * impulse;
-              q.vel.x += nxv * impulse;
-              q.vel.y += nyv * impulse;
+              const impulse = rv * (0.15 + DENSITY_DAMPING * 0.5) * corr;
+              const impX = nxv * impulse;
+              const impY = nyv * impulse;
+              p.vel.x -= impX;
+              p.vel.y -= impY;
+              q.vel.x += impX;
+              q.vel.y += impY;
             }
           }
         } else {
@@ -2732,40 +2946,46 @@ function resolveSpaceCollisions(
                 if (d < p.minNNThisFrame) p.minNNThisFrame = d;
                 if (d < q.minNNThisFrame) q.minNNThisFrame = d;
               }
-              let push = overlap * pushK;
-              push *= corr;
+              let push = overlap * pushK * corr;
               if (push > maxMovePx) push = maxMovePx;
-              if (audit && it === 0) {
-                audit.pairsOverlap++;
-                audit.sumOverlap += overlap;
-                if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
-                const post = overlap * max(0, 1.0 - 2.0 * pushK);
-                audit.postPairsOverlap++;
-                audit.postSumOverlap += post;
-                if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
-              }
-              if (overlap > 0 && it === 0) {
-                p.collidedThisFrame = true;
-                q.collidedThisFrame = true;
-              }
-              if (overlap > 0 && it === 0) {
-                const count = (collisionHotCounts.get(key) || 0) + 1;
-                collisionHotCounts.set(key, count);
-                if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+
+              // Only track stats on first iteration to reduce overhead
+              if (it === 0) {
+                if (audit) {
+                  audit.pairsOverlap++;
+                  audit.sumOverlap += overlap;
+                  if (overlap > audit.maxOverlap) audit.maxOverlap = overlap;
+                  const post = overlap * max(0, 1.0 - 2.0 * pushK);
+                  audit.postPairsOverlap++;
+                  audit.postSumOverlap += post;
+                  if (post > audit.postMaxOverlap) audit.postMaxOverlap = post;
+                }
+                if (overlap > 0) {
+                  p.collidedThisFrame = true;
+                  q.collidedThisFrame = true;
+                  const count = (collisionHotCounts.get(key) || 0) + 1;
+                  collisionHotCounts.set(key, count);
+                  if (count === HOT_CELL_OVERLAP_THRESHOLD) collisionHotKeys.push(key);
+                }
               }
 
-              p.pos.x += nxv * push;
-              p.pos.y += nyv * push;
-              q.pos.x -= nxv * push;
-              q.pos.y -= nyv * push;
+              // Position correction (optimized: cache multiplications)
+              const pushX = nxv * push;
+              const pushY = nyv * push;
+              p.pos.x += pushX;
+              p.pos.y += pushY;
+              q.pos.x -= pushX;
+              q.pos.y -= pushY;
 
+              // Velocity damping (optimized: inline constants, cache products)
               const rv = (p.vel.x - q.vel.x) * nxv + (p.vel.y - q.vel.y) * nyv;
-              const dampFactor = 0.15 + DENSITY_DAMPING * 0.5;
-              const impulse = rv * dampFactor * corr;
-              p.vel.x -= nxv * impulse;
-              p.vel.y -= nyv * impulse;
-              q.vel.x += nxv * impulse;
-              q.vel.y += nyv * impulse;
+              const impulse = rv * (0.15 + DENSITY_DAMPING * 0.5) * corr;
+              const impX = nxv * impulse;
+              const impY = nyv * impulse;
+              p.vel.x -= impX;
+              p.vel.y -= impY;
+              q.vel.x += impX;
+              q.vel.y += impY;
             }
           }
         }
@@ -3023,35 +3243,53 @@ function applyLayerStratification(p, T) {
   const frac = (p.layerTargetFrac !== null && p.layerTargetFrac !== undefined) ? p.layerTargetFrac : (prof.layerRadiusFrac || 0);
   const age = (frameCount || 0) - (p.birthFrame || 0);
   if (age < 18) return; // don't yank freshly-emitted particles toward a ring
-  const k = (prof.layerStrength || 0) * 0.45 * constrain(kindStrength(p.kind), 0, 1);
+  const fill01 = constrain(chamberFillFrac || 0, 0, 1);
+  const fade = lerp(1.0, 0.40, pow(fill01, 1.3)); // when full, reduce ring forcing so the disk can fill
+  const k = (prof.layerStrength || 0) * LAYER_STRAT_STRENGTH_MULT * fade * constrain(kindStrength(p.kind), 0, 1);
   if (k <= 0.000001 || frac <= 0) return;
 
-  const rel = p5.Vector.sub(p.pos, T.c);
-  const r = rel.mag();
+  const dx = p.pos.x - T.c.x;
+  const dy = p.pos.y - T.c.y;
+  const r = sqrt(dx * dx + dy * dy) + 1e-6;
   const target = T.radius * frac;
   const dr = target - r;
   if (abs(dr) < 1.0) return;
-  const n = rel.copy().normalize();
-  p.vel.add(n.mult(constrain(dr, -80, 80) * k));
+  const inv = 1.0 / r;
+  const nx = dx * inv;
+  const ny = dy * inv;
+  const f = constrain(dr, -80, 80) * k;
+  p.vel.x += nx * f;
+  p.vel.y += ny * f;
 }
 
 function applyVolumetricMix(p, T) {
   // Gentle radial noise that prevents long-term ring trapping and encourages filling.
   const t = millis() * 0.001;
-  const rel = p5.Vector.sub(p.pos, T.c);
-  const r = max(20, rel.mag());
-  const n = rel.copy().mult(1.0 / r);
+  const dx = p.pos.x - T.c.x;
+  const dy = p.pos.y - T.c.y;
+  const r = max(20, sqrt(dx * dx + dy * dy)) + 1e-6;
+  const inv = 1.0 / r;
+  const dirx = dx * inv;
+  const diry = dy * inv;
 
   const k = 0.016 * (0.35 + electrons * 0.40) * (1.0 - 0.45 * protons);
   if (k <= 0.000001) return;
 
-  const nx = (p.pos.x - T.c.x) * 0.0015;
-  const ny = (p.pos.y - T.c.y) * 0.0015;
-  const wob = (noise(nx + 7.7, ny + 3.3, t * 0.15) - 0.5) * 2.0;
-  p.vel.add(n.mult(wob * k * T.radius));
+  const sx = dx * 0.0015;
+  const sy = dy * 0.0015;
+  const wob = (noise(sx + 7.7, sy + 3.3, t * 0.15) - 0.5) * 2.0;
+  const f = wob * k * T.radius;
+  p.vel.x += dirx * f;
+  p.vel.y += diry * f;
 }
 
 function applyCohesion(p, index, grid, cellSize, forceScale) {
+  // X-ray blob particles should ONLY use blob cohesion, not global cohesion
+  if (p.kind === "xray" && p.blobId) return;
+
+  // OPTION 2: Skip cohesion for magnetic (uses filament force) and electrons (individual flutter)
+  if (p.kind === "mag" || p.kind === "electrons") return;
+
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const radius = prof.cohesionRadius || 0;
   if (radius <= 0) return;
@@ -3132,7 +3370,552 @@ function applyCohesion(p, index, grid, cellSize, forceScale) {
   p.vel.y += fy * s;
 }
 
+// Generate magnetic guide paths from each hand toward center
+// These are invisible paths that magnetic particles are strongly attracted to
+function updateMagneticGuidePaths(T, handPositions) {
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const pathPointSpacing = 20; // distance between path points
+  const pathCount = 3; // number of parallel paths per hand
+
+  // DEBUG: IMMEDIATE log on first call
+  if (frameCount === 1 || frameCount % 120 === 0) {
+    console.log(`[PATH GEN] Called at frame ${frameCount}`);
+    console.log(`[PATH GEN] handPositions:`, handPositions);
+    console.log(`[PATH GEN] handPositions.hour:`, handPositions.hour);
+    console.log(`[PATH GEN] handPositions.minute:`, handPositions.minute);
+    console.log(`[PATH GEN] handPositions.second:`, handPositions.second);
+  }
+
+  let totalPathsGenerated = 0;
+
+  ['hour', 'minute', 'second'].forEach(which => {
+    const hand = handPositions[which];
+    if (!hand) {
+      console.log(`[PATH GEN] ERROR: ${which} hand is null/undefined at frame ${frameCount}`);
+      return;
+    }
+
+    magneticPaths[which] = [];
+
+    // Create multiple parallel SPIRAL paths that wrap around center (like red drawing)
+    // Each path should spiral inward with rotation, forming curved strings
+    for (let pathIdx = 0; pathIdx < pathCount; pathIdx++) {
+      const radiusOffset = (pathIdx - 1) * 30; // spread paths radially
+      const points = [];
+
+      // Get starting angle of hand from center
+      const startAngle = atan2(hand.y - T.c.y, hand.x - T.c.x);
+      const startRadius = sqrt(pow(hand.x - T.c.x, 2) + pow(hand.y - T.c.y, 2));
+
+      // Create spiral path: start at hand, spiral inward while rotating
+      const totalRotation = PI * 2.5; // spiral makes 2.5 full rotations inward
+      const numPoints = 50; // many points for smooth curve
+
+      for (let i = 0; i <= numPoints; i++) {
+        const t = i / numPoints;
+        // Radius decreases as we spiral inward
+        const radius = (startRadius + radiusOffset) * (1 - t * 0.85); // spiral to 15% of start radius
+        // Angle rotates as we spiral
+        const angle = startAngle + t * totalRotation;
+
+        points.push({
+          x: T.c.x + cos(angle) * radius,
+          y: T.c.y + sin(angle) * radius,
+          t: t // 0=hand, 1=near center
+        });
+      }
+
+      magneticPaths[which].push(points);
+      totalPathsGenerated++;
+
+      if (frameCount % 120 === 0 && pathIdx === 0) {
+        console.log(`[PATH GEN] ${which}: hand=(${hand.x.toFixed(1)},${hand.y.toFixed(1)}), radius=${startRadius.toFixed(1)}, numPoints=${numPoints}, rotation=${(totalRotation/PI).toFixed(1)}π`);
+      }
+    }
+  });
+
+  if (frameCount % 120 === 0) {
+    console.log(`[PATH GEN] Total paths generated: ${totalPathsGenerated}`);
+    console.log(`[PATH GEN] magneticPaths:`, magneticPaths);
+  }
+}
+
+// Apply path following force: attracts magnetic particles to nearest guide path
+function applyMagneticPathForce(p, which) {
+  if (!p || p.kind !== "mag" || !magneticPaths[which]) return;
+
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const pathStrength = 25.0; // EXTREMELY strong attraction to path - dominate all other forces
+  const maxPathForce = 50.0; // Very high max force to form tight strings along paths
+
+  let closestDist = Infinity;
+  let closestX = p.pos.x;
+  let closestY = p.pos.y;
+
+  // Find nearest point across all paths for this hand
+  for (const path of magneticPaths[which]) {
+    for (const point of path) {
+      const dx = point.x - p.pos.x;
+      const dy = point.y - p.pos.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < closestDist * closestDist) {
+        closestDist = sqrt(d2);
+        closestX = point.x;
+        closestY = point.y;
+      }
+    }
+  }
+
+  // Apply force toward nearest path point - VERY STRONG to form tight strings
+  if (closestDist > 0.5 && closestDist < 500) {
+    const dx = closestX - p.pos.x;
+    const dy = closestY - p.pos.y;
+    const force = constrain(closestDist * pathStrength, 0, maxPathForce);
+    const inv = force / closestDist;
+    // Directly set velocity toward path (override other forces)
+    const mix = 0.8; // 80% toward path, 20% keep existing velocity
+    p.vel.x = p.vel.x * (1.0 - mix) + dx * inv * mix;
+    p.vel.y = p.vel.y * (1.0 - mix) + dy * inv * mix;
+
+    // DEBUG
+    if (frameCount % 60 === 0 && random() < 0.01) {
+      console.log(`[PATH] which=${which}, dist=${closestDist.toFixed(1)}, force=${force.toFixed(2)}, paths=${magneticPaths[which].length}`);
+    }
+  }
+}
+
+// DEBUG: Draw magnetic guide paths (for visualization)
+function debugDrawMagneticPaths() {
+  if (!LAYER_BEHAVIOR.mag.drawChainLines) {
+    if (frameCount % 120 === 0) {
+      console.log(`[PATH DRAW] drawChainLines is FALSE, skipping draw`);
+    }
+    return;
+  }
+
+  if (frameCount % 120 === 0) {
+    console.log(`[PATH DRAW] Drawing paths. magneticPaths:`, magneticPaths);
+    console.log(`[PATH DRAW] hour paths:`, magneticPaths.hour?.length, 'minute:', magneticPaths.minute?.length, 'second:', magneticPaths.second?.length);
+  }
+
+  push();
+  stroke(255, 255, 0, 100); // yellow, semi-transparent
+  strokeWeight(2);
+  noFill();
+
+  let totalPathsDrawn = 0;
+  let totalPointsDrawn = 0;
+
+  ['hour', 'minute', 'second'].forEach(which => {
+    if (!magneticPaths[which]) {
+      if (frameCount % 120 === 0) console.log(`[PATH DRAW] ${which} has no paths`);
+      return;
+    }
+
+    for (const path of magneticPaths[which]) {
+      beginShape();
+      for (const point of path) {
+        vertex(point.x, point.y);
+        totalPointsDrawn++;
+      }
+      endShape();
+      totalPathsDrawn++;
+    }
+  });
+
+  pop();
+
+  if (frameCount % 120 === 0) {
+    console.log(`[PATH DRAW] Drew ${totalPathsDrawn} paths with ${totalPointsDrawn} total points`);
+  }
+}
+
+// Apply magnetic filament force: creates elongated, string-like structures
+// High coherence = straight, continuous filaments
+// Low coherence = jagged, broken, zigzag filaments
+function applyMagneticFilamentForce(p, magneticCoherence, magNeighborGrid = null, magNeighborCellSize = 64) {
+  if (p.kind !== "mag") return;
+
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const historyBlend = (typeof magBehavior.historyBlend === "number") ? magBehavior.historyBlend : 0.0;
+  const cohNow = constrain(magneticCoherence, 0, 1);
+  const cohBirth = constrain((typeof p.magCohBirth === "number") ? p.magCohBirth : cohNow, 0, 1);
+  const coherence = constrain(lerp(cohNow, cohBirth, historyBlend), 0, 1);
+
+  // Spring constants for longitudinal (forward/back) chaining (using config values)
+  const springStrength = lerp(
+    magBehavior.springStrengthLow || 0.08,
+    magBehavior.springStrengthHigh || 0.28,
+    coherence
+  );
+  const springMaxForce = lerp(
+    magBehavior.springMaxForceLow || 0.15,
+    magBehavior.springMaxForceHigh || 0.45,
+    coherence
+  );
+  const restLength = magBehavior.restLength || 28;
+
+  // Lateral separation strength (keep threads thin, not blobby)
+  const lateralSeparation = lerp(
+    magBehavior.lateralSeparationLow || 0.55,
+    magBehavior.lateralSeparationHigh || 0.35,
+    coherence
+  );
+
+  // Velocity alignment along filament tangent
+  const alignmentStrength = lerp(
+    magBehavior.alignmentStrengthLow || 0.02,
+    magBehavior.alignmentStrengthHigh || 0.16,
+    coherence
+  );
+
+  // Directional noise amplitude (creates kinks and zigzags)
+  const noiseAmp = lerp(
+    magBehavior.noiseAmpLow || 0.35,
+    magBehavior.noiseAmpHigh || 0.08,
+    coherence
+  );
+
+  // Validate links (low coherence breaks more easily).
+  const breakDist = lerp(restLength * 1.6, restLength * 3.2, coherence);
+  if (p.magNext) {
+    const q = p.magNext;
+    const dx = q.pos.x - p.pos.x;
+    const dy = q.pos.y - p.pos.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 > breakDist * breakDist) {
+      if (q.magPrev === p) q.magPrev = null;
+      p.magNext = null;
+    }
+  }
+  if (p.magPrev) {
+    const q = p.magPrev;
+    const dx = q.pos.x - p.pos.x;
+    const dy = q.pos.y - p.pos.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 > breakDist * breakDist) {
+      if (q.magNext === p) q.magNext = null;
+      p.magPrev = null;
+    }
+  }
+
+  // Compute local tangent from chain geometry (preferred) or fall back to stored tangent/velocity.
+  let tx = 0, ty = 0;
+  if (p.magPrev && p.magNext) {
+    tx = p.magNext.pos.x - p.magPrev.pos.x;
+    ty = p.magNext.pos.y - p.magPrev.pos.y;
+  } else if (p.magNext) {
+    tx = p.magNext.pos.x - p.pos.x;
+    ty = p.magNext.pos.y - p.pos.y;
+  } else if (p.magPrev) {
+    tx = p.pos.x - p.magPrev.pos.x;
+    ty = p.pos.y - p.magPrev.pos.y;
+  } else {
+    tx = (p.magTangent && Number.isFinite(p.magTangent.x)) ? p.magTangent.x : p.vel.x;
+    ty = (p.magTangent && Number.isFinite(p.magTangent.y)) ? p.magTangent.y : p.vel.y;
+  }
+  {
+    const tmag = sqrt(tx * tx + ty * ty) + 1e-6;
+    tx /= tmag;
+    ty /= tmag;
+    p.magTangent.x = tx;
+    p.magTangent.y = ty;
+  }
+
+  // Continuity repair: when organized, try to re-connect missing links locally along the tangent.
+  if (coherence > 0.65 && magNeighborGrid) {
+    const healDist = lerp(restLength * 1.25, restLength * 2.7, coherence);
+    const healDot = lerp(0.10, 0.45, coherence);
+    const healR2 = healDist * healDist;
+    const cx = floor(p.pos.x / magNeighborCellSize);
+    const cy = floor(p.pos.y / magNeighborCellSize);
+
+    const tryHeal = (dir) => {
+      let best = null;
+      let bestScore = -1e9;
+      for (let oy = -1; oy <= 1; oy++) {
+        const cyo = (cy + oy) & 0xffff;
+        for (let ox = -1; ox <= 1; ox++) {
+          const key = (((cx + ox) & 0xffff) << 16) | cyo;
+          const cell = magNeighborGrid.get(key);
+          if (!cell) continue;
+          for (let i = 0; i < cell.length; i++) {
+            const q = cell[i];
+            if (!q || q === p) continue;
+            if (q === p.magPrev || q === p.magNext) continue;
+            // Keep strands stable: prefer reconnecting within the same hand-thread when available.
+            if (p.magHand && q.magHand && q.magHand !== p.magHand) continue;
+
+            const dx = q.pos.x - p.pos.x;
+            const dy = q.pos.y - p.pos.y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < 0.01 || d2 > healR2) continue;
+            const d = sqrt(d2) + 1e-6;
+            const dot = (dx / d) * tx + (dy / d) * ty;
+
+            if (dir > 0) {
+              if (dot < healDot) continue;
+              if (q.magPrev) continue; // avoid branching
+            } else {
+              if (dot > -healDot) continue;
+              if (q.magNext) continue; // avoid branching
+            }
+
+            const score = abs(dot) / d;
+            if (score > bestScore) {
+              bestScore = score;
+              best = q;
+            }
+          }
+        }
+      }
+      return best;
+    };
+
+    if (!p.magNext) {
+      const q = tryHeal(+1);
+      if (q) {
+        p.magNext = q;
+        q.magPrev = p;
+      }
+    }
+    if (!p.magPrev) {
+      const q = tryHeal(-1);
+      if (q) {
+        p.magPrev = q;
+        q.magNext = p;
+      }
+    }
+  }
+
+  let springForceX = 0;
+  let springForceY = 0;
+  let alignVelX = 0;
+  let alignVelY = 0;
+  let chainCount = 0;
+
+  // Apply spring force to chain neighbors (forward and backward) (longitudinal chaining).
+  if (p.magNext) {
+    const q = p.magNext;
+    const dx = q.pos.x - p.pos.x;
+    const dy = q.pos.y - p.pos.y;
+    const d = sqrt(dx * dx + dy * dy) + 1e-6;
+
+    // Spring force along the chain (prefers a rest length)
+    const delta = (d - restLength);
+    const f = constrain(delta * springStrength, -springMaxForce, springMaxForce);
+    springForceX += (dx / d) * f;
+    springForceY += (dy / d) * f;
+
+    // Collect velocity for alignment
+    alignVelX += q.vel.x;
+    alignVelY += q.vel.y;
+    chainCount++;
+  }
+
+  if (p.magPrev) {
+    const q = p.magPrev;
+    const dx = q.pos.x - p.pos.x;
+    const dy = q.pos.y - p.pos.y;
+    const d = sqrt(dx * dx + dy * dy) + 1e-6;
+
+    const delta = (d - restLength);
+    const f = constrain(delta * springStrength, -springMaxForce, springMaxForce);
+    springForceX += (dx / d) * f;
+    springForceY += (dy / d) * f;
+
+    // Collect velocity for alignment
+    alignVelX += q.vel.x;
+    alignVelY += q.vel.y;
+    chainCount++;
+  }
+
+  // Apply spring force
+  p.vel.x += springForceX;
+  p.vel.y += springForceY;
+
+  // Velocity alignment: align velocity with chain neighbors (continuity)
+  if (chainCount > 0) {
+    const avgVelX = alignVelX / chainCount;
+    const avgVelY = alignVelY / chainCount;
+    const alignX = (avgVelX - p.vel.x) * alignmentStrength;
+    const alignY = (avgVelY - p.vel.y) * alignmentStrength;
+    p.vel.x += alignX;
+    p.vel.y += alignY;
+  }
+
+  // Curvature control: high coherence tightens (less curvature); low coherence allows kinks/zigzags.
+  if (p.magPrev && p.magNext) {
+    const bendStrength = lerp(
+      (typeof magBehavior.bendStrengthLow === "number") ? magBehavior.bendStrengthLow : 0.01,
+      (typeof magBehavior.bendStrengthHigh === "number") ? magBehavior.bendStrengthHigh : 0.06,
+      coherence
+    );
+    const midX = (p.magPrev.pos.x + p.magNext.pos.x) * 0.5;
+    const midY = (p.magPrev.pos.y + p.magNext.pos.y) * 0.5;
+    p.vel.x += (midX - p.pos.x) * bendStrength;
+    p.vel.y += (midY - p.pos.y) * bendStrength;
+  }
+
+  // Directional noise along and perpendicular to tangent (controls jaggedness).
+  if (noiseAmp > 0.001) {
+    const t = millis() * 0.001;
+    const nx = p.pos.x * 0.005 + t * 0.1;
+    const ny = p.pos.y * 0.005 + t * 0.1;
+
+    // Noise along tangent (creates longitudinal disturbance)
+    const noiseLong = (noise(nx, ny, p.seed * 0.01) - 0.5) * 2.0;
+    const noiseLat = (noise(nx + 5.5, ny + 7.7, p.seed * 0.01 + 10) - 0.5) * 2.0;
+
+    const px = -ty; // perpendicular to tangent
+    const py = tx;
+    const longAmp = noiseAmp * lerp(0.45, 0.18, coherence);
+    const latAmp = noiseAmp * lerp(1.15, 0.10, coherence);
+
+    p.vel.x += (tx * noiseLong) * longAmp + (px * noiseLat) * latAmp;
+    p.vel.y += (ty * noiseLong) * longAmp + (py * noiseLat) * latAmp;
+  }
+
+  // Lateral separation from other magnetic particles (prevents blobbing).
+  // Separation is ANISOTROPIC: much stronger perpendicular to the local filament tangent.
+  const separationRadius = magBehavior.separationRadius || 45;
+  let sepX = 0;
+  let sepY = 0;
+  let sepCount = 0;
+  const sepMaxN = (typeof magBehavior.separationMaxNeighbors === "number") ? magBehavior.separationMaxNeighbors : 10;
+
+  const sepR2 = separationRadius * separationRadius;
+  if (magNeighborGrid) {
+    const cx = floor(p.pos.x / magNeighborCellSize);
+    const cy = floor(p.pos.y / magNeighborCellSize);
+    for (let oy = -1; oy <= 1; oy++) {
+      const cyo = (cy + oy) & 0xffff;
+      for (let ox = -1; ox <= 1; ox++) {
+        const key = (((cx + ox) & 0xffff) << 16) | cyo;
+        const cell = magNeighborGrid.get(key);
+        if (!cell) continue;
+        for (let i = 0; i < cell.length; i++) {
+          const q = cell[i];
+          if (!q || q === p) continue;
+          if (q === p.magNext || q === p.magPrev) continue;
+          const dx = p.pos.x - q.pos.x;
+          const dy = p.pos.y - q.pos.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > sepR2 || d2 < 0.01) continue;
+          const d = sqrt(d2) + 1e-6;
+          const w = (1.0 - d / separationRadius);
+          const para = dx * tx + dy * ty;
+          const perpX = dx - tx * para;
+          const perpY = dy - ty * para;
+          const pm = sqrt(perpX * perpX + perpY * perpY) + 1e-6;
+
+          // Mostly repel laterally (perpendicular), with a small tangential component when stacked
+          // along the filament (prevents coiling into blobs).
+          const tangWeightBase = lerp(0.22, 0.06, coherence);
+          const nearLine = constrain(1.0 - (pm / (separationRadius * 0.25)), 0, 1);
+          const tangWeight = tangWeightBase * (0.25 + 0.75 * nearLine);
+          const sgn = (para >= 0) ? 1 : -1;
+          sepX += (perpX / pm) * w + (tx * sgn) * w * tangWeight;
+          sepY += (perpY / pm) * w + (ty * sgn) * w * tangWeight;
+          sepCount++;
+          if (sepCount >= sepMaxN) break;
+        }
+        if (sepCount >= sepMaxN) break;
+      }
+      if (sepCount >= sepMaxN) break;
+    }
+  } else {
+    // Fallback: linear scan (bounded by sepMaxN).
+    for (let i = 0; i < particles.length; i++) {
+      const q = particles[i];
+      if (!q || q === p || q.kind !== "mag") continue;
+      if (q === p.magNext || q === p.magPrev) continue;
+      const dx = p.pos.x - q.pos.x;
+      const dy = p.pos.y - q.pos.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > sepR2 || d2 < 0.01) continue;
+      const d = sqrt(d2) + 1e-6;
+      const w = (1.0 - d / separationRadius);
+      const para = dx * tx + dy * ty;
+      const perpX = dx - tx * para;
+      const perpY = dy - ty * para;
+      const pm = sqrt(perpX * perpX + perpY * perpY) + 1e-6;
+
+      const tangWeightBase = lerp(0.22, 0.06, coherence);
+      const nearLine = constrain(1.0 - (pm / (separationRadius * 0.25)), 0, 1);
+      const tangWeight = tangWeightBase * (0.25 + 0.75 * nearLine);
+      const sgn = (para >= 0) ? 1 : -1;
+      sepX += (perpX / pm) * w + (tx * sgn) * w * tangWeight;
+      sepY += (perpY / pm) * w + (ty * sgn) * w * tangWeight;
+      sepCount++;
+      if (sepCount >= sepMaxN) break;
+    }
+  }
+
+  if (sepCount > 0) {
+    sepX = (sepX / sepCount) * lateralSeparation;
+    sepY = (sepY / sepCount) * lateralSeparation;
+    p.vel.x += sepX;
+    p.vel.y += sepY;
+  }
+
+  // High coherence: align velocity along filament tangent (reduce sideways drift).
+  const px = -ty, py = tx;
+  const vperp = p.vel.x * px + p.vel.y * py;
+  const perpDamp = lerp(0.08, 0.55, coherence);
+  p.vel.x -= px * vperp * perpDamp;
+  p.vel.y -= py * vperp * perpDamp;
+
+  // Additional tangent alignment: project velocity onto tangent (stronger when organized).
+  const vdot = p.vel.x * tx + p.vel.y * ty;
+  const tvx = tx * vdot;
+  const tvy = ty * vdot;
+  const tangentAlign = lerp(
+    (typeof magBehavior.tangentAlignLow === "number") ? magBehavior.tangentAlignLow : 0.02,
+    (typeof magBehavior.tangentAlignHigh === "number") ? magBehavior.tangentAlignHigh : 0.18,
+    coherence
+  );
+  p.vel.x += (tvx - p.vel.x) * tangentAlign;
+  p.vel.y += (tvy - p.vel.y) * tangentAlign;
+}
+
+function applyMagneticHistoryForce(p, T) {
+  if (!p || p.kind !== "mag" || !T) return;
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  const outerFrac = (typeof magBehavior.historyOuterFrac === "number") ? magBehavior.historyOuterFrac : 0.92;
+  const innerFrac = (typeof magBehavior.historyInnerFrac === "number") ? magBehavior.historyInnerFrac : 0.18;
+  const strength = (typeof magBehavior.historyStrength === "number") ? magBehavior.historyStrength : 0.007;
+
+  const age = (frameCount || 0) - (p.birthFrame || 0);
+  const age01 = constrain(age / max(1, AGE_WINDOW_FRAMES), 0, 1);
+  const targetR = lerp(T.radius * outerFrac, T.radius * innerFrac, age01);
+
+  const rx = p.pos.x - T.c.x;
+  const ry = p.pos.y - T.c.y;
+  const r = max(30, sqrt(rx * rx + ry * ry));
+  const inv = 1.0 / r;
+  const nx = rx * inv;
+  const ny = ry * inv;
+  const dr = constrain(targetR - r, -120, 120);
+  const coh = constrain((typeof p.magCohBirth === "number") ? p.magCohBirth : constrain(abs(mag), 0, 1), 0, 1);
+  const k = strength * (0.35 + 0.65 * coh);
+  p.vel.x += nx * dr * k;
+  p.vel.y += ny * dr * k;
+}
+
 function applyCalmOrbit(p, center, scale, pullScale) {
+  // X-ray particles in blobs should IGNORE global orbital forces to stay clumped
+  if (p.kind === "xray" && p.blobId) {
+    scale = 0.05; // reduce to 5% for blob particles
+  }
+  // Reduce orbital force for magnetic (filament behavior) and electrons (jittery individual motion)
+  if (p.kind === "mag") {
+    // Let clock-space forces curve the filament (avoid clumping at emission points).
+    scale = (scale || 1.0) * 0.75;
+  }
+  if (p.kind === "electrons") {
+    scale = (scale || 1.0) * 0.4; // 40% for electrons - let flutter dominate
+  }
   if (scale === undefined) scale = 1.0;
   const pull = (pullScale === undefined) ? 1.0 : pullScale;
   // tangential swirl around center (scalar math: avoids p5.Vector allocations)
@@ -3170,6 +3953,17 @@ function applyCalmOrbit(p, center, scale, pullScale) {
 }
 
 function applyAgeSpiral(p, T, ageRank01, scale, pullScale) {
+  // X-ray particles in blobs should IGNORE age spiral to stay clumped
+  if (p.kind === "xray" && p.blobId) {
+    scale = 0.03; // reduce to 3% for blob particles
+  }
+  // Reduce age spiral for magnetic and electrons to preserve their unique motion
+  if (p.kind === "mag") {
+    scale = 0; // mag uses its own 4-minute radial history axis (applyMagneticHistoryForce)
+  }
+  if (p.kind === "electrons") {
+    scale = (scale || 1.0) * 0.35; // 35% for electrons
+  }
   if (scale === undefined) scale = 1.0;
   const pullScaleUse = (pullScale === undefined) ? 1.0 : pullScale;
   if (DEBUG_DISABLE_AGE_SPIRAL) return;
@@ -3272,8 +4066,8 @@ function applyLayerBehavior(p, T) {
   }
 
   if (p.kind === "xray") {
-    // If this xray belongs to a rigid segment, keep it locked to the segment shape.
-    if (p.segId) applyXraySegmentConstraint(p);
+    // Blob particles should NOT receive kick forces - they need to stay clumped
+    if (p.blobId) return;
 
     const b = LAYER_BEHAVIOR.xray;
     // IMPORTANT: X-ray "peak memory" is encoded by particle age/order.
@@ -3291,6 +4085,9 @@ function applyLayerBehavior(p, T) {
 }
 
 function applyEddyField(p, T, pullScale) {
+  // X-ray particles in blobs should IGNORE eddy field to stay clumped
+  if (p.kind === "xray" && p.blobId) return; // completely skip for blob particles
+
   const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
   const s = prof.eddyMult * kindStrength(p.kind);
   if (s <= 0.0001) return;
@@ -3317,40 +4114,6 @@ function applyEddyField(p, T, pullScale) {
   const sw = (0.65 + 0.8 * mag) * (0.06 + 0.10 * s);
   p.vel.x += dx + (-dy) * sw;
   p.vel.y += dy + (dx) * sw;
-}
-
-function applyMagRings(p, T) {
-  if (p.kind !== "mag") return;
-  const prof = PARTICLE_PROFILE.mag;
-  const s = constrain(mag, 0, 1);
-  const strength = (prof.ringStrength || 0) * s;
-  if (strength <= 0.000001) return;
-
-  const rel = p5.Vector.sub(p.pos, T.c);
-  const r = rel.mag();
-  // Fewer rings so it doesn't dominate all layers visually.
-  const rings = [0.40, 0.62, 0.80];
-  let targetR = rings[0] * T.radius;
-  let best = abs(r - targetR);
-  for (let i = 1; i < rings.length; i++) {
-    const rr = rings[i] * T.radius;
-    const d = abs(r - rr);
-    if (d < best) { best = d; targetR = rr; }
-  }
-
-  // Radial correction toward ring + tangential coherence.
-  const n = rel.copy().normalize();
-  const dr = (targetR - r);
-  p.vel.add(n.mult(dr * strength));
-
-  // Make arcs (not full circles) by gating with low-frequency noise.
-  const theta = atan2(rel.y, rel.x);
-  const t = millis() * 0.001;
-  const gate = noise(cos(theta) * 0.9 + 10.0, sin(theta) * 0.9 + 20.0, t * 0.15 + 3.0);
-  if (gate > 0.45) {
-    const tang = createVector(-rel.y, rel.x).mult(1.0 / max(40, r));
-    p.vel.add(tang.mult((0.30 + 0.55 * s) * (gate - 0.45)));
-  }
 }
 
 function applyHIonStreams(p, T) {
@@ -3401,33 +4164,9 @@ function updateHandDeltas(T) {
   prevHandAngles.secA = T.secA;
 }
 
-function rotateInHand(p, T) {
-  let da = 0;
-  if (p.hand === "hour") da = T.dHour;
-  else if (p.hand === "minute") da = T.dMin;
-  else da = T.dSec;
-  if (!da) return;
-  const rel = p5.Vector.sub(p.pos, T.c);
-  rel.rotate(da);
-  p.pos = p5.Vector.add(T.c, rel);
-  p.vel.rotate(da);
-}
-
 function handWidthAt(t, len, headR) {
   const u = constrain(t / max(1, len), 0, 1);
   return lerp(HAND_TUBE_MIN, headR, pow(u, HAND_TUBE_EXP));
-}
-
-function depositHandEnergy(which, amount) {
-  const cap = HAND_CAP[which];
-  const next = handFill[which] + amount;
-  if (next <= cap) {
-    handFill[which] = next;
-    return 0;
-  }
-  const overflow = next - cap;
-  handFill[which] = cap;
-  return overflow;
 }
 
 function handFillRatio(which) {
@@ -3447,412 +4186,10 @@ function computeHandBasis(T, which) {
   return { head, dir, nrm, len, headR, forwardLen, backLen, sideLen };
 }
 
-function buildHandSlotsFor(which, T) {
-  const b = computeHandBasis(T, which);
-  const cap = HAND_CAP[which];
-
-  // Approximate areas to distribute slots so the container fills evenly.
-  let tubeArea = 0;
-  const steps = 48;
-  for (let i = 0; i < steps; i++) {
-    const t0 = (i / steps) * b.len;
-    const t1 = ((i + 1) / steps) * b.len;
-    const w0 = handWidthAt(t0, b.len, b.headR);
-    const w1 = handWidthAt(t1, b.len, b.headR);
-    const w = (w0 + w1) * 0.5;
-    tubeArea += (t1 - t0) * (2 * w);
-  }
-  const forwardArea = b.headR * b.forwardLen;
-  const backArea = b.headR * b.backLen;
-  const sideArea = b.headR * b.sideLen;
-  const total = tubeArea + forwardArea + backArea + 2 * sideArea + 1e-6;
-
-  const tubeN = floor(cap * (tubeArea / total));
-  const forwardN = floor(cap * (forwardArea / total));
-  const backN = floor(cap * (backArea / total));
-  const sideEachN = floor(cap * (sideArea / total));
-
-  let remaining = cap - (tubeN + forwardN + backN + 2 * sideEachN);
-  let tubeNN = tubeN;
-  let forwardNN = forwardN;
-  let backNN = backN;
-  let leftNN = sideEachN;
-  let rightNN = sideEachN;
-  while (remaining-- > 0) {
-    // Bias extra slots toward tube + forward (most visible).
-    const r = random();
-    if (r < 0.45) tubeNN++;
-    else if (r < 0.70) forwardNN++;
-    else if (r < 0.85) backNN++;
-    else if (r < 0.925) leftNN++;
-    else rightNN++;
-  }
-
-  const slots = [];
-  const meta = { releaseOrder: [] };
-
-  const addSlot = (kind, u, v, score) => {
-    const idx = slots.length;
-    slots.push({ kind, u, v, score });
-    meta.releaseOrder.push(idx);
-  };
-
-  // Tube (center space): v in [0,len], u in [-w,w]
-  for (let i = 0; i < tubeNN; i++) {
-    const v = random() * b.len;
-    const w = handWidthAt(v, b.len, b.headR);
-    const u = (random() - 0.5) * 2 * w;
-    const score = 0.6 + 0.8 * (v / max(1, b.len));
-    addSlot("tube", u, v, score);
-  }
-
-  // Forward spike (head space): v in [0,forwardLen], width tapers to 0 at tip
-  for (let i = 0; i < forwardNN; i++) {
-    const v = random() * b.forwardLen;
-    const w = b.headR * (1.0 - v / b.forwardLen);
-    const u = (random() - 0.5) * 2 * w;
-    const score = 3.0 + (v / max(1, b.forwardLen));
-    addSlot("forward", u, v, score);
-  }
-
-  // Back spike (head space): v in [-backLen,0]
-  for (let i = 0; i < backNN; i++) {
-    const vAbs = random() * b.backLen;
-    const v = -vAbs;
-    const w = b.headR * (1.0 - vAbs / b.backLen);
-    const u = (random() - 0.5) * 2 * w;
-    const score = 1.4 + 0.3 * (vAbs / max(1, b.backLen));
-    addSlot("back", u, v, score);
-  }
-
-  // Left/Right spikes (head space): u in [-sideLen,0] / [0,sideLen], v in [-w,w]
-  for (let i = 0; i < leftNN; i++) {
-    const uAbs = random() * b.sideLen;
-    const u = -uAbs;
-    const w = b.headR * (1.0 - uAbs / b.sideLen);
-    const v = (random() - 0.5) * 2 * w;
-    const score = 2.2 + 0.5 * (uAbs / max(1, b.sideLen));
-    addSlot("left", u, v, score);
-  }
-  for (let i = 0; i < rightNN; i++) {
-    const uAbs = random() * b.sideLen;
-    const u = uAbs;
-    const w = b.headR * (1.0 - uAbs / b.sideLen);
-    const v = (random() - 0.5) * 2 * w;
-    const score = 2.2 + 0.5 * (uAbs / max(1, b.sideLen));
-    addSlot("right", u, v, score);
-  }
-
-  // Sort release order so "pressure escape" happens near the anchor circle (the head),
-  // never near the center: head-region slots first (closest to head), then tube slots
-  // closest to the head (largest v).
-  meta.releaseOrder.sort((ia, ib) => {
-    const a = slots[ia];
-    const b = slots[ib];
-    const aTube = a.kind === "tube";
-    const bTube = b.kind === "tube";
-    if (aTube !== bTube) return aTube ? 1 : -1;
-    if (!aTube) {
-      const da = Math.hypot(a.u, a.v);
-      const db = Math.hypot(b.u, b.v);
-      return da - db;
-    }
-    return b.v - a.v;
-  });
-  meta.occupancy = new Array(slots.length);
-  meta.free = [];
-  for (let i = slots.length - 1; i >= 0; i--) meta.free.push(i);
-
-  // Leak should happen across many points near the anchor circle (head).
-  // Build a "leak zone" as an annulus around the head disk, including:
-  // - head-space slots (forward/back/left/right) close to the disk
-  // - tube slots only very near the head (not near center)
-  const leakMin = b.headR * 0.70;
-  const leakMax = b.headR * 1.25;
-  meta.leakOrder = meta.releaseOrder.filter((idx) => {
-    const s = slots[idx];
-    let uH = s.u;
-    let vH = s.v;
-    if (s.kind === "tube") vH = s.v - b.len; // convert tube slot to head-local
-    const r = Math.hypot(uH, vH);
-    if (r < leakMin || r > leakMax) return false;
-    // Exclude deep back/tube regions even if numerically close due to rounding.
-    if (s.kind === "tube" && s.v < b.len - b.headR * 1.2) return false;
-    if (s.kind === "back" && s.v < -b.headR * 1.1) return false;
-    if (s.kind === "forward" && s.v > b.headR * 1.1) return false;
-    if ((s.kind === "left" || s.kind === "right") && Math.abs(s.u) > b.headR * 1.1) return false;
-    return true;
-  });
-
-  return { slots, meta };
-}
-
-function ensureHandSlots(T) {
-  for (const which of ["hour", "minute", "second"]) {
-    const cap = HAND_CAP[which];
-    const key = `${cap}|${T.radius}`;
-    if (!handSlotMeta[which] || handSlotMeta[which].key !== key) {
-      const built = buildHandSlotsFor(which, T);
-      handSlots[which] = built.slots;
-      handSlotMeta[which] = Object.assign({}, built.meta, { key });
-      handParticles[which] = [];
-    }
-  }
-}
-
-function slotWorldPos(T, which, slot) {
-  const b = computeHandBasis(T, which);
-  if (slot.kind === "tube") {
-    return p5.Vector.add(T.c, b.dir.copy().mult(slot.v)).add(b.nrm.copy().mult(slot.u));
-  }
-  // head-space kinds
-  if (slot.kind === "left" || slot.kind === "right") {
-    return p5.Vector.add(b.head, b.nrm.copy().mult(slot.u)).add(b.dir.copy().mult(slot.v));
-  }
-  return p5.Vector.add(b.head, b.dir.copy().mult(slot.v)).add(b.nrm.copy().mult(slot.u));
-}
-
-function addToHandReservoir(T, which, p) {
-  const slots = handSlots[which];
-  const meta = handSlotMeta[which];
-  if (!slots || !meta) return false;
-
-  // Allocate a free slot; if none, release one (pressure escape) and reuse its slot.
-  let slotIndex = meta.free.pop();
-  if (slotIndex === undefined) {
-    // Release only from the anchor region.
-    const order = (meta.leakOrder && meta.leakOrder.length) ? meta.leakOrder : meta.releaseOrder;
-
-    // Pick a random occupied slot from the leak zone so leaks appear from many points.
-    const occupied = [];
-    for (let i = 0; i < order.length; i++) {
-      const idx = order[i];
-      if (meta.occupancy[idx]) occupied.push(idx);
-    }
-    const fallbackOccupied = [];
-    if (!occupied.length) {
-      for (let i = 0; i < meta.releaseOrder.length; i++) {
-        const idx = meta.releaseOrder[i];
-        if (meta.occupancy[idx]) fallbackOccupied.push(idx);
-      }
-    }
-    const pickFrom = occupied.length ? occupied : fallbackOccupied;
-    const idx = pickFrom.length ? pickFrom[floor(random(pickFrom.length))] : undefined;
-    if (idx !== undefined) {
-      const occ = meta.occupancy[idx];
-      // Remove from reservoir list
-      const list = handParticles[which];
-      const pos = list.indexOf(occ);
-      if (pos !== -1) list.splice(pos, 1);
-      meta.occupancy[idx] = null;
-
-      // Convert to free-space particle (escape) from the anchor region (slot position),
-      // so leaks never appear near the center due to stale particle positions.
-      occ.inHand = false;
-      occ.hand = null;
-      const b = computeHandBasis(T, which);
-      occ.pos = slotWorldPos(T, which, slots[idx]);
-      // PERF: avoid per-frame vector allocations (no copy(), no random2D()).
-      {
-        const kick = 1.5 + random(2.0);
-        occ.vel.x += b.dir.x * kick;
-        occ.vel.y += b.dir.y * kick;
-        const j = (occ.dirIdx + (frameCount & DIR_MASK)) & DIR_MASK;
-        occ.vel.x += DIR_X[j] * 0.6;
-        occ.vel.y += DIR_Y[j] * 0.6;
-      }
-      particles.push(occ);
-
-      // Reuse the freed slot immediately (pressure replacement at the leak site).
-      slotIndex = idx;
-    }
-  }
-  if (slotIndex === undefined) return false;
-
-  p.inHand = true;
-  p.hand = which;
-  p.slotIndex = slotIndex;
-  // Snap new particles into their allocated slot immediately so the reservoir fills
-  // the intended shape and overflow leaks can't originate from spawn-at-center.
-  p.pos = slotWorldPos(T, which, slots[slotIndex]);
-  p.vel.mult(0.0);
-  meta.occupancy[slotIndex] = p;
-  handParticles[which].push(p);
-  return true;
-}
-
-function updateHandReservoir(T) {
-  for (const which of ["hour", "minute", "second"]) {
-    const slots = handSlots[which];
-    const meta = handSlotMeta[which];
-    if (!slots || !meta) continue;
-
-    for (let i = 0; i < handParticles[which].length; i++) {
-      const p = handParticles[which][i];
-      const slot = slots[p.slotIndex];
-      if (!slot) continue;
-      const target = slotWorldPos(T, which, slot);
-      // Higher follow for faster hands so the particle-hand doesn't lag behind the anchor circle.
-      const followBase = 0.16 + protons * 0.18;
-      let follow = followBase;
-      if (which === "second") follow = min(0.65, followBase + 0.30);
-      else if (which === "minute") follow = min(0.55, followBase + 0.18);
-      else follow = min(0.48, followBase + 0.10);
-      p.pos.lerp(target, follow);
-      const prof = PARTICLE_PROFILE[p.kind] || PARTICLE_PROFILE.protons;
-      const jitter = (0.05 + electrons * 0.20) * (0.6 + overallAmp) * prof.reservoirJitterMult;
-      // PERF: avoid p5.Vector.random2D() allocation.
-      {
-        const j = (p.dirIdx + ((frameCount * 3) & DIR_MASK)) & DIR_MASK;
-        p.pos.x += DIR_X[j] * jitter;
-        p.pos.y += DIR_Y[j] * jitter;
-      }
-      // Safety clamp to clock
-      const toP = p5.Vector.sub(p.pos, T.c);
-      const d = toP.mag();
-      if (d > T.radius - 1) p.pos = p5.Vector.add(T.c, toP.mult((T.radius - 1) / d));
-    }
-  }
-}
-
-function guideInHand(p, T) {
-  const which = p.hand;
-  const head = (which === "hour") ? T.hourP : (which === "minute") ? T.minP : T.secP;
-  const dir = p5.Vector.sub(head, T.c).normalize();
-  const nrm = createVector(-dir.y, dir.x);
-  const len = p5.Vector.dist(T.c, head);
-  const headR = HAND_HEAD_R[which];
-
-  // Desired shape (filled, not just outline):
-  // 1) Tube/cone from center -> anchor circle: starts very thin at center and grows to radius=headR at anchor.
-  // 2) From the anchor: 4 tapered spikes (back to center, forward to rim, left/right sideways).
-  //
-  // We only clamp when outside; if a particle is already inside the union, we leave it in place.
-  const relC = p5.Vector.sub(p.pos, T.c);
-  const vC = relC.dot(dir);
-  const uC = relC.dot(nrm);
-
-  const localH = p5.Vector.sub(p.pos, head);
-  const vH = localH.dot(dir);
-  const uH = localH.dot(nrm);
-
-  const forwardLen = max(1, (T.radius - 1) - len);
-  const backLen = max(1, len);
-  const maxSideByCircle = sqrt(max(0, sq(T.radius - 1) - sq(len)));
-  const sideLen = max(1, min(headR * HAND_SIDE_SPIKE_MULT, maxSideByCircle));
-
-  const tubeW = handWidthAt(constrain(vC, 0, len), len, headR);
-  const inTube = (vC >= 0 && vC <= len && abs(uC) <= tubeW);
-
-  const inForward = (vH >= 0 && vH <= forwardLen && abs(uH) <= headR * (1.0 - vH / forwardLen));
-  const inBack = (vH <= 0 && vH >= -backLen && abs(uH) <= headR * (1.0 - (-vH) / backLen));
-  const inRight = (uH >= 0 && uH <= sideLen && abs(vH) <= headR * (1.0 - uH / sideLen));
-  const inLeft = (uH <= 0 && uH >= -sideLen && abs(vH) <= headR * (1.0 - (-uH) / sideLen));
-
-  if (!inTube && !inForward && !inBack && !inRight && !inLeft) {
-    // Project onto the nearest region in the union.
-    const candidates = [];
-
-    // Tube candidate (center space)
-    {
-      const v = constrain(vC, 0, len);
-      const w = handWidthAt(v, len, headR);
-      const u = constrain(uC, -w, w);
-      const pos = p5.Vector.add(T.c, dir.copy().mult(v)).add(nrm.copy().mult(u));
-      candidates.push(pos);
-    }
-
-    // Forward spike candidate (head space)
-    {
-      const v = constrain(vH, 0, forwardLen);
-      const w = headR * (1.0 - v / forwardLen);
-      const u = constrain(uH, -w, w);
-      const pos = p5.Vector.add(head, dir.copy().mult(v)).add(nrm.copy().mult(u));
-      candidates.push(pos);
-    }
-
-    // Back spike candidate (head space)
-    {
-      const v = constrain(vH, -backLen, 0);
-      const w = headR * (1.0 - (-v) / backLen);
-      const u = constrain(uH, -w, w);
-      const pos = p5.Vector.add(head, dir.copy().mult(v)).add(nrm.copy().mult(u));
-      candidates.push(pos);
-    }
-
-    // Right spike candidate
-    {
-      const u = constrain(uH, 0, sideLen);
-      const w = headR * (1.0 - u / sideLen);
-      const v = constrain(vH, -w, w);
-      const pos = p5.Vector.add(head, nrm.copy().mult(u)).add(dir.copy().mult(v));
-      candidates.push(pos);
-    }
-
-    // Left spike candidate
-    {
-      const u = constrain(uH, -sideLen, 0);
-      const w = headR * (1.0 - (-u) / sideLen);
-      const v = constrain(vH, -w, w);
-      const pos = p5.Vector.add(head, nrm.copy().mult(u)).add(dir.copy().mult(v));
-      candidates.push(pos);
-    }
-
-    let best = candidates[0];
-    let bestD2 = Infinity;
-    for (const c of candidates) {
-      const d2 = p5.Vector.sub(p.pos, c).magSq();
-      if (d2 < bestD2) {
-        bestD2 = d2;
-        best = c;
-      }
-    }
-    p.pos.set(best);
-    p.vel.mult(0.7);
-  }
-
-  // Absolute safety: never let in-hand particles appear outside the clock circle.
-  const toP = p5.Vector.sub(p.pos, T.c);
-  const d = toP.mag();
-  if (d > T.radius - 1) {
-    p.pos = p5.Vector.add(T.c, toP.mult((T.radius - 1) / d));
-  }
-
-  // Encourage filling: forward drift + sideways diffusion (strongest near the anchor/head).
-  const headBoost = exp(-abs(vH) / max(1, headR * 0.9));
-  const lateral = (random() - 0.5) * (0.55 + electrons * 0.45) * headBoost;
-
-  // Keep motion "container-like", but allow forward progress so the whole hand fills.
-  let vAlong = p.vel.dot(dir);
-  let vSide = p.vel.dot(nrm);
-
-  // Persistent drift forward (stronger when we're far from the anchor).
-  const farFromHead = constrain(1.0 - (vC / max(1, len)), 0, 1);
-  vAlong += (0.20 + overallAmp * 0.22) * (0.55 + 0.75 * farFromHead);
-
-  // Mix sideways to populate the full cross-section.
-  vSide = vSide * 0.85 + lateral;
-
-  // Clamp, but don't choke it.
-  vAlong = constrain(vAlong, -0.4, 2.4);
-  vSide = constrain(vSide, -3.0, 3.0);
-  p.vel = dir.copy().mult(vAlong).add(nrm.copy().mult(vSide));
-
-  // Repel only very near tips (so we don't get "stuck" early).
-  const tipF = constrain((vH - forwardLen * 0.88) / max(1, forwardLen * 0.12), 0, 1);
-  const tipB = constrain(((-vH) - backLen * 0.88) / max(1, backLen * 0.12), 0, 1);
-  const tipR = constrain((uH - sideLen * 0.88) / max(1, sideLen * 0.12), 0, 1);
-  const tipL = constrain(((-uH) - sideLen * 0.88) / max(1, sideLen * 0.12), 0, 1);
-  p.vel.add(dir.copy().mult((-0.22 * tipF) + (0.12 * tipB)));
-  p.vel.add(nrm.copy().mult((-0.18 * tipR) + (0.18 * tipL)));
-
-  p.vel.mult(0.94);
-}
-
-
 
 function draw() {
   profFrameStart();
+  const usePixiNow = USE_PIXI_RENDERER && !!pixi;
   // Worker init is deferred until particles exist (handles N==0 at startup).
   if (USE_WORKER) tryInitWorkerIfReady();
   frameStartTime = profLiteNow();
@@ -3861,6 +4198,7 @@ function draw() {
   collisionsRanSinceLastDraw = false;
   if (PROF_LITE) profLite.lastFrameStart = frameStartTime;
   renderStamp = (renderStamp + 1) >>> 0;
+  if (usePixiNow) clear(); // keep p5 canvas transparent as a HUD overlay
   if (USE_WORKER && simRenderNextX && simRenderNextY && simRefs.length) {
     const now = profLiteNow();
     const tPrev = simRenderPrevT || simRenderNextT;
@@ -3931,11 +4269,16 @@ function draw() {
     }
   }
 
-  profStart("background");
-  const tBg0 = PROF_LITE ? profLiteNow() : 0;
-  background(...COL.bg);
-  if (PROF_LITE) profLite.backgroundMs = profLiteEma(profLite.backgroundMs, profLiteNow() - tBg0);
-  profEnd("background");
+	  profStart("background");
+	  const tBg0 = PROF_LITE ? profLiteNow() : 0;
+	  if (usePixiNow) {
+	    // p5 canvas is a HUD overlay above Pixi; keep it transparent.
+	    clear();
+	  } else {
+	    background(...COL.bg);
+	  }
+	  if (PROF_LITE) profLite.backgroundMs = profLiteEma(profLite.backgroundMs, profLiteNow() - tBg0);
+	  profEnd("background");
 
   // Always compute correct time (hands should never “stop rotating”)
   profStart("time");
@@ -4147,6 +4490,8 @@ function draw() {
       const y0 = faceRowCursor;
       const y1 = min(field.height - 1, y0 + faceChunkRows);
       updateFaceFieldChunk(y0, y1);
+      faceUpdateY0 = y0;
+      faceUpdateY1 = y1;
       faceRowCursor = (y1 >= field.height - 1) ? 1 : y1;
       faceUpdatedThisFrame = true;
       if (PROF_LITE) profLite.faceMs = profLiteEma(profLite.faceMs, profLiteNow() - t0);
@@ -4166,10 +4511,12 @@ function draw() {
   if (PROF_LITE) profLite.houseCapMs = profLiteEma(profLite.houseCapMs, profLiteNow() - tCap0);
   profEnd("capacity");
 
+  // Magnetic guide paths are disabled for MAG behavior: the clock space forces shape curvature.
+
   profStart("update.particles");
   if (USE_WORKER) {
     // Critical ordering: only run the per-particle force stage when the worker advanced the sim.
-    // This prevents “force accumulation without motion” when the worker lags.
+    // This prevents "force accumulation without motion" when the worker lags.
     // Physics step runs in the worker onmessage pump; draw() only renders.
   } else {
     updateParticles(T);
@@ -4178,18 +4525,22 @@ function draw() {
 
   profStart("draw.face");
   const tClockOther0 = PROF_LITE ? profLiteNow() : 0;
-  drawFace(T);
+  if (!usePixiNow) drawFace(T);
   if (PROF_LITE) profLite.clockOtherMs = profLiteEma(profLite.clockOtherMs, profLiteNow() - tClockOther0);
   profEnd("draw.face");
 
   profStart("draw.hands");
   const tClockStatic0 = PROF_LITE ? profLiteNow() : 0;
-  if (clockStatic) image(clockStatic, 0, 0);
+  if (!usePixiNow) {
+    if (clockStatic) image(clockStatic, 0, 0);
+  }
   if (PROF_LITE) profLite.clockStaticMs = profLiteEma(profLite.clockStaticMs, profLiteNow() - tClockStatic0);
 
   const tClockDyn0 = PROF_LITE ? profLiteNow() : 0;
-  drawHandShapes(T);
-  drawClockHands(T);
+  if (!usePixiNow) {
+    drawHandShapes(T);
+    drawClockHands(T);
+  }
   if (PROF_LITE) profLite.clockDynamicMs = profLiteEma(profLite.clockDynamicMs, profLiteNow() - tClockDyn0);
 
   if (PROF_LITE) {
@@ -4200,7 +4551,59 @@ function draw() {
 
   profStart("draw.particles");
   const tDraw0 = PROF_LITE ? profLiteNow() : 0;
-  drawParticles();
+  if (usePixiNow) {
+    try {
+      renderPixiFrame(pixi, {
+        fieldGraphics: field,
+        clockStaticGraphics: clockStatic,
+        faceFieldBuf: fieldBuf,
+        faceFieldW: fieldW,
+        faceFieldH: fieldH,
+        faceUpdatedThisFrame,
+        faceUpdateY0,
+        faceUpdateY1,
+        canvasW: width,
+        canvasH: height,
+        T,
+        COL,
+        h_ions,
+        xray,
+        HAND_HEAD_R,
+        HAND_W,
+        HAND_SIDE_SPIKE_MULT,
+        computeHandBasis,
+        handWidthAt,
+	        handFillRatio,
+	        mixEnergyColor,
+	        particles,
+	        SOLO_KIND: VIEW_SOLO_KIND,
+	        PARTICLE_PROFILE,
+	        kindStrength,
+	        ALPHA_STRENGTH_MIX,
+	        ALPHA_SCALE,
+        PARTICLE_SIZE_SCALE,
+        renderStamp,
+        millisFn: millis,
+        sinFn: sin,
+        PI,
+      });
+    } catch (e) {
+      console.error("[pixi] render failed, falling back to p5 renderer", e);
+      pixi = null;
+      drawFace(T);
+      if (clockStatic) image(clockStatic, 0, 0);
+      drawHandShapes(T);
+      drawClockHands(T);
+      drawParticles();
+    }
+  } else {
+    drawParticles();
+  }
+
+  // DEBUG: Draw magnetic guide paths
+  debugDrawMagneticPaths();
+  drawXrayGridEnvironmentOverlay();
+
   if (debugClumpDiag) {
     updateClumpDiagnostics();
     drawClumpDiagnosticsMarker();
@@ -4419,17 +4822,18 @@ function resetVisualSystems() {
   }
   particles.length = 0;
   particlesActive = 0;
-  handParticles = { hour: [], minute: [], second: [] };
-  handSlots = { hour: null, minute: null, second: null };
-  handSlotMeta = { hour: null, minute: null, second: null };
-  handFill = { hour: 0, minute: 0, second: 0 };
-  xrayBlobs = [];
+	  handFill = { hour: 0, minute: 0, second: 0 };
+	  emitCarry = { hour: 0, minute: 0, second: 0 };
+	  emitKindCarry = {
+	    hour:   { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	    minute: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	    second: { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 },
+	  };
+	  VIEW_SOLO_KIND = null;
+	  xrayBlobs = [];
   xrayBlobIndex = new Map();
-  xraySegments = [];
-  xraySegIndex = new Map();
-  xraySegmentIdCounter = 1;
-  lastXraySegIdByHand = { hour: 0, minute: 0, second: 0 };
   lastHIonByHand = { hour: null, minute: null, second: null };
+  lastMagByHand = { hour: null, minute: null, second: null };
 
   if (START_CHAMBER_FULL) {
     seedChamberParticles(computeHandData(new Date()), floor(min(CAPACITY, START_CHAMBER_FILL_COUNT) * PARTICLE_SCALE));
@@ -4458,9 +4862,8 @@ function updateAudioFeatures() {
   const aE = constrain(level * 4.0, 0, 1);
 
   // shape
-  // PERF/VIS: boost low x-ray values so typical tracks still produce visible X-ray activity.
-  // (Same band mapping; just a gentler curve than pow(...,1.15) which suppresses lows.)
-  const xRaw = constrain(pow(xE, 0.72) * 1.25, 0, 1);
+  // Keep x-ray band "honest" to the sound (no low-end boost); x-ray visuals come mainly from spikes.
+  const xRaw = constrain(pow(xE, 1.15), 0, 1);
   const mRaw = pow(mE, 1.0);
   const hRaw = pow(hE, 1.05);
   const eRaw = pow(eE, 1.05);
@@ -4474,8 +4877,9 @@ function updateAudioFeatures() {
   protons   = lerp(protons,   pRaw, SMOOTH_SLOW);
   h_ions    = lerp(h_ions,    hRaw, SMOOTH_SLOW);
   overallAmp= lerp(overallAmp, aE,  SMOOTH_FAST);
-  // Raw spike measure (before global compression) to drive bursts even when baseline xray is low.
-  const xSpikeRaw = max(0, xRaw - prevX);
+  // Honest spike measure from the raw band (before smoothing/compression).
+  const xSpikeRaw = max(0, xE - xBandPrev);
+  xBandPrev = xE;
 
   // Global reactivity boost with soft-knee to avoid saturating at 1.0.
   const react = (v) => {
@@ -4507,9 +4911,9 @@ function updateAudioFeatures() {
   }
 
   if (!xrayBurst && nowF >= xrayBurstCooldownUntil && CURRENT_T && CURRENT_T.secP) {
-    const spike01 = constrain(xSpikeRaw * 6.0, 0, 1);
+    const spike01 = constrain(xSpikeRaw * 9.0, 0, 1);
     if (spike01 >= XRAY_BURST_SPIKE_MIN) {
-      const s = constrain(max(spike01, changeEmph.xray * 0.65), 0, 1);
+      const s = spike01;
       const dur = floor(lerp(XRAY_BURST_FRAMES_BASE, XRAY_BURST_FRAMES_MAX, pow(s, 0.85)));
       const rawCount = constrain(floor(XRAY_PULSE_BASE + s * 520 + xray * 220), XRAY_PULSE_BASE, XRAY_PULSE_MAX);
       const startCount = max(XRAY_EVENT_MIN_COUNT, floor(rawCount * PARTICLE_SCALE * XRAY_EVENT_COUNT_SCALE));
@@ -4543,7 +4947,7 @@ function fallbackFeatures() {
 
 // ---------- Face field ----------
 function updateFaceFieldChunk(yStart, yEnd) {
-  updateFaceFieldChunkCore({ field, fieldW, fieldH, fieldBuf, fieldBuf2 }, yStart, yEnd, {
+  updateFaceFieldChunkCore({ field, fieldW, fieldH, fieldBuf, fieldBuf2, fieldImgData, disableGraphics: (USE_PIXI_RENDERER && !!pixi) }, yStart, yEnd, {
     h_ions,
     protons,
     COL,
@@ -4563,7 +4967,7 @@ function injectFieldAtScreenPos(x, y, rgb, strength) {
 }
 
 // ---------- Emission ----------
-function emitEnergy(T) {
+	function emitEnergy(T) {
   // Make it feel “full”. Lower base to reduce overall particle count (bigger particles)
   const base = 4;
   let rate = base + overallAmp * 40 + electrons * 30 + h_ions * 18;
@@ -4579,20 +4983,39 @@ function emitEnergy(T) {
     const throttle = (fps < 30) ? 0.4 : (fps < 45 ? 0.7 : 1.0);
     rate *= throttle;
   }
-  // Apply global particle count scale (reduce emission by scale)
-  rate *= PARTICLE_SCALE;
-  // Temporary emission throttle under sustained frame budget pressure.
-  rate *= spawnThrottleScale;
+	  // Apply global particle count scale (reduce emission by scale)
+	  rate *= PARTICLE_SCALE;
+	  // Temporary emission throttle under sustained frame budget pressure.
+	  rate *= spawnThrottleScale;
 
-  emitFromHand(T, "hour",   rate * 0.75);
-  emitFromHand(T, "minute", rate * 0.95);
-  emitFromHand(T, "second", rate * 1.20);
-  // Do not hard-cap here; capacity control is handled in enforceCapacity().
-}
+	  // Target average lifetime at ~100% fill by scaling total emission.
+	  // In this sketch, particles mostly die only when overflow is pruned, so steady-state
+	  // average lifetime ~= CAPACITY / spawnsPerSecond.
+	  if (TIME_TUNING && TIME_TUNING.lifetimeControlEnabled) {
+	    const lifeSec = +TIME_TUNING.particleLifetimeSec || 0;
+	    if (lifeSec > 1) {
+	      const fpsEff = (typeof fps10 === "number" && isFinite(fps10) && fps10 > 0) ? fps10 : frameRate();
+	      const fpsUse = max(1, fpsEff || 60);
+	      const desiredPerFrame = (CAPACITY / lifeSec) / fpsUse;
+	      // `rate` is the per-hand base; total is roughly (0.75+0.95+1.20)=2.90x.
+	      const currentPerFrame = max(1e-6, rate * 2.90);
+	      let s = desiredPerFrame / currentPerFrame;
+	      const sMin = (typeof TIME_TUNING.lifetimeScaleMin === "number") ? TIME_TUNING.lifetimeScaleMin : 0.05;
+	      const sMax = (typeof TIME_TUNING.lifetimeScaleMax === "number") ? TIME_TUNING.lifetimeScaleMax : 2.0;
+	      s = constrain(s, sMin, sMax);
+	      rate *= s;
+	    }
+	  }
 
-function allocateCounts(total, weightsByKind) {
-  const n = max(0, floor(total));
-  if (n <= 0) return { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
+	  emitFromHand(T, "hour",   rate * 0.75);
+	  emitFromHand(T, "minute", rate * 0.95);
+	  emitFromHand(T, "second", rate * 1.20);
+	  // Do not hard-cap here; capacity control is handled in enforceCapacity().
+	}
+
+	function allocateCounts(total, weightsByKind) {
+	  const n = max(0, floor(total));
+	  if (n <= 0) return { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
 
   let sum = 0;
   // PERF: fixed order, no arrays/sorts per frame.
@@ -4614,10 +5037,10 @@ function allocateCounts(total, weightsByKind) {
   let fP = rP - bP,  fH = rH - bH,  fM = rM - bM,  fE = rE - bE,  fX = rX - bX;
   let baseSum = bP + bH + bM + bE + bX;
 
-  let rem = n - baseSum;
-  if (rem > 0) {
-    // Distribute remainder to the highest fractional parts (only 5 kinds => cheap linear scans).
-    for (let k = 0; k < 5 && rem > 0; k++) {
+	  let rem = n - baseSum;
+	  if (rem > 0) {
+	    // Distribute remainder to the highest fractional parts (only 5 kinds => cheap linear scans).
+	    for (let k = 0; k < 5 && rem > 0; k++) {
       let best = fP, which = 0;
       if (fH > best) { best = fH; which = 1; }
       if (fM > best) { best = fM; which = 2; }
@@ -4629,22 +5052,63 @@ function allocateCounts(total, weightsByKind) {
       else if (which === 2) { bM++; fM = -1; }
       else if (which === 3) { bE++; fE = -1; }
       else { bX++; fX = -1; }
-      rem--;
-    }
-  }
+	      rem--;
+	    }
+	  }
 
-  return {
-    protons: bP,
-    h_ions: bH,
-    mag: bM,
+	  // Ensure low-weight kinds still appear when we're emitting enough particles overall.
+	  // This avoids "never see mag/h_ions" when `n` is small and rounding favors dominant kinds.
+	  if (n >= 3) {
+	    const wantProton = (weightsByKind.protons || 0) > 1e-6;
+	    const wantHIon = (weightsByKind.h_ions || 0) > 1e-6;
+	    const wantMag = (weightsByKind.mag || 0) > 1e-6;
+
+	    const stealOne = (exclude) => {
+	      // Prefer stealing from the largest bucket so totals stay stable.
+	      // Never steal from the bucket we are trying to ensure.
+	      let which = null;
+	      let best = -1;
+	      const consider = (name, v) => {
+	        if (exclude && exclude[name]) return;
+	        if (v > best) { best = v; which = name; }
+	      };
+	      consider("protons", bP);
+	      consider("electrons", bE);
+	      consider("xray", bX);
+	      consider("h_ions", bH);
+	      consider("mag", bM);
+	      if (!which || best <= 1) return null; // don't zero out a bucket
+	      if (which === "protons") bP--;
+	      else if (which === "electrons") bE--;
+	      else if (which === "xray") bX--;
+	      else if (which === "h_ions") bH--;
+	      else if (which === "mag") bM--;
+	      return which;
+	    };
+
+	    if (wantProton && bP === 0) {
+	      if (stealOne({ protons: true })) bP = 1;
+	    }
+	    if (wantHIon && bH === 0) {
+	      if (stealOne({ h_ions: true })) bH = 1;
+	    }
+	    if (wantMag && bM === 0) {
+	      if (stealOne({ mag: true })) bM = 1;
+	    }
+	  }
+
+	  return {
+	    protons: bP,
+	    h_ions: bH,
+	    mag: bM,
     electrons: bE,
     xray: bX,
   };
 }
 
-function emitFromHand(T, which, rate) {
-  const w = HAND_W[which];
-  const head = (which === "hour") ? T.hourP : (which === "minute") ? T.minP : T.secP;
+	function emitFromHand(T, which, rate) {
+	  const w = HAND_W[which];
+	  const head = (which === "hour") ? T.hourP : (which === "minute") ? T.minP : T.secP;
 
   // PERF: scalar basis (avoids p5.Vector allocations in hot spawn loop).
   const dx = head.x - T.c.x;
@@ -4659,13 +5123,25 @@ function emitFromHand(T, which, rate) {
   // Using pow(random(), k) makes values cluster near 1.0
   const headBiasK = 3.2;
 
-  // How much each parameter contributes (hand weights * proxies)
-  // Keep baseline x-ray low (events/spikes are the readable signature).
-  const wx = w.x * xray * XRAY_BASELINE_EMIT_MULT;
-  const wm = w.m * mag;
-  const wh = w.h * h_ions;
-  const we = w.e * electrons;
-  const wp = w.p * protons;
+	  // How much each parameter contributes (hand weights * proxies)
+	  // Keep baseline x-ray low (events/spikes are the readable signature).
+	  const wx = w.x * xray * XRAY_BASELINE_EMIT_MULT;
+	  const pBase = (EMIT_TUNING?.baseline?.protons || 0);
+	  const hBase = (EMIT_TUNING?.baseline?.h_ions || 0);
+	  const eBase = (EMIT_TUNING?.baseline?.electrons || 0);
+	  const mBase = (EMIT_TUNING?.baseline?.mag || 0);
+	  const pMul = (EMIT_TUNING?.mult?.protons || 1);
+	  const hMul = (EMIT_TUNING?.mult?.h_ions || 1);
+	  const eMul = (EMIT_TUNING?.mult?.electrons || 1);
+	  const mMul = (EMIT_TUNING?.mult?.mag || 1);
+	  const protonsEff = constrain(protons + pBase, 0, 1) * pMul;
+	  const hIonsEff = constrain(h_ions + hBase, 0, 1) * hMul;
+	  const electronsEff = constrain(electrons + eBase, 0, 1) * eMul;
+	  const magEff = constrain(abs(mag) + mBase, 0, 1) * mMul;
+	  const wm = w.m * magEff;
+	  const wh = w.h * hIonsEff;
+	  const we = w.e * electronsEff;
+	  const wp = w.p * protonsEff;
   const cx = w.x * changeEmph.xray;
   const cm = w.m * changeEmph.mag;
   const ch = w.h * changeEmph.h_ions;
@@ -4676,21 +5152,57 @@ function emitFromHand(T, which, rate) {
 
   // Spread controlled by protons (stiffness)
   const stiffness = 0.35 + protons * 0.65;
-  const spread = (1.0 + electrons * 2.2 + mag * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
+  const spread = (1.0 + electrons * 2.2 + abs(mag) * 1.2) * (1.0 - stiffness * 0.70) * (1.0 + changeMix * 0.35);
 
-  const count = floor(rate);
-  let kindSequence = [];
+	  // Support fractional emission rates (needed for slow time / long lifetimes).
+	  // Without this, rates < 1 would floor to 0 and appear "frozen".
+	  const carry = (emitCarry && typeof emitCarry[which] === "number") ? emitCarry[which] : 0;
+	  const total = max(0, rate + carry);
+	  const count = floor(total);
+	  if (emitCarry) emitCarry[which] = total - count;
+	  let kindSequence = [];
   {
-    const counts = allocateCounts(count, { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx });
-    for (const k of ["protons", "h_ions", "mag", "electrons", "xray"]) {
-      for (let j = 0; j < (counts[k] || 0); j++) kindSequence.push(k);
+    // Use per-kind quota carry so low-weight kinds (mag/h_ions) still appear even when
+    // `count` is small due to slow time / long lifetimes.
+    const weights = { protons: wp, h_ions: wh, mag: wm, electrons: we, xray: wx };
+    let sumW = 0;
+    sumW += max(0, weights.protons || 0);
+    sumW += max(0, weights.h_ions || 0);
+    sumW += max(0, weights.mag || 0);
+    sumW += max(0, weights.electrons || 0);
+    sumW += max(0, weights.xray || 0);
+
+    if (!emitKindCarry || !emitKindCarry[which]) {
+      emitKindCarry = emitKindCarry || {};
+      emitKindCarry[which] = { protons: 0, h_ions: 0, mag: 0, electrons: 0, xray: 0 };
     }
-    // Randomize order so types are interleaved but total proportions stay exact.
-    for (let i = kindSequence.length - 1; i > 0; i--) {
-      const j = floor(random() * (i + 1));
-      const tmp = kindSequence[i];
-      kindSequence[i] = kindSequence[j];
-      kindSequence[j] = tmp;
+
+    if (count > 0) {
+      const carryK = emitKindCarry[which];
+      if (sumW <= 1e-9) {
+        // Fallback: all protons.
+        carryK.protons += count;
+      } else {
+        carryK.protons += (max(0, weights.protons || 0) / sumW) * count;
+        carryK.h_ions += (max(0, weights.h_ions || 0) / sumW) * count;
+        carryK.mag += (max(0, weights.mag || 0) / sumW) * count;
+        carryK.electrons += (max(0, weights.electrons || 0) / sumW) * count;
+        carryK.xray += (max(0, weights.xray || 0) / sumW) * count;
+      }
+
+      // Emit exactly `count` particles by taking from the kind with the highest accumulated quota.
+      // This is deterministic and prevents starvation of subtle kinds.
+      for (let i = 0; i < count; i++) {
+        let bestKind = "protons";
+        let best = carryK.protons;
+        if (carryK.h_ions > best) { best = carryK.h_ions; bestKind = "h_ions"; }
+        if (carryK.mag > best) { best = carryK.mag; bestKind = "mag"; }
+        if (carryK.electrons > best) { best = carryK.electrons; bestKind = "electrons"; }
+        if (carryK.xray > best) { best = carryK.xray; bestKind = "xray"; }
+
+        kindSequence.push(bestKind);
+        carryK[bestKind] -= 1;
+      }
     }
   }
 
@@ -4727,9 +5239,9 @@ function emitFromHand(T, which, rate) {
     }
     if (!accepted) continue;
 
-    // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
-    let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
-    let vy = diry * (1.4 + random(1.8) + overallAmp * 2.2) + nrmy * ((random() - 0.5) * (0.8 + mag * 1.6));
+	    // Velocity: outward from the anchor with small tangential spread (avoid shooting to center).
+	    let vx = dirx * (1.4 + random(1.8) + overallAmp * 2.2) + nrmx * ((random() - 0.5) * (0.8 + mag * 1.6));
+	    let vy = diry * (1.4 + random(1.8) + overallAmp * 2.2) + nrmy * ((random() - 0.5) * (0.8 + mag * 1.6));
 
     // parameter-specific feel (subtle—clock stays readable)
     if (kind === "xray") {    // sharp, fast
@@ -4751,14 +5263,17 @@ function emitFromHand(T, which, rate) {
       vx *= 0.85;
       vy *= 0.85;
     }
-    if (kind === "mag") {
-      const ang = (random() - 0.5) * 0.25 * mag;
-      const ca = cos(ang), sa = sin(ang);
-      const nvx = vx * ca - vy * sa;
-      const nvy = vx * sa + vy * ca;
-      vx = nvx;
-      vy = nvy;
-    }
+	    if (kind === "mag") {
+	      const ang = (random() - 0.5) * 0.25 * abs(mag);
+	      const ca = cos(ang), sa = sin(ang);
+	      const nvx = vx * ca - vy * sa;
+	      const nvy = vx * sa + vy * ca;
+	      vx = nvx;
+	      vy = nvy;
+	    }
+
+		    // Global motion slow-down is applied in the integration step (worker/main), not here,
+		    // to avoid double-scaling (spawn velocity *and* integration).
 
     // Lifetime / size per type
     // Keep effectively infinite; only pruning should reduce life.
@@ -4785,6 +5300,44 @@ function emitFromHand(T, which, rate) {
       p.linkGen = (p.link ? p.link.generation : 0);
       lastHIonByHand[which] = p;
     }
+    if (kind === "mag") {
+      const magBehavior = LAYER_BEHAVIOR.mag || {};
+      if (magBehavior.emitFromHandsChain) {
+        const coherence = constrain(abs(mag), 0, 1);
+        const rest = magBehavior.restLength || 28;
+        const maxLink = lerp(rest * 2.2, rest * 6.5, coherence);
+        // MUCH lower break chance - we want continuous strings!
+        // Low coherence = chaotic but still connected; high coherence = very stable
+        const breakChance = pow(1.0 - coherence, 2.5) * 0.08;  // was 0.55, now 0.08 (85% reduction)
+
+        let prev = lastMagByHand[which];
+        if (prev && (!prev.active || prev.dead() || prev.kind !== "mag")) prev = null;
+        if (prev && noise(p.seed * 0.21, millis() * 0.00012) < breakChance) prev = null;
+        if (prev) {
+          const dxl = prev.pos.x - p.pos.x;
+          const dyl = prev.pos.y - p.pos.y;
+          const d = sqrt(dxl * dxl + dyl * dyl);
+          if (d <= maxLink) {
+            // New particle becomes the chain head at the hand; chain extends via magNext.
+            p.magNext = prev;
+            prev.magPrev = p;
+            // DEBUG: Log chain creation (remove after testing)
+            if (frameCount % 60 === 0) {
+              console.log(`[MAG CHAIN] Connected: distance=${d.toFixed(1)}, maxLink=${maxLink.toFixed(1)}, coherence=${coherence.toFixed(2)}`);
+            }
+          } else if (frameCount % 60 === 0) {
+            console.log(`[MAG CHAIN] TOO FAR: distance=${d.toFixed(1)}, maxLink=${maxLink.toFixed(1)}`);
+          }
+        } else if (frameCount % 60 === 0) {
+          console.log(`[MAG CHAIN] NO PREV: which=${which}, coherence=${coherence.toFixed(2)}, breakChance=${breakChance.toFixed(3)}`);
+        }
+        p.magTangent.x = dirx;
+        p.magTangent.y = diry;
+        p.magCohBirth = coherence;
+        p.magHand = which; // Store which hand this particle came from for path following
+        lastMagByHand[which] = p;
+      }
+    }
     if (kind === "xray") {
       // NOTE: X-ray segments (rigid line constraints) are currently disabled to keep spikes as blobs,
       // not long broken lines. We keep the segment system in code for later re-introduction if desired.
@@ -4793,7 +5346,14 @@ function emitFromHand(T, which, rate) {
     if (!DISABLE_KIND_RINGS) {
       const prof = PARTICLE_PROFILE[kind] || PARTICLE_PROFILE.protons;
       if (prof.layerRadiusFrac && prof.layerStrength) {
-        p.layerTargetFrac = constrain(prof.layerRadiusFrac + (random() - 0.5) * 0.14, 0.18, 0.90);
+        // Mix the per-kind ring target with a per-particle target sampled across the disk.
+        // This keeps some stratification, but prevents visible "empty core" and patchy arcs.
+        const baseFrac = (typeof prof.layerRadiusFrac === "number" && prof.layerRadiusFrac > 0)
+          ? prof.layerRadiusFrac
+          : 0.55;
+        const diskFrac = pow(random(), 1.25); // bias slightly toward center for fuller coverage
+        const mixFrac = lerp(baseFrac, diskFrac, constrain(KIND_RING_SPREAD_MIX, 0, 1));
+        p.layerTargetFrac = constrain(mixFrac + (random() - 0.5) * 0.06, KIND_RING_MIN_FRAC, KIND_RING_MAX_FRAC);
       }
     }
     particles.push(p);
@@ -4951,6 +5511,45 @@ function drawDensityDebugHUD() {
   pop();
 }
 
+function drawXrayGridEnvironmentOverlay() {
+  if (!XRAY_GRID_ENV_ENABLED) return;
+  if (VIEW_SOLO_KIND !== "xray") return;
+  const T = (typeof CURRENT_T !== "undefined" && CURRENT_T) ? CURRENT_T : null;
+  if (!T || !T.c || !Number.isFinite(T.c.x) || !Number.isFinite(T.c.y) || !Number.isFinite(T.radius)) return;
+
+  const cell = max(8, XRAY_GRID_CELL_SIZE | 0);
+  const cx = T.c.x, cy = T.c.y, r = T.radius;
+  const halfCells = ceil(r / cell) + 1;
+
+  push();
+  stroke(COL.xray[0], COL.xray[1], COL.xray[2], 22);
+  strokeWeight(1);
+  noFill();
+
+  // Grid lines (cheap overlay; intentionally not clipped to the circle for speed).
+  for (let i = -halfCells; i <= halfCells; i++) {
+    const x = cx + i * cell;
+    line(x, cy - r, x, cy + r);
+    const y = cy + i * cell;
+    line(cx - r, y, cx + r, y);
+  }
+
+  // Mark current blob cells (if any) so the "collision cells" are obvious.
+  if (xrayBlobs && xrayBlobs.length) {
+    noStroke();
+    fill(COL.xray[0], COL.xray[1], COL.xray[2], 38);
+    for (let i = 0; i < xrayBlobs.length; i++) {
+      const b = xrayBlobs[i];
+      if (!b) continue;
+      const bx = Number.isFinite(b.cx) ? b.cx : 0;
+      const by = Number.isFinite(b.cy) ? b.cy : 0;
+      rect(bx - cell * 0.35, by - cell * 0.35, cell * 0.7, cell * 0.7, 3);
+    }
+  }
+
+  pop();
+}
+
 function drawHead(p, r) {
   const glow = 18 + h_ions*40 + xray*30;
   noStroke();
@@ -4964,8 +5563,6 @@ function updateParticles(T) {
   const tUpd0 = PROF_LITE ? profLiteNow() : 0;
   const tFields0 = tUpd0;
   updateXrayBlobs();
-  updateXraySegments();
-  // free-space particles only (hand reservoir particles are updated separately)
   // PERF: pooling leaves null holes; compute active count for correct "fill" logic.
   let activeCount = 0;
   for (let i = 0; i < particles.length; i++) if (particles[i]) activeCount++;
@@ -4976,10 +5573,51 @@ function updateParticles(T) {
   const smoothDense = denseMode && DENSE_SMOOTH_FLOW;
   const smoothAll = GLOBAL_SMOOTH_FLOW || smoothDense;
 
-  const drag = 0.985 + protons * 0.01;
-  const swirlBoost = 1.0 + mag * 0.8;
+	  const dragBase = (CLOCK_TUNING && typeof CLOCK_TUNING.dragBase === "number") ? CLOCK_TUNING.dragBase : 0.985;
+	  const dragProtonsAdd = (CLOCK_TUNING && typeof CLOCK_TUNING.dragProtonsAdd === "number") ? CLOCK_TUNING.dragProtonsAdd : 0.01;
+	  const swirlMagMult = (CLOCK_TUNING && typeof CLOCK_TUNING.swirlMagMult === "number") ? CLOCK_TUNING.swirlMagMult : 0.8;
+	  const stepScale = (TIME_TUNING && typeof TIME_TUNING.motionStepScale === "number") ? TIME_TUNING.motionStepScale : 1.0;
+	  const dragRaw = dragBase + protons * dragProtonsAdd;
+	  // When slowing motion, reduce per-frame damping proportionally so particles don't "stick" visually.
+	  const drag = 1.0 - (1.0 - dragRaw) * constrain(stepScale, 0, 1);
+	  const swirlBoost = 1.0 + mag * swirlMagMult;
   const cohesionCellSize = 110;
   const cohesionGrid = getCohesionGrid(particles, cohesionCellSize);
+
+  // Magnetic coherence: high mag signal = organized filaments, low = chaotic/broken filaments.
+  const magneticCoherence = constrain(abs(mag), 0, 1);
+
+  // Build magnetic particle chains for filament structure
+  const magBehavior = LAYER_BEHAVIOR.mag || {};
+  if (!magBehavior.emitFromHandsChain) {
+    const chainRebuildEvery = magBehavior.chainRebuildEvery || MAGNETIC_CHAIN_EVERY;
+    const chainK = magBehavior.chainK || 3;
+    if ((frameCount - magneticChainFrame) >= chainRebuildEvery) {
+      buildMagneticChains(particles, chainK, magneticCoherence);
+      magneticChainFrame = frameCount;
+    }
+  }
+
+  // NOTE: updateMagneticGuidePaths is now called in main draw loop (before worker check)
+  // so it runs whether worker is enabled or not
+
+  // DEBUG: Count magnetic particles with magHand assigned
+  if (frameCount % 120 === 0) {
+    let magCount = 0;
+    let magWithHandCount = 0;
+    let handCounts = { hour: 0, minute: 0, second: 0 };
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (!p || p.kind !== "mag") continue;
+      magCount++;
+      if (p.magHand) {
+        magWithHandCount++;
+        handCounts[p.magHand] = (handCounts[p.magHand] || 0) + 1;
+      }
+    }
+    console.log(`[MAG PARTICLES] Total mag: ${magCount}, with magHand: ${magWithHandCount}, by hand:`, handCounts);
+  }
+
   const stridePhase = frameCount % COHESION_APPLY_STRIDE;
   const heavyPhase = frameCount % HEAVY_FIELD_STRIDE;
   const alignmentPhase = frameCount % ALIGNMENT_STRIDE;
@@ -5019,7 +5657,8 @@ function updateParticles(T) {
     alignmentCellSize,
     cohesionGrid,
     cohesionCellSize,
-    ageRankDen
+    ageRankDen,
+    magneticCoherence
   );
 
   if (PROF_LITE) {
@@ -5054,7 +5693,10 @@ function updateParticles(T) {
     collisionState.itersLast = 0;
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
-      if (p && COLLISION_KINDS[p.kind]) collisionList.push(p);
+      if (!p) continue;
+      if (!COLLISION_KINDS[p.kind]) continue;
+      if (p.kind === "xray" && p.blobId) continue;
+      collisionList.push(p);
     }
     if (collisionList.length) {
       for (let i = 0; i < collisionList.length; i++) {
@@ -5090,7 +5732,10 @@ function updateParticles(T) {
       collisionState.maxMoveCurrent = lerp(collisionState.maxMoveCurrent, collisionState.maxMoveTarget, COLLISION_ITERS_LERP);
       collisionState.pushKTarget = trouble ? TROUBLE_PUSH_K : COLLISION_PUSH;
       collisionState.pushKCurrent = lerp(collisionState.pushKCurrent, collisionState.pushKTarget, COLLISION_ITERS_LERP);
-    const cellFrac = 1;
+      const nCol = collisionList.length | 0;
+      const cellFrac = trouble
+        ? 1
+        : (nCol >= 9000 ? 0.28 : nCol >= 6500 ? 0.40 : nCol >= 4000 ? 0.60 : 1);
       resolveSpaceCollisions(
         collisionList,
         T.c,
@@ -5154,7 +5799,8 @@ function applyForcesMainThread(
   alignmentCellSize,
   cohesionGrid,
   cohesionCellSize,
-  ageRankDen
+  ageRankDen,
+  magneticCoherence
 ) {
   applyForcesStage({
     particles,
@@ -5180,6 +5826,7 @@ function applyForcesMainThread(
     enableDensity,
     enableCohesion,
     enableXrayBlobForce,
+    magneticCoherence,
     infoRec: infoRec.isRecording() ? infoRec : null,
     infoRecSampleStride: INFOREC_FORCES_SAMPLE_STRIDE,
     DENSE_DISABLE_COHESION,
@@ -5192,10 +5839,14 @@ function applyForcesMainThread(
     applyElectronBreath,
     applyAgeSpiral,
     applyLayerBehavior,
+    applyLayerStratification,
     applyVolumetricMix,
     applyDensityCoupling,
     applyAlignment,
     applyCohesion,
+    applyMagneticHistoryForce,
+    applyMagneticPathForce,
+    applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
     returnToPool,
@@ -5527,15 +6178,17 @@ function Particle(x, y, vx, vy, life, size, col, kind) {
   this.strength = 1.0;
   this.birthFrame = frameCount || 0;
   this.layerTargetFrac = null;
-  this.inHand = false;
-  this.hand = null;
-  this.slotIndex = -1;
   this.blobId = 0;
-  this.segId = 0;
   this.link = null;
   this.linkGen = 0;
   this.xrayTight = 0; // per-particle "rigidity" for X-ray spikes (0..1)
   this.xrayRadPref = 0; // stable radius preference inside xray blobs (0..1)
+  // Magnetic filament chain properties
+  this.magPrev = null; // previous particle in magnetic chain
+  this.magNext = null; // next particle in magnetic chain
+  this.magTangent = createVector(0, 0); // local filament tangent direction
+  this.magCohBirth = 0.5; // coherence at spawn time (history)
+  this.magHand = null; // which hand this magnetic particle was emitted from (for path following)
   this.active = true;
   this.generation = 0;
 }
@@ -5563,32 +6216,41 @@ Particle.prototype.resetFromSpawn = function(kind, x, y, vx, vy, life, size, col
   this.birthFrame = frameCount || 0;
   this.layerTargetFrac = null;
 
-  this.inHand = false;
-  this.hand = null;
-  this.slotIndex = -1;
-
   this.blobId = 0;
-  this.segId = 0;
   this.link = null;
   this.linkGen = 0;
   this.xrayTight = 0;
   this.xrayRadPref = 0;
+
+  // Reset magnetic chain links
+  this.magPrev = null;
+  this.magNext = null;
+  this.magTangent.x = 0;
+  this.magTangent.y = 0;
+  this.magCohBirth = (kind === "mag") ? constrain(abs(mag), 0, 1) : 0.5;
+  this.magHand = null;
 
   this.active = true;
   this.generation = (this.generation + 1) | 0;
 };
 
 Particle.prototype.deactivate = function() {
+  // Detach magnetic neighbors so pooled objects don't leave dangling links.
+  if (this.kind === "mag") {
+    const a = this.magPrev;
+    const b = this.magNext;
+    if (a && a.magNext === this) a.magNext = null;
+    if (b && b.magPrev === this) b.magPrev = null;
+  }
   this.active = false;
-  this.inHand = false;
-  this.hand = null;
-  this.slotIndex = -1;
   this.blobId = 0;
-  this.segId = 0;
   this.link = null;
   this.linkGen = 0;
   this.xrayTight = 0;
   this.xrayRadPref = 0;
+  this.magPrev = null;
+  this.magNext = null;
+  this.magCohBirth = 0.5;
   this.layerTargetFrac = null;
   this.strength = 1.0;
   this.life = 0;

@@ -29,6 +29,7 @@ export function drawLiteProfilerHUD(state, opts) {
   const y = Math.max(70, (uiBottomY || 0) + 12); // keep below DOM controls (file input + buttons)
   const now = millis();
   const ft = (typeof deltaTime !== "undefined") ? deltaTime : 0;
+  if (!state.ftWindow10s) state.ftWindow10s = [];
   state.ftHistory.push(ft);
   if (state.ftHistory.length > 120) state.ftHistory.shift();
   state.ftWindow2s.push({ t: now, ft });
@@ -85,7 +86,15 @@ export function drawLiteProfilerHUD(state, opts) {
   textAlign(LEFT, TOP);
   textSize(12);
   text(
+<<<<<<< HEAD
     `FPS ${nf(fps, 2, 1)} | FPS10 ${nf(fps10, 2, 1)} | ft ${nf(state.ftDisplay.current, 1, 1)}ms | worst ${nf(state.ftDisplay.worst, 1, 1)}ms | p95 ${nf(
+=======
+    `FPS ${nf(fps, 2, 1)} | FPS10 ${nf(fps10, 2, 1)} | ft ${nf(state.ftDisplay.current, 1, 1)}ms | worst ${nf(
+      state.ftDisplay.worst,
+      1,
+      1
+    )}ms | p95 ${nf(
+>>>>>>> pixi-quick-test
       state.ftDisplay.p95,
       1,
       1
