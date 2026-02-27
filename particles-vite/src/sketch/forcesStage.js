@@ -42,6 +42,7 @@ export function applyForcesStage(ctx) {
     applyAlignment,
     applyCohesion,
     applyMagneticHistoryForce,
+    applyMagneticPathForce,
     applyMagneticFilamentForce,
     applyXrayBlobForce,
     confineToClock,
@@ -172,7 +173,8 @@ export function applyForcesStage(ctx) {
 
     // STEP 4B: when worker is enabled, move only basic motion (drag+integrate+confine) to worker.
     // Main thread keeps all forces/behaviors but does not advance position or clamp to clock.
-    if (USE_WORKER) {
+    // EXCEPTION: Magnetic particles use chain springs that need main-thread integration
+    if (USE_WORKER && p.kind !== "mag") {
       p.update(1.0, swirlBoost, false);
       if (sampleThisFrame) infoRec.incCounter("integrate.workerStub");
     } else {
